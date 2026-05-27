@@ -1107,7 +1107,7 @@ export abstract class MemoryManagerSyncOps {
     });
   }
 
-  private async syncMemoryFiles(params: {
+  protected async syncMemoryFiles(params: {
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
   }) {
@@ -1205,7 +1205,7 @@ export abstract class MemoryManagerSyncOps {
     }
   }
 
-  private async syncSessionFiles(params: {
+  protected async syncSessionFiles(params: {
     needsFullReindex: boolean;
     targetSessionFiles?: string[];
     progress?: MemorySyncProgressState;
