@@ -911,20 +911,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     this.writeChunks(entry, options.source, this.provider.model, chunks, embeddings, vectorReady);
   }
 
-  protected override async syncMemoryFiles(params: {
-    needsFullReindex: boolean;
-    progress?: MemorySyncProgressState;
-  }) {
-    await super.syncMemoryFiles(params);
-    await this.flushPendingIndexWrites();
-  }
-
-  protected override async syncSessionFiles(params: {
-    needsFullReindex: boolean;
-    targetSessionFiles?: string[];
-    progress?: MemorySyncProgressState;
-  }) {
-    await super.syncSessionFiles(params);
+  protected override async flushBatchWrites(): Promise<void> {
     await this.flushPendingIndexWrites();
   }
 }

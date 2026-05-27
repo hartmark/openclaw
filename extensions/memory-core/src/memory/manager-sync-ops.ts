@@ -1449,6 +1449,7 @@ export abstract class MemoryManagerSyncOps {
       sessionsDirtyFiles: this.sessionsDirtyFiles,
       syncSessionFiles: async (targetedParams) => {
         await this.syncSessionFiles(targetedParams);
+        await this.flushBatchWrites();
       },
       shouldFallbackOnError: (err) => this.shouldFallbackOnError(err),
       activateFallbackProvider: async (reason) => await this.activateFallbackProvider(reason),
@@ -1521,6 +1522,7 @@ export abstract class MemoryManagerSyncOps {
       } else {
         this.sessionsDirty = false;
       }
+      await this.flushBatchWrites();
     } catch (err) {
       const reason = formatErrorMessage(err);
       const activated =
@@ -1566,6 +1568,10 @@ export abstract class MemoryManagerSyncOps {
       pollIntervalMs: batch?.pollIntervalMs ?? 2000,
       timeoutMs: (batch?.timeoutMinutes ?? 1440) * 60 * 1000,
     };
+  }
+
+  protected async flushBatchWrites(): Promise<void> {
+    // Override in MemoryManagerEmbeddingOps for two-phase batch flush
   }
 
   protected async activateFallbackProvider(reason: string): Promise<boolean> {
@@ -1697,6 +1703,7 @@ export abstract class MemoryManagerSyncOps {
           } else {
             this.sessionsDirty = false;
           }
+          await this.flushBatchWrites();
 
           const meta: MemoryIndexMeta = {
             model: this.provider?.model ?? "fts-only",
@@ -1777,6 +1784,7 @@ export abstract class MemoryManagerSyncOps {
     } else {
       this.sessionsDirty = false;
     }
+    await this.flushBatchWrites();
 
     const nextMeta: MemoryIndexMeta = {
       model: this.provider?.model ?? "fts-only",
