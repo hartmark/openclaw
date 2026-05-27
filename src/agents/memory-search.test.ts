@@ -88,7 +88,7 @@ describe("memory search config", () => {
       wait: true,
       concurrency: 2,
       pollIntervalMs: 2000,
-      timeoutMinutes: 60,
+      timeoutMinutes: 1440,
     });
   }
 
@@ -141,7 +141,7 @@ describe("memory search config", () => {
         wait: true,
         concurrency: 2,
         pollIntervalMs: 2000,
-        timeoutMinutes: 60,
+        timeoutMinutes: 1440,
       },
     });
   }

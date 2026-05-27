@@ -1,48 +1,10 @@
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-
-type MemoryEmbeddingTextPart = {
-  type: "text";
-  text: string;
-};
-
-type MemoryEmbeddingInlineDataPart = {
-  type: "inline-data";
-  mimeType: string;
-  data: string;
-};
-
-type MemoryEmbeddingInput = {
-  text: string;
-  parts?: Array<MemoryEmbeddingTextPart | MemoryEmbeddingInlineDataPart>;
-};
+import { type EmbeddingInput } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 
 type MemoryEmbeddingChunk = {
   text: string;
-  embeddingInput?: MemoryEmbeddingInput;
+  embeddingInput?: EmbeddingInput;
 };
-
-function estimateUtf8Bytes(text: string): number {
-  if (!text) {
-    return 0;
-  }
-  return Buffer.byteLength(text, "utf8");
-}
-
-function estimateStructuredEmbeddingInputBytes(input: MemoryEmbeddingInput): number {
-  if (!input.parts?.length) {
-    return estimateUtf8Bytes(input.text);
-  }
-  let total = 0;
-  for (const part of input.parts) {
-    if (part.type === "text") {
-      total += estimateUtf8Bytes(part.text);
-    } else {
-      total += estimateUtf8Bytes(part.mimeType);
-      total += estimateUtf8Bytes(part.data);
-    }
-  }
-  return total;
-}
 
 export function filterNonEmptyMemoryChunks<T extends MemoryEmbeddingChunk>(chunks: T[]): T[] {
   return chunks.filter((chunk) => chunk.text.trim().length > 0);
@@ -50,32 +12,11 @@ export function filterNonEmptyMemoryChunks<T extends MemoryEmbeddingChunk>(chunk
 
 export function buildMemoryEmbeddingBatches<T extends MemoryEmbeddingChunk>(
   chunks: T[],
-  maxTokens: number,
+  maxChunks: number,
 ): T[][] {
   const batches: T[][] = [];
-  let current: T[] = [];
-  let currentTokens = 0;
-
-  for (const chunk of chunks) {
-    const estimate = chunk.embeddingInput
-      ? estimateStructuredEmbeddingInputBytes(chunk.embeddingInput)
-      : estimateUtf8Bytes(chunk.text);
-    const wouldExceed = current.length > 0 && currentTokens + estimate > maxTokens;
-    if (wouldExceed) {
-      batches.push(current);
-      current = [];
-      currentTokens = 0;
-    }
-    if (current.length === 0 && estimate > maxTokens) {
-      batches.push([chunk]);
-      continue;
-    }
-    current.push(chunk);
-    currentTokens += estimate;
-  }
-
-  if (current.length > 0) {
-    batches.push(current);
+  for (let i = 0; i < chunks.length; i += maxChunks) {
+    batches.push(chunks.slice(i, i + maxChunks));
   }
   return batches;
 }
@@ -124,6 +65,6 @@ export async function runMemoryEmbeddingRetryLoop<T>(params: {
   }
 }
 
-export function buildTextEmbeddingInputs(chunks: MemoryEmbeddingChunk[]): MemoryEmbeddingInput[] {
+export function buildTextEmbeddingInputs(chunks: MemoryEmbeddingChunk[]): EmbeddingInput[] {
   return chunks.map((chunk) => chunk.embeddingInput ?? { text: chunk.text });
 }

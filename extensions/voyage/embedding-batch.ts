@@ -39,7 +39,8 @@ type VoyageBatchOutputLine = ProviderBatchOutputLine;
 
 const VOYAGE_BATCH_ENDPOINT = EMBEDDING_BATCH_ENDPOINT;
 const VOYAGE_BATCH_COMPLETION_WINDOW = "12h";
-const VOYAGE_BATCH_MAX_REQUESTS = 50000;
+const VOYAGE_BATCH_MAX_REQUESTS = 50_000;
+const VOYAGE_BATCH_MAX_BACKOFF_MS = 60_000;
 
 type VoyageBatchDeps = {
   now: () => number;
@@ -176,6 +177,7 @@ async function waitForVoyageBatch(params: {
 }): Promise<BatchCompletionResult> {
   const start = params.deps.now();
   let current: VoyageBatchStatus | undefined = params.initial;
+  let pollCount = 0;
   while (true) {
     const status =
       current ??
@@ -208,8 +210,13 @@ async function waitForVoyageBatch(params: {
     if (params.deps.now() - start > params.timeoutMs) {
       throw new Error(`voyage batch ${params.batchId} timed out after ${params.timeoutMs}ms`);
     }
-    params.debug?.(`voyage batch ${params.batchId} ${state}; waiting ${params.pollIntervalMs}ms`);
-    await params.deps.sleep(params.pollIntervalMs);
+    const delay = Math.min(
+      params.pollIntervalMs * Math.pow(2, pollCount),
+      VOYAGE_BATCH_MAX_BACKOFF_MS,
+    );
+    params.debug?.(`voyage batch ${params.batchId} ${state}; waiting ${delay}ms`);
+    await params.deps.sleep(delay);
+    pollCount += 1;
     current = undefined;
   }
 }

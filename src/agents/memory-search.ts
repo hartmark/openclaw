@@ -218,7 +218,7 @@ function mergeConfig(
     pollIntervalMs:
       overrideRemote?.batch?.pollIntervalMs ?? defaultRemote?.batch?.pollIntervalMs ?? 2000,
     timeoutMinutes:
-      overrideRemote?.batch?.timeoutMinutes ?? defaultRemote?.batch?.timeoutMinutes ?? 60,
+      overrideRemote?.batch?.timeoutMinutes ?? defaultRemote?.batch?.timeoutMinutes ?? 1440,
   };
   const remote = includeRemote
     ? {

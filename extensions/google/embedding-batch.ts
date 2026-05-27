@@ -49,7 +49,8 @@ type GeminiBatchOutputLine = {
   error?: { message?: string };
 };
 
-const GEMINI_BATCH_MAX_REQUESTS = 50000;
+const GEMINI_BATCH_MAX_REQUESTS = 50_000;
+const GEMINI_BATCH_MAX_BACKOFF_MS = 60_000;
 function hashText(text: string): string {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
@@ -238,6 +239,7 @@ async function waitForGeminiBatch(params: {
 }): Promise<{ outputFileId: string }> {
   const start = Date.now();
   let current: GeminiBatchStatus | undefined = params.initial;
+  let pollCount = 0;
   while (true) {
     const status =
       current ??
@@ -266,8 +268,13 @@ async function waitForGeminiBatch(params: {
     if (Date.now() - start > params.timeoutMs) {
       throw new Error(`gemini batch ${params.batchName} timed out after ${params.timeoutMs}ms`);
     }
-    params.debug?.(`gemini batch ${params.batchName} ${state}; waiting ${params.pollIntervalMs}ms`);
-    await new Promise((resolve) => setTimeout(resolve, params.pollIntervalMs));
+    const delay = Math.min(
+      params.pollIntervalMs * Math.pow(2, pollCount),
+      GEMINI_BATCH_MAX_BACKOFF_MS,
+    );
+    params.debug?.(`gemini batch ${params.batchName} ${state}; waiting ${delay}ms`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    pollCount += 1;
     current = undefined;
   }
 }

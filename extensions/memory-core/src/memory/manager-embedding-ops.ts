@@ -42,7 +42,8 @@ import { replaceMemoryVectorRow } from "./manager-vector-write.js";
 const VECTOR_TABLE = "chunks_vec";
 const FTS_TABLE = "chunks_fts";
 const EMBEDDING_CACHE_TABLE = "embedding_cache";
-const EMBEDDING_BATCH_MAX_TOKENS = 8000;
+const EMBEDDING_CHUNK_MAX_BYTES = 8192;
+const EMBEDDING_INLINE_BATCH_MAX_CHUNKS = 50_000;
 const EMBEDDING_INDEX_CONCURRENCY = 4;
 const EMBEDDING_RETRY_MAX_ATTEMPTS = 3;
 const EMBEDDING_RETRY_BASE_DELAY_MS = 500;
@@ -51,6 +52,8 @@ const EMBEDDING_QUERY_TIMEOUT_REMOTE_MS = 60_000;
 const EMBEDDING_QUERY_TIMEOUT_LOCAL_MS = 5 * 60_000;
 const EMBEDDING_BATCH_TIMEOUT_REMOTE_MS = 2 * 60_000;
 const EMBEDDING_BATCH_TIMEOUT_LOCAL_MS = 10 * 60_000;
+const DEFERRED_BATCH_DEBOUNCE_MS = 2_000;
+const DEFERRED_BATCH_FLUSH_THRESHOLD = 1_000;
 
 const log = createSubsystemLogger("memory");
 
@@ -147,6 +150,17 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
   protected abstract batchFailureLock: Promise<void>;
   protected abstract markLocalEmbeddingProviderDegraded(err: unknown): void;
 
+  private deferredBatch: {
+    entries: Array<{
+      embeddings: number[][];
+      missing: Array<{ index: number; chunk: MemoryChunk }>;
+      chunks: MemoryChunk[];
+      resolve: (value: number[][]) => void;
+      reject: (err: unknown) => void;
+    }>;
+    timer: ReturnType<typeof setTimeout> | null;
+  } | null = null;
+
   protected pruneEmbeddingCacheIfNeeded(): void {
     if (!this.cache.enabled) {
       return;
@@ -186,7 +200,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     }
 
     const missingChunks = missing.map((m) => m.chunk);
-    const batches = buildMemoryEmbeddingBatches(missingChunks, EMBEDDING_BATCH_MAX_TOKENS);
+    const batches = buildMemoryEmbeddingBatches(missingChunks, EMBEDDING_INLINE_BATCH_MAX_CHUNKS);
     const toCache: Array<{ hash: string; embedding: number[] }> = [];
     const provider = this.provider;
     if (!provider) {
@@ -266,43 +280,118 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
       return embeddings;
     }
 
-    const missingChunks = missing.map((item) => item.chunk);
-    const batchResult = await this.runBatchWithFallback({
-      provider: provider.id,
-      run: async () =>
-        await batchEmbed({
-          agentId: this.agentId,
-          chunks: missingChunks,
-          wait: this.batch.wait,
-          concurrency: this.batch.concurrency,
-          pollIntervalMs: this.batch.pollIntervalMs,
-          timeoutMs: this.batch.timeoutMs,
-          debug: this.buildBatchDebug(source, chunks),
-        }),
-      fallback: async () => await this.embedChunksInBatches(chunks),
-    });
-    if (!batchResult) {
-      return this.embedChunksInBatches(chunks);
-    }
-    const toCache: Array<{ hash: string; embedding: number[] }> = [];
-    for (let index = 0; index < missing.length; index += 1) {
-      const item = missing[index];
-      const embedding = batchResult[index] ?? [];
-      if (!item) {
-        continue;
+    // Defer to accumulate uncached chunks across files into fewer batches
+    return this.deferBatchEmbed(missing, embeddings, chunks);
+  }
+
+  private deferBatchEmbed(
+    missing: Array<{ index: number; chunk: MemoryChunk }>,
+    embeddings: number[][],
+    chunks: MemoryChunk[],
+  ): Promise<number[][]> {
+    return new Promise<number[][]>((resolve, reject) => {
+      if (!this.deferredBatch) {
+        this.deferredBatch = { entries: [], timer: null };
       }
-      embeddings[item.index] = embedding;
-      toCache.push({ hash: item.chunk.hash, embedding });
-    }
-    upsertMemoryEmbeddingCache({
-      db: this.db,
-      enabled: this.cache.enabled,
-      provider,
-      providerKey: this.providerKey,
-      entries: toCache,
-      tableName: EMBEDDING_CACHE_TABLE,
+
+      this.deferredBatch.entries.push({ embeddings, missing, chunks, resolve, reject });
+
+      const totalMissing = this.deferredBatch.entries.reduce((s, e) => s + e.missing.length, 0);
+      if (totalMissing >= DEFERRED_BATCH_FLUSH_THRESHOLD) {
+        this.scheduleDeferredFlush(true);
+      } else {
+        this.scheduleDeferredFlush(false);
+      }
     });
-    return embeddings;
+  }
+
+  private scheduleDeferredFlush(immediate: boolean): void {
+    if (!this.deferredBatch) return;
+
+    if (this.deferredBatch.timer) {
+      clearTimeout(this.deferredBatch.timer);
+      this.deferredBatch.timer = null;
+    }
+
+    if (immediate) {
+      this.flushDeferredBatches();
+    } else if (this.deferredBatch.entries.length > 0) {
+      this.deferredBatch.timer = setTimeout(
+        () => this.flushDeferredBatches(),
+        DEFERRED_BATCH_DEBOUNCE_MS,
+      );
+    }
+  }
+
+  private async flushDeferredBatches(): Promise<void> {
+    const batch = this.deferredBatch;
+    if (!batch || batch.entries.length === 0) return;
+    this.deferredBatch = null;
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+    }
+
+    const { entries } = batch;
+    const allMissing = entries.flatMap((e) => e.missing);
+    const allMissingChunks = allMissing.map((m) => m.chunk);
+
+    try {
+      const batchResult = await this.runBatchWithFallback({
+        provider: this.provider!.id,
+        run: async () =>
+          await this.providerRuntime!.batchEmbed!({
+            agentId: this.agentId,
+            chunks: allMissingChunks,
+            wait: this.batch.wait,
+            concurrency: this.batch.concurrency,
+            pollIntervalMs: this.batch.pollIntervalMs,
+            timeoutMs: this.batch.timeoutMs,
+            debug: (msg: string, data?: Record<string, unknown>) =>
+              log.debug(msg, { ...data, chunks: allMissingChunks.length }),
+          }),
+        fallback: async () => {
+          const allChunks = entries.flatMap((e) => e.chunks);
+          return await this.embedChunksInBatches(allChunks);
+        },
+      });
+
+      if (batchResult) {
+        if (batchResult.length === allMissingChunks.length) {
+          // Batch API path: result[i] corresponds to allMissing[i]
+          const toCache: Array<{ hash: string; embedding: number[] }> = [];
+          let idx = 0;
+          for (const entry of entries) {
+            for (const item of entry.missing) {
+              const embedding = batchResult[idx] ?? [];
+              idx++;
+              entry.embeddings[item.index] = embedding;
+              toCache.push({ hash: item.chunk.hash, embedding });
+            }
+          }
+          upsertMemoryEmbeddingCache({
+            db: this.db,
+            enabled: this.cache.enabled,
+            provider: this.provider!,
+            providerKey: this.providerKey,
+            entries: toCache,
+            tableName: EMBEDDING_CACHE_TABLE,
+          });
+        } else {
+          // Fallback path: embedChunksInBatches returns embeddings for ALL chunks
+          let offset = 0;
+          for (const entry of entries) {
+            for (let i = 0; i < entry.chunks.length; i++) {
+              entry.embeddings[i] = batchResult[offset + i] ?? [];
+            }
+            offset += entry.chunks.length;
+          }
+        }
+      }
+
+      for (const entry of entries) entry.resolve(entry.embeddings);
+    } catch (err) {
+      for (const entry of entries) entry.reject(err);
+    }
   }
 
   private collectCachedEmbeddings(chunks: MemoryChunk[]): {
@@ -747,7 +836,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
       const content = options.content ?? (await fs.readFile(entry.absPath, "utf-8"));
       const baseChunks = filterNonEmptyMemoryChunks(chunkMarkdown(content, this.settings.chunking));
       chunks = this.provider
-        ? enforceEmbeddingMaxInputTokens(this.provider, baseChunks, EMBEDDING_BATCH_MAX_TOKENS)
+        ? enforceEmbeddingMaxInputTokens(this.provider, baseChunks, EMBEDDING_CHUNK_MAX_BYTES)
         : baseChunks;
       if (options.source === "sessions" && "lineMap" in entry) {
         remapChunkLines(chunks, entry.lineMap);

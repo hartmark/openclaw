@@ -43,7 +43,8 @@ type OpenAiBatchOutputLine = ProviderBatchOutputLine;
 
 export const OPENAI_BATCH_ENDPOINT = EMBEDDING_BATCH_ENDPOINT;
 const OPENAI_BATCH_COMPLETION_WINDOW = "24h";
-const OPENAI_BATCH_MAX_REQUESTS = 50000;
+const OPENAI_BATCH_MAX_REQUESTS = 50_000;
+const OPENAI_BATCH_MAX_BACKOFF_MS = 60_000;
 
 async function submitOpenAiBatch(params: {
   openAi: OpenAiEmbeddingClient;
@@ -163,6 +164,7 @@ async function waitForOpenAiBatch(params: {
 }): Promise<BatchCompletionResult> {
   const start = Date.now();
   let current: OpenAiBatchStatus | undefined = params.initial;
+  let pollCount = 0;
   while (true) {
     const status =
       current ??
@@ -193,8 +195,13 @@ async function waitForOpenAiBatch(params: {
     if (Date.now() - start > params.timeoutMs) {
       throw new Error(`openai batch ${params.batchId} timed out after ${params.timeoutMs}ms`);
     }
-    params.debug?.(`openai batch ${params.batchId} ${state}; waiting ${params.pollIntervalMs}ms`);
-    await new Promise((resolve) => setTimeout(resolve, params.pollIntervalMs));
+    const delay = Math.min(
+      params.pollIntervalMs * Math.pow(2, pollCount),
+      OPENAI_BATCH_MAX_BACKOFF_MS,
+    );
+    params.debug?.(`openai batch ${params.batchId} ${state}; waiting ${delay}ms`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    pollCount += 1;
     current = undefined;
   }
 }

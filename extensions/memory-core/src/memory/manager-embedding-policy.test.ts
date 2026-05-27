@@ -18,19 +18,17 @@ function chunk(text: string) {
 }
 
 describe("memory embedding policy", () => {
-  it("splits large files across multiple embedding batches", () => {
-    const line = "a".repeat(4200);
-    const batches = buildMemoryEmbeddingBatches([chunk(line), chunk(line)], 8000);
+  it("splits chunks across count-based batches", () => {
+    const batches = buildMemoryEmbeddingBatches([chunk("a"), chunk("b"), chunk("c")], 2);
 
     expect(batches).toHaveLength(2);
-    expect(batches.map((batch) => batch.length)).toEqual([1, 1]);
+    expect(batches.map((batch) => batch.length)).toEqual([2, 1]);
   });
 
-  it("keeps small files in a single embedding batch", () => {
-    const line = "b".repeat(120);
+  it("keeps all chunks in a single batch when under max count", () => {
     const batches = buildMemoryEmbeddingBatches(
-      [chunk(line), chunk(line), chunk(line), chunk(line)],
-      8000,
+      [chunk("a"), chunk("b"), chunk("c"), chunk("d")],
+      50_000,
     );
 
     expect(batches).toHaveLength(1);
