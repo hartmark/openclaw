@@ -314,10 +314,18 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     return embeddings;
   }
 
-  private async flushPendingIndexWrites(): Promise<void> {
+  private async flushPendingIndexWrites(progress?: MemorySyncProgressState): Promise<void> {
     const pending = this.pendingIndexWrites;
     if (!pending || pending.length === 0) return;
     this.pendingIndexWrites = null;
+
+    if (progress) {
+      progress.report({
+        completed: progress.completed,
+        total: progress.total,
+        label: `Embedding batch (${this.provider?.id ?? "unknown"})…`,
+      });
+    }
 
     const allMissing = pending.flatMap((p) => p.missing);
     if (allMissing.length === 0) {
@@ -911,7 +919,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     this.writeChunks(entry, options.source, this.provider.model, chunks, embeddings, vectorReady);
   }
 
-  protected override async flushBatchWrites(): Promise<void> {
-    await this.flushPendingIndexWrites();
+  protected override async flushBatchWrites(progress?: MemorySyncProgressState): Promise<void> {
+    await this.flushPendingIndexWrites(progress);
   }
 }

@@ -29,6 +29,8 @@ afterAll(() => {
 
 let embedBatchCalls = 0;
 let embedBatchInputCalls = 0;
+let batchEmbedCalls = 0;
+let batchEmbedChunkCounts: number[] = [];
 let providerCloseCalls = 0;
 let providerCloseFailuresRemaining = 0;
 let providerCloseGate: Promise<void> | null = null;
@@ -130,20 +132,21 @@ vi.mock("./embeddings.js", () => {
               }
             : {}),
         },
-        ...(providerId === "gemini" || providerId === "fallback-provider"
-          ? {
-              runtime: {
-                id: providerId,
-                cacheKeyData: {
-                  provider: providerId,
-                  baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-                  model,
-                  outputDimensionality: options.outputDimensionality,
-                  headers: [],
-                },
-              },
-            }
-          : {}),
+        runtime: {
+          id: providerId,
+          cacheKeyData: {
+            provider: providerId,
+            baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+            model,
+            outputDimensionality: options.outputDimensionality,
+            headers: [],
+          },
+          batchEmbed: async (opts: { chunks: Array<{ text: string }> }) => {
+            batchEmbedCalls += 1;
+            batchEmbedChunkCounts.push(opts.chunks.length);
+            return opts.chunks.map((c) => embedText(c.text));
+          },
+        },
       };
     },
   };
@@ -217,6 +220,8 @@ describe("memory index", () => {
     registerBuiltInMemoryEmbeddingProviders({ registerMemoryEmbeddingProvider: registerAdapter });
     embedBatchCalls = 0;
     embedBatchInputCalls = 0;
+    batchEmbedCalls = 0;
+    batchEmbedChunkCounts = [];
     providerCloseCalls = 0;
     providerCloseFailuresRemaining = 0;
     providerCloseGate = null;
@@ -275,6 +280,7 @@ describe("memory index", () => {
     minScore?: number;
     onSearch?: boolean;
     hybrid?: { enabled: boolean; vectorWeight?: number; textWeight?: number };
+    batch?: { enabled: boolean };
   }): TestCfg {
     return {
       agents: {
@@ -297,6 +303,7 @@ describe("memory index", () => {
             extraPaths: params.extraPaths,
             multimodal: params.multimodal,
             sources: params.sources,
+            remote: params.batch ? { batch: params.batch } : undefined,
             experimental: { sessionMemory: params.sessionMemory ?? false },
           },
         },
@@ -997,6 +1004,87 @@ describe("memory index", () => {
       expect(results[0]?.snippet).toContain("ORBIT-10");
     } finally {
       vi.unstubAllEnvs();
+    }
+  });
+
+  it("batches across memory and session files in a single batchEmbed call", async () => {
+    const sessionsDir = resolveSessionTranscriptsDirForAgent("main");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    await fs.writeFile(
+      path.join(sessionsDir, "session-alpha.jsonl"),
+      [
+        JSON.stringify({
+          type: "session",
+          id: "session-alpha",
+          timestamp: "2026-04-07T15:24:04.113Z",
+        }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "user",
+            timestamp: "2026-04-07T15:24:34.113Z",
+            content: [{ type: "text", text: "Alpha test session data" }],
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
+            timestamp: "2026-04-07T15:25:04.113Z",
+            content: [{ type: "text", text: "Response with alpha data" }],
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    await fs.writeFile(
+      path.join(sessionsDir, "session-beta.jsonl"),
+      [
+        JSON.stringify({
+          type: "session",
+          id: "session-beta",
+          timestamp: "2026-04-07T15:24:04.113Z",
+        }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "user",
+            timestamp: "2026-04-07T15:24:34.113Z",
+            content: [{ type: "text", text: "Beta test session data" }],
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
+            timestamp: "2026-04-07T15:25:04.113Z",
+            content: [{ type: "text", text: "Response with beta data" }],
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const cfg = createCfg({
+      storePath: path.join(workspaceDir, "index-batch-join.sqlite"),
+      sources: ["memory", "sessions"],
+      sessionMemory: true,
+      batch: { enabled: true },
+    });
+    const manager = await getFreshManager(cfg);
+    try {
+      batchEmbedCalls = 0;
+      batchEmbedChunkCounts = [];
+
+      await manager.sync({ reason: "test", force: true });
+
+      expect(batchEmbedCalls).toBe(1);
+      expect(batchEmbedChunkCounts).toEqual([expect.any(Number)]);
+      expect(batchEmbedChunkCounts[0]).toBeGreaterThan(1);
+    } finally {
+      await manager.close?.();
     }
   });
 });

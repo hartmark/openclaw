@@ -1522,7 +1522,7 @@ export abstract class MemoryManagerSyncOps {
       } else {
         this.sessionsDirty = false;
       }
-      await this.flushBatchWrites();
+      await this.flushBatchWrites(progress ?? undefined);
     } catch (err) {
       const reason = formatErrorMessage(err);
       const activated =
@@ -1570,7 +1570,7 @@ export abstract class MemoryManagerSyncOps {
     };
   }
 
-  protected async flushBatchWrites(): Promise<void> {
+  protected async flushBatchWrites(progress?: MemorySyncProgressState): Promise<void> {
     // Override in MemoryManagerEmbeddingOps for two-phase batch flush
   }
 
@@ -1684,10 +1684,7 @@ export abstract class MemoryManagerSyncOps {
         build: async () => {
           await this.seedEmbeddingCache(originalDb);
           const shouldSyncMemory = this.sources.has("memory");
-          const shouldSyncSessions = this.shouldSyncSessions(
-            { reason: params.reason, force: params.force },
-            true,
-          );
+          const shouldSyncSessions = this.sources.has("sessions");
 
           if (shouldSyncMemory) {
             await this.syncMemoryFiles({ needsFullReindex: true, progress: params.progress });
@@ -1703,7 +1700,7 @@ export abstract class MemoryManagerSyncOps {
           } else {
             this.sessionsDirty = false;
           }
-          await this.flushBatchWrites();
+          await this.flushBatchWrites(params.progress);
 
           const meta: MemoryIndexMeta = {
             model: this.provider?.model ?? "fts-only",
@@ -1765,10 +1762,7 @@ export abstract class MemoryManagerSyncOps {
     this.resetIndex();
 
     const shouldSyncMemory = this.sources.has("memory");
-    const shouldSyncSessions = this.shouldSyncSessions(
-      { reason: params.reason, force: params.force },
-      true,
-    );
+    const shouldSyncSessions = this.sources.has("sessions");
 
     if (shouldSyncMemory) {
       await this.syncMemoryFiles({ needsFullReindex: true, progress: params.progress });
@@ -1784,7 +1778,7 @@ export abstract class MemoryManagerSyncOps {
     } else {
       this.sessionsDirty = false;
     }
-    await this.flushBatchWrites();
+    await this.flushBatchWrites(params.progress);
 
     const nextMeta: MemoryIndexMeta = {
       model: this.provider?.model ?? "fts-only",
