@@ -94,6 +94,9 @@ export function classifyMemoryMultimodalPath(
   for (const modality of settings.modalities) {
     for (const extension of getMemoryMultimodalExtensions(modality)) {
       if (lower.endsWith(extension)) {
+        console.log(
+          `[DEBUG] classifyMemoryMultimodalPath: matched ${filePath} as ${modality} via extension ${extension}`,
+        );
         return modality;
       }
     }

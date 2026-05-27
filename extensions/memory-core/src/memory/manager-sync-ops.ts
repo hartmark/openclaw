@@ -1111,6 +1111,7 @@ export abstract class MemoryManagerSyncOps {
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
   }) {
+    console.log(`[DEBUG] syncMemoryFiles starting`);
     const deleteFileByPathAndSource = this.db.prepare(
       `DELETE FROM files WHERE path = ? AND source = ?`,
     );
@@ -1142,6 +1143,9 @@ export abstract class MemoryManagerSyncOps {
         this.getIndexConcurrency(),
       )
     ).filter((entry): entry is MemoryIndexEntry => entry !== null);
+    console.log(
+      `[DEBUG] syncMemoryFiles found ${files.length} files, ${fileEntries.length} valid entries: ${fileEntries.map((e) => e.path).join(", ")}`,
+    );
     log.debug("memory sync: indexing memory files", {
       files: fileEntries.length,
       needsFullReindex: params.needsFullReindex,
@@ -1185,6 +1189,7 @@ export abstract class MemoryManagerSyncOps {
       }
     });
     await runWithConcurrency(tasks, this.getIndexConcurrency());
+    console.log(`[DEBUG] syncMemoryFiles finished processing ${tasks.length} tasks`);
 
     for (const stale of existingRows) {
       if (activePaths.has(stale.path)) {
@@ -1319,6 +1324,7 @@ export abstract class MemoryManagerSyncOps {
       }
     });
     await runWithConcurrency(tasks, this.getIndexConcurrency());
+    console.log(`[DEBUG] syncSessionFiles finished processing ${tasks.length} tasks`);
 
     if (activePaths === null) {
       // Targeted syncs only refresh the requested transcripts and should not
@@ -1406,6 +1412,9 @@ export abstract class MemoryManagerSyncOps {
     sessionFiles?: string[];
     progress?: (update: MemorySyncProgressUpdate) => void;
   }) {
+    console.log(
+      `[DEBUG] runSync starting. reason=${params?.reason} force=${params?.force} sources=${Array.from(this.sources).join(",")}`,
+    );
     // Guard: if an embedding provider is configured but currently unavailable,
     // abort sync to prevent silently degrading an existing semantic vector index
     // to fts-only and wiping existing semantic vectors.
@@ -1435,6 +1444,7 @@ export abstract class MemoryManagerSyncOps {
     });
     const targetSessionFiles = this.normalizeTargetSessionFiles(params?.sessionFiles);
     const hasTargetSessionFiles = targetSessionFiles !== null;
+    console.log(`[DEBUG] hasTargetSessionFiles=${hasTargetSessionFiles}`);
     if (params?.reason === "cli" && !params.force && !hasTargetSessionFiles) {
       await this.markSessionStartupCatchupDirtyFiles();
     }
@@ -1561,6 +1571,9 @@ export abstract class MemoryManagerSyncOps {
   } {
     const batch = this.settings.remote?.batch;
     const enabled = Boolean(batch?.enabled && this.provider && this.providerRuntime?.batchEmbed);
+    console.log(
+      `[DEBUG] resolveBatchConfig [${this.constructor.name}]: enabled=${enabled} (config=${batch?.enabled} hasProvider=${!!this.provider} hasBatchEmbed=${!!this.providerRuntime?.batchEmbed})`,
+    );
     return {
       enabled,
       wait: batch?.wait ?? true,
@@ -1629,6 +1642,7 @@ export abstract class MemoryManagerSyncOps {
     force?: boolean;
     progress?: MemorySyncProgressState;
   }): Promise<void> {
+    console.log(`[DEBUG] runSafeReindex: batchEnabled=${this.batch.enabled}`);
     this.assertFtsOnlySyncAllowed();
 
     const dbPath = resolveUserPath(this.settings.store.path);
@@ -1757,6 +1771,7 @@ export abstract class MemoryManagerSyncOps {
     force?: boolean;
     progress?: MemorySyncProgressState;
   }): Promise<void> {
+    console.log(`[DEBUG] runUnsafeReindex: batchEnabled=${this.batch.enabled}`);
     // Perf: for test runs, skip atomic temp-db swapping. The index is isolated
     // under the per-test HOME anyway, and this cuts substantial fs+sqlite churn.
     this.resetIndex();
@@ -1778,7 +1793,9 @@ export abstract class MemoryManagerSyncOps {
     } else {
       this.sessionsDirty = false;
     }
+    console.log(`[DEBUG] runUnsafeReindex calling flushBatchWrites`);
     await this.flushBatchWrites(params.progress);
+    console.log(`[DEBUG] runUnsafeReindex finished`);
 
     const nextMeta: MemoryIndexMeta = {
       model: this.provider?.model ?? "fts-only",

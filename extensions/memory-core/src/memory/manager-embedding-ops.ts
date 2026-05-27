@@ -343,6 +343,14 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     }
 
     const allMissingChunks = allMissing.map((m) => m.chunk);
+    console.log(
+      `[DEBUG] flushPendingIndexWrites: flushing batch with ${pending.length} files and ${allMissingChunks.length} chunks`,
+    );
+    log.debug("memory embeddings: flushing across-file batch", {
+      files: pending.length,
+      chunks: allMissingChunks.length,
+      provider: this.provider!.id,
+    });
     const batchResult = await this.runBatchWithFallback({
       provider: this.provider!.id,
       run: async () =>
@@ -814,10 +822,18 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     this.upsertFileRecord(entry, source);
   }
 
+  private indexFileCount = 0;
   protected async indexFile(
     entry: MemoryIndexEntry,
     options: { source: MemorySource; content?: string },
   ) {
+    if (this.indexFileCount < 5) {
+      console.log(
+        `[DEBUG] indexFile entry #${this.indexFileCount} (${options.source}):`,
+        JSON.stringify(entry),
+      );
+      this.indexFileCount++;
+    }
     // FTS-only mode: no embedding provider, but we can still build a FTS index
     if (!this.provider) {
       // Multimodal files require an embedding provider; skip in FTS-only mode.
@@ -859,6 +875,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
       chunks = this.provider
         ? enforceEmbeddingMaxInputTokens(this.provider, baseChunks, EMBEDDING_CHUNK_MAX_BYTES)
         : baseChunks;
+      console.log(`[DEBUG] indexFile: chunked ${entry.path} into ${chunks.length} chunks`);
       if (options.source === "sessions" && "lineMap" in entry) {
         remapChunkLines(chunks, entry.lineMap);
       }
@@ -869,10 +886,25 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     }
 
     // Defer for batch across files when batch enabled and not multimodal
-    if (this.batch.enabled && !("kind" in entry && entry.kind === "multimodal")) {
+    const isMultimodal = "kind" in entry && entry.kind === "multimodal";
+    const shouldDefer = this.batch.enabled && !isMultimodal;
+    console.log(
+      `[DEBUG] indexFile [${this.constructor.name}]: ${entry.path} this.batch.enabled=${this.batch.enabled} isMultimodal=${isMultimodal} kind=${"kind" in entry ? entry.kind : "missing"} shouldDefer=${shouldDefer} pendingLength=${this.pendingIndexWrites?.length ?? 0}`,
+    );
+    if (shouldDefer) {
       const { embeddings: cached, missing } = this.collectCachedEmbeddings(chunks);
       if (missing.length > 0) {
-        if (!this.pendingIndexWrites) this.pendingIndexWrites = [];
+        if (!this.pendingIndexWrites) {
+          console.log(`[DEBUG] indexFile: initializing pendingIndexWrites for ${entry.path}`);
+          this.pendingIndexWrites = [];
+        }
+        console.log(
+          `[DEBUG] indexFile: deferring ${entry.path} (${missing.length} missing), pendingLength before=${this.pendingIndexWrites.length}`,
+        );
+        log.debug("memory embeddings: deferring file for batch indexing", {
+          path: entry.path,
+          missing: missing.length,
+        });
         this.pendingIndexWrites.push({
           entry,
           source: options.source,
@@ -880,13 +912,27 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
           cachedEmbeddings: cached,
           missing,
         });
+        console.log(
+          `[DEBUG] indexFile: deferred ${entry.path}, pendingLength after=${this.pendingIndexWrites.length}`,
+        );
         return;
       }
       // All cached: write immediately
+      console.log(`[DEBUG] indexFile: all cached for ${entry.path}`);
+      log.debug("memory embeddings: all chunks cached for file", { path: entry.path });
       const vectorReady = await this.resolveVectorReady(cached);
       this.writeChunks(entry, options.source, this.provider.model, chunks, cached, vectorReady);
       return;
     }
+
+    console.log(
+      `[DEBUG] indexFile: SKIP DEFER for ${entry.path} (batchEnabled=${this.batch.enabled} isMultimodal=${isMultimodal} kind=${"kind" in entry ? entry.kind : "missing"})`,
+    );
+    log.debug("memory embeddings: indexing file without across-file batching", {
+      path: entry.path,
+      batchEnabled: this.batch.enabled,
+      kind: "kind" in entry ? entry.kind : "unknown",
+    });
 
     let embeddings: number[][];
     try {

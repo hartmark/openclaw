@@ -45,6 +45,7 @@ export type SessionFileEntry = {
   generatedByDreamingNarrative?: boolean;
   /** True when this transcript belongs to an isolated cron run session. */
   generatedByCronRun?: boolean;
+  kind: "session-jsonl";
 };
 
 export type BuildSessionEntryOptions = {
@@ -562,6 +563,7 @@ export async function buildSessionEntry(
         content: "",
         lineMap: [],
         messageTimestampsMs: [],
+        kind: "session-jsonl",
       };
     }
     const raw = (await readRegularFile({ filePath: absPath })).buffer.toString("utf-8");
@@ -679,6 +681,7 @@ export async function buildSessionEntry(
       messageTimestampsMs,
       ...(generatedByDreamingNarrative ? { generatedByDreamingNarrative: true } : {}),
       ...(generatedByCronRun ? { generatedByCronRun: true } : {}),
+      kind: "session-jsonl",
     };
   } catch (err) {
     void logSessionFileReadFailure(absPath, err);

@@ -528,11 +528,13 @@ export async function runWithConcurrency<T>(
   tasks: Array<() => Promise<T>>,
   limit: number,
 ): Promise<T[]> {
+  console.log(`[DEBUG] runWithConcurrency: starting ${tasks.length} tasks with limit ${limit}`);
   const { results, firstError, hasError } = await runTasksWithConcurrency({
     tasks,
     limit,
     errorMode: "stop",
   });
+  console.log(`[DEBUG] runWithConcurrency: finished ${tasks.length} tasks (hasError=${hasError})`);
   if (hasError) {
     throw firstError;
   }
