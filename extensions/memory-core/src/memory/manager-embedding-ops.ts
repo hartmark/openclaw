@@ -370,7 +370,17 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
       },
     });
 
-    if (batchResult && batchResult.length === allMissingChunks.length) {
+    if (!batchResult) {
+      const allChunks = pending.flatMap((p) => p.chunks);
+      const fallbackResult = await this.embedChunksInBatches(allChunks);
+      let offset = 0;
+      for (const p of pending) {
+        for (let i = 0; i < p.chunks.length; i++) {
+          p.cachedEmbeddings[i] = fallbackResult[offset + i] ?? [];
+        }
+        offset += p.chunks.length;
+      }
+    } else if (batchResult.length === allMissingChunks.length) {
       // Batch API path: result[i] corresponds to allMissing[i]
       const toCache: Array<{ hash: string; embedding: number[] }> = [];
       let idx = 0;
@@ -390,7 +400,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
         entries: toCache,
         tableName: EMBEDDING_CACHE_TABLE,
       });
-    } else if (batchResult) {
+    } else {
       // Fallback: embedChunksInBatches returned embeddings for ALL chunks
       let offset = 0;
       for (const p of pending) {
