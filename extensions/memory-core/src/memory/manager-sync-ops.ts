@@ -73,20 +73,22 @@ import {
   type MemoryWatchSettleQueue,
 } from "./watch-settle.js";
 
-type MemorySyncProgressState = {
+export type MemorySyncProgressState = {
   completed: number;
   total: number;
   label?: string;
   report: (update: MemorySyncProgressUpdate) => void;
 };
 
-type MemoryIndexEntry = {
+export type MemoryIndexEntry = {
   path: string;
   absPath: string;
   mtimeMs: number;
   size: number;
   hash: string;
   content?: string;
+  kind?: "markdown" | "multimodal";
+  lineMap?: number[];
 };
 
 const META_KEY = "memory_index_meta_v1";
@@ -219,7 +221,7 @@ export abstract class MemoryManagerSyncOps {
   } = { enabled: false, available: false };
   protected vectorReady: Promise<boolean> | null = null;
   protected watcher: FSWatcher | null = null;
-  private nativeMemoryWatchPairs: NativeMemoryWatchPair[] = [];
+  private readonly nativeMemoryWatchPairs: NativeMemoryWatchPair[] = [];
   protected watchTimer: NodeJS.Timeout | null = null;
   protected sessionWatchTimer: NodeJS.Timeout | null = null;
   protected sessionUnsubscribe: (() => void) | null = null;
@@ -1164,7 +1166,8 @@ export abstract class MemoryManagerSyncOps {
       });
     }
 
-    const tasks = fileEntries.map((entry) => async () => {
+    const dirtyFiles: MemoryIndexEntry[] = [];
+    for (const entry of fileEntries) {
       if (!params.needsFullReindex && existingHashes.get(entry.path) === entry.hash) {
         if (params.progress) {
           params.progress.completed += 1;
@@ -1173,18 +1176,28 @@ export abstract class MemoryManagerSyncOps {
             total: params.progress.total,
           });
         }
-        return;
+        continue;
       }
-      await this.indexFile(entry, { source: "memory" });
-      if (params.progress) {
-        params.progress.completed += 1;
-        params.progress.report({
-          completed: params.progress.completed,
-          total: params.progress.total,
+      dirtyFiles.push(entry);
+    }
+
+    if (dirtyFiles.length > 0) {
+      if (this.batch.enabled) {
+        await this.indexFiles(dirtyFiles, { source: "memory", progress: params.progress });
+      } else {
+        const tasks = dirtyFiles.map((entry) => async () => {
+          await this.indexFile(entry, { source: "memory" });
+          if (params.progress) {
+            params.progress.completed += 1;
+            params.progress.report({
+              completed: params.progress.completed,
+              total: params.progress.total,
+            });
+          }
         });
+        await runWithConcurrency(tasks, this.getIndexConcurrency());
       }
-    });
-    await runWithConcurrency(tasks, this.getIndexConcurrency());
+    }
 
     for (const stale of existingRows) {
       if (activePaths.has(stale.path)) {
@@ -1265,9 +1278,67 @@ export abstract class MemoryManagerSyncOps {
     }
 
     const yieldAfterSessionFile = createSessionSyncYield(files.length);
-    const tasks = files.map((absPath) => async () => {
-      try {
-        if (!indexAll && !this.sessionsDirtyFiles.has(absPath)) {
+    const dirtyFiles = (
+      await runWithConcurrency(
+        files.map((absPath) => async () => {
+          try {
+            if (!indexAll && !this.sessionsDirtyFiles.has(absPath)) {
+              if (params.progress) {
+                params.progress.completed += 1;
+                params.progress.report({
+                  completed: params.progress.completed,
+                  total: params.progress.total,
+                });
+              }
+              return null;
+            }
+            const entry = await buildSessionEntry(absPath);
+            if (!entry) {
+              if (params.progress) {
+                params.progress.completed += 1;
+                params.progress.report({
+                  completed: params.progress.completed,
+                  total: params.progress.total,
+                });
+              }
+              return null;
+            }
+            const existingHash = resolveMemorySourceExistingHash({
+              db: this.db,
+              source: "sessions",
+              path: entry.path,
+              existingHashes,
+            });
+            if (!params.needsFullReindex && existingHash === entry.hash) {
+              if (params.progress) {
+                params.progress.completed += 1;
+                params.progress.report({
+                  completed: params.progress.completed,
+                  total: params.progress.total,
+                });
+              }
+              this.resetSessionDelta(absPath, entry.size);
+              return null;
+            }
+            return entry;
+          } finally {
+            await yieldAfterSessionFile();
+          }
+        }),
+        this.getIndexConcurrency(),
+      )
+    ).filter((entry): entry is MemoryIndexEntry => entry !== null);
+
+    if (dirtyFiles.length > 0) {
+      if (this.batch.enabled) {
+        await this.indexFiles(dirtyFiles, { source: "sessions", progress: params.progress });
+        for (const entry of dirtyFiles) {
+          this.resetSessionDelta(entry.absPath, entry.size);
+        }
+      } else {
+        const tasks = dirtyFiles.map((entry) => async () => {
+          await this.indexFile(entry, { source: "sessions", content: entry.content });
+          this.resetSessionDelta(entry.absPath, entry.size);
           if (params.progress) {
             params.progress.completed += 1;
             params.progress.report({
@@ -1275,50 +1346,10 @@ export abstract class MemoryManagerSyncOps {
               total: params.progress.total,
             });
           }
-          return;
-        }
-        const entry = await buildSessionEntry(absPath);
-        if (!entry) {
-          if (params.progress) {
-            params.progress.completed += 1;
-            params.progress.report({
-              completed: params.progress.completed,
-              total: params.progress.total,
-            });
-          }
-          return;
-        }
-        const existingHash = resolveMemorySourceExistingHash({
-          db: this.db,
-          source: "sessions",
-          path: entry.path,
-          existingHashes,
         });
-        if (!params.needsFullReindex && existingHash === entry.hash) {
-          if (params.progress) {
-            params.progress.completed += 1;
-            params.progress.report({
-              completed: params.progress.completed,
-              total: params.progress.total,
-            });
-          }
-          this.resetSessionDelta(absPath, entry.size);
-          return;
-        }
-        await this.indexFile(entry, { source: "sessions", content: entry.content });
-        this.resetSessionDelta(absPath, entry.size);
-        if (params.progress) {
-          params.progress.completed += 1;
-          params.progress.report({
-            completed: params.progress.completed,
-            total: params.progress.total,
-          });
-        }
-      } finally {
-        await yieldAfterSessionFile();
+        await runWithConcurrency(tasks, this.getIndexConcurrency());
       }
-    });
-    await runWithConcurrency(tasks, this.getIndexConcurrency());
+    }
 
     if (activePaths === null) {
       // Targeted syncs only refresh the requested transcripts and should not
