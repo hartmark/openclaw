@@ -43,13 +43,15 @@ class SessionDeltaHarness extends MemoryManagerSyncOps {
       },
     },
   } as ResolvedMemorySearchConfig;
-  protected readonly batch = {
-    enabled: false,
-    wait: false,
-    concurrency: 1,
-    pollIntervalMs: 0,
-    timeoutMs: 0,
-  };
+  protected get batch() {
+    return {
+      enabled: false,
+      wait: false,
+      concurrency: 1,
+      pollIntervalMs: 0,
+      timeoutMs: 0,
+    };
+  }
   protected readonly vector = { enabled: false, available: false };
   protected readonly cache = { enabled: false };
   protected providerUnavailableReason?: string;

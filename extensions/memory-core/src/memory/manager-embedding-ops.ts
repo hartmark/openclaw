@@ -264,7 +264,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
   ): Promise<number[][]> {
     const provider = this.provider;
     const batchEmbed = this.providerRuntime?.batchEmbed;
-    if (!provider || !batchEmbed) {
+    if (!provider || !batchEmbed || !this.batch.enabled) {
       return this.embedChunksInBatches(chunks);
     }
     if (chunks.length === 0) {
@@ -888,22 +888,23 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     // Defer for batch across files when batch enabled and not multimodal
     const isMultimodal = "kind" in entry && entry.kind === "multimodal";
     const shouldDefer = this.batch.enabled && !isMultimodal;
-    console.log(
-      `[DEBUG] indexFile [${this.constructor.name}]: ${entry.path} this.batch.enabled=${this.batch.enabled} isMultimodal=${isMultimodal} kind=${"kind" in entry ? entry.kind : "missing"} shouldDefer=${shouldDefer} pendingLength=${this.pendingIndexWrites?.length ?? 0}`,
-    );
+    log.debug("memory index: check deferral", {
+      path: entry.path,
+      batchEnabled: this.batch.enabled,
+      isMultimodal,
+      shouldDefer,
+    });
     if (shouldDefer) {
       const { embeddings: cached, missing } = this.collectCachedEmbeddings(chunks);
       if (missing.length > 0) {
         if (!this.pendingIndexWrites) {
-          console.log(`[DEBUG] indexFile: initializing pendingIndexWrites for ${entry.path}`);
           this.pendingIndexWrites = [];
         }
-        console.log(
-          `[DEBUG] indexFile: deferring ${entry.path} (${missing.length} missing), pendingLength before=${this.pendingIndexWrites.length}`,
-        );
+        const pendingBefore = this.pendingIndexWrites.length;
         log.debug("memory embeddings: deferring file for batch indexing", {
           path: entry.path,
           missing: missing.length,
+          pendingBefore,
         });
         this.pendingIndexWrites.push({
           entry,
@@ -912,13 +913,13 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
           cachedEmbeddings: cached,
           missing,
         });
-        console.log(
-          `[DEBUG] indexFile: deferred ${entry.path}, pendingLength after=${this.pendingIndexWrites.length}`,
-        );
+        log.debug("memory embeddings: deferred file", {
+          path: entry.path,
+          pendingAfter: this.pendingIndexWrites.length,
+        });
         return;
       }
       // All cached: write immediately
-      console.log(`[DEBUG] indexFile: all cached for ${entry.path}`);
       log.debug("memory embeddings: all chunks cached for file", { path: entry.path });
       const vectorReady = await this.resolveVectorReady(cached);
       this.writeChunks(entry, options.source, this.provider.model, chunks, cached, vectorReady);

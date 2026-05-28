@@ -132,13 +132,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   protected providerUnavailableReason?: string;
   protected override providerLifecycle: MemoryProviderLifecycleState;
   protected override providerRuntime?: EmbeddingProviderRuntime;
-  protected batch: {
-    enabled: boolean;
-    wait: boolean;
-    concurrency: number;
-    pollIntervalMs: number;
-    timeoutMs: number;
-  };
   protected batchFailureCount = 0;
   protected batchFailureLastError?: string;
   protected batchFailureLastProvider?: string;
@@ -278,7 +271,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       statusOnly: params.purpose === "status",
       hasIndexedMeta: Boolean(meta),
     });
-    this.batch = this.resolveBatchConfig();
     if (!transient) {
       this.ensureSessionStartupCatchup();
     }
@@ -293,6 +285,11 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     this.providerLifecycle = providerState.lifecycle;
     this.providerRuntime = providerState.providerRuntime;
     this.providerInitialized = true;
+    log.debug("memory index: applied provider result", {
+      providerId: this.provider?.id,
+      hasRuntime: !!this.providerRuntime,
+      batchEnabled: this.batch.enabled,
+    });
   }
 
   private async ensureProviderInitialized(): Promise<void> {
@@ -308,7 +305,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         });
         this.applyProviderResult(providerResult);
         this.providerKey = this.computeProviderKey();
-        this.batch = this.resolveBatchConfig();
       })();
     }
     try {
@@ -351,7 +347,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     });
     EMBEDDING_PROBE_CACHE.delete(this.cacheKey);
     this.providerKey = this.computeProviderKey();
-    this.batch = this.resolveBatchConfig();
     this.vector.semanticAvailable = false;
     void Promise.resolve(degradedProvider.close?.()).catch((err: unknown) => {
       log.debug(`memory embeddings: failed to close degraded local provider: ${String(err)}`);

@@ -195,13 +195,9 @@ export abstract class MemoryManagerSyncOps {
   protected abstract providerUnavailableReason?: string;
   protected abstract providerLifecycle: MemoryProviderLifecycleState;
   protected providerRuntime?: EmbeddingProviderRuntime;
-  protected abstract batch: {
-    enabled: boolean;
-    wait: boolean;
-    concurrency: number;
-    pollIntervalMs: number;
-    timeoutMs: number;
-  };
+  protected get batch() {
+    return this.resolveBatchConfig();
+  }
   protected readonly sources: Set<MemorySource> = new Set();
   protected providerKey: string | null = null;
   protected abstract readonly vector: {
@@ -1570,10 +1566,20 @@ export abstract class MemoryManagerSyncOps {
     timeoutMs: number;
   } {
     const batch = this.settings.remote?.batch;
-    const enabled = Boolean(batch?.enabled && this.provider && this.providerRuntime?.batchEmbed);
-    console.log(
-      `[DEBUG] resolveBatchConfig [${this.constructor.name}]: enabled=${enabled} (config=${batch?.enabled} hasProvider=${!!this.provider} hasBatchEmbed=${!!this.providerRuntime?.batchEmbed})`,
-    );
+    // When no provider is loaded yet (e.g. status), assume it supports batching if configured.
+    // Real indexing will ensure the provider is initialized and has batchEmbed before proceeding.
+    const batchSupported = this.provider
+      ? this.providerRuntime
+        ? Boolean(this.providerRuntime.batchEmbed)
+        : true
+      : true;
+    const enabled = Boolean(batch?.enabled && batchSupported);
+    log.debug("memory index: resolved batch config", {
+      enabled,
+      configured: batch?.enabled,
+      hasProvider: !!this.provider,
+      hasBatchEmbed: !!this.providerRuntime?.batchEmbed,
+    });
     return {
       enabled,
       wait: batch?.wait ?? true,
@@ -1630,7 +1636,6 @@ export abstract class MemoryManagerSyncOps {
     this.providerUnavailableReason = fallbackState.providerUnavailableReason;
     this.providerLifecycle = fallbackState.lifecycle;
     this.providerKey = this.computeProviderKey();
-    this.batch = this.resolveBatchConfig();
     log.warn(`memory embeddings: switched to fallback provider (${fallbackRequest.provider})`, {
       reason,
     });
@@ -1642,7 +1647,7 @@ export abstract class MemoryManagerSyncOps {
     force?: boolean;
     progress?: MemorySyncProgressState;
   }): Promise<void> {
-    console.log(`[DEBUG] runSafeReindex: batchEnabled=${this.batch.enabled}`);
+    log.debug("memory index: starting safe reindex", { batchEnabled: this.batch.enabled });
     this.assertFtsOnlySyncAllowed();
 
     const dbPath = resolveUserPath(this.settings.store.path);
@@ -1771,7 +1776,7 @@ export abstract class MemoryManagerSyncOps {
     force?: boolean;
     progress?: MemorySyncProgressState;
   }): Promise<void> {
-    console.log(`[DEBUG] runUnsafeReindex: batchEnabled=${this.batch.enabled}`);
+    log.debug("memory index: starting unsafe reindex", { batchEnabled: this.batch.enabled });
     // Perf: for test runs, skip atomic temp-db swapping. The index is isolated
     // under the per-test HOME anyway, and this cuts substantial fs+sqlite churn.
     this.resetIndex();
