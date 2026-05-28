@@ -86,6 +86,7 @@ export type MemoryIndexEntry = {
   mtimeMs: number;
   size: number;
   hash: string;
+  source?: MemorySource;
   content?: string;
   kind?: "markdown" | "multimodal";
   lineMap?: number[];
@@ -258,6 +259,10 @@ export abstract class MemoryManagerSyncOps {
   protected abstract getIndexConcurrency(): number;
   protected abstract pruneEmbeddingCacheIfNeeded(): void;
   protected abstract resetProviderInitializationForRetry(): void;
+  protected abstract indexFiles(
+    entries: MemoryIndexEntry[],
+    options: { progress?: MemorySyncProgressState },
+  ): Promise<void>;
   protected abstract indexFile(
     entry: MemoryIndexEntry,
     options: { source: MemorySource; content?: string },
@@ -1112,7 +1117,7 @@ export abstract class MemoryManagerSyncOps {
   private async syncMemoryFiles(params: {
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
-  }) {
+  }): Promise<MemoryIndexEntry[]> {
     const deleteFileByPathAndSource = this.db.prepare(
       `DELETE FROM files WHERE path = ? AND source = ?`,
     );
@@ -1178,13 +1183,12 @@ export abstract class MemoryManagerSyncOps {
         }
         continue;
       }
+      entry.source = "memory";
       dirtyFiles.push(entry);
     }
 
     if (dirtyFiles.length > 0) {
-      if (this.batch.enabled) {
-        await this.indexFiles(dirtyFiles, { source: "memory", progress: params.progress });
-      } else {
+      if (!this.batch.enabled) {
         const tasks = dirtyFiles.map((entry) => async () => {
           await this.indexFile(entry, { source: "memory" });
           if (params.progress) {
@@ -1196,6 +1200,7 @@ export abstract class MemoryManagerSyncOps {
           }
         });
         await runWithConcurrency(tasks, this.getIndexConcurrency());
+        return [];
       }
     }
 
@@ -1216,13 +1221,15 @@ export abstract class MemoryManagerSyncOps {
         } catch {}
       }
     }
+
+    return dirtyFiles;
   }
 
   private async syncSessionFiles(params: {
     needsFullReindex: boolean;
     targetSessionFiles?: string[];
     progress?: MemorySyncProgressState;
-  }) {
+  }): Promise<MemoryIndexEntry[]> {
     const deleteFileByPathAndSource = this.db.prepare(
       `DELETE FROM files WHERE path = ? AND source = ?`,
     );
@@ -1330,12 +1337,10 @@ export abstract class MemoryManagerSyncOps {
     ).filter((entry): entry is MemoryIndexEntry => entry !== null);
 
     if (dirtyFiles.length > 0) {
-      if (this.batch.enabled) {
-        await this.indexFiles(dirtyFiles, { source: "sessions", progress: params.progress });
-        for (const entry of dirtyFiles) {
-          this.resetSessionDelta(entry.absPath, entry.size);
-        }
-      } else {
+      for (const entry of dirtyFiles) {
+        entry.source = "sessions";
+      }
+      if (!this.batch.enabled) {
         const tasks = dirtyFiles.map((entry) => async () => {
           await this.indexFile(entry, { source: "sessions", content: entry.content });
           this.resetSessionDelta(entry.absPath, entry.size);
@@ -1348,13 +1353,14 @@ export abstract class MemoryManagerSyncOps {
           }
         });
         await runWithConcurrency(tasks, this.getIndexConcurrency());
+        return [];
       }
     }
 
     if (activePaths === null) {
       // Targeted syncs only refresh the requested transcripts and should not
       // prune unrelated session rows without a full directory enumeration.
-      return;
+      return dirtyFiles;
     }
 
     const staleRows = existingRows ?? [];
@@ -1384,6 +1390,8 @@ export abstract class MemoryManagerSyncOps {
         await yieldAfterStaleSessionRow();
       }
     }
+
+    return dirtyFiles;
   }
 
   private createSyncProgress(
@@ -1529,28 +1537,43 @@ export abstract class MemoryManagerSyncOps {
         return;
       }
 
+      const dirtyEntries: MemoryIndexEntry[] = [];
       const shouldSyncMemory =
         this.sources.has("memory") &&
         ((!hasTargetSessionFiles && params?.force) || needsFullReindex || this.dirty);
       const shouldSyncSessions = this.shouldSyncSessions(params, needsFullReindex);
 
       if (shouldSyncMemory) {
-        await this.syncMemoryFiles({ needsFullReindex, progress: progress ?? undefined });
+        const memoryDirty = await this.syncMemoryFiles({
+          needsFullReindex,
+          progress: progress ?? undefined,
+        });
+        dirtyEntries.push(...memoryDirty);
         this.dirty = false;
       }
 
       if (shouldSyncSessions) {
-        await this.syncSessionFiles({
+        const sessionDirty = await this.syncSessionFiles({
           needsFullReindex,
           targetSessionFiles: targetSessionFiles ? Array.from(targetSessionFiles) : undefined,
           progress: progress ?? undefined,
         });
+        dirtyEntries.push(...sessionDirty);
         this.sessionsDirty = false;
         this.sessionsDirtyFiles.clear();
       } else if (this.sessionsDirtyFiles.size > 0) {
         this.sessionsDirty = true;
       } else {
         this.sessionsDirty = false;
+      }
+
+      if (dirtyEntries.length > 0) {
+        await this.indexFiles(dirtyEntries, { progress: progress ?? undefined });
+        for (const entry of dirtyEntries) {
+          if (entry.source === "sessions") {
+            this.resetSessionDelta(entry.absPath, entry.size);
+          }
+        }
       }
     } catch (err) {
       const reason = formatErrorMessage(err);
@@ -1714,19 +1737,37 @@ export abstract class MemoryManagerSyncOps {
             true,
           );
 
+          const dirtyEntries: MemoryIndexEntry[] = [];
           if (shouldSyncMemory) {
-            await this.syncMemoryFiles({ needsFullReindex: true, progress: params.progress });
+            const memoryDirty = await this.syncMemoryFiles({
+              needsFullReindex: true,
+              progress: params.progress,
+            });
+            dirtyEntries.push(...memoryDirty);
             this.dirty = false;
           }
 
           if (shouldSyncSessions) {
-            await this.syncSessionFiles({ needsFullReindex: true, progress: params.progress });
+            const sessionDirty = await this.syncSessionFiles({
+              needsFullReindex: true,
+              progress: params.progress,
+            });
+            dirtyEntries.push(...sessionDirty);
             this.sessionsDirty = false;
             this.sessionsDirtyFiles.clear();
           } else if (this.sessionsDirtyFiles.size > 0) {
             this.sessionsDirty = true;
           } else {
             this.sessionsDirty = false;
+          }
+
+          if (dirtyEntries.length > 0) {
+            await this.indexFiles(dirtyEntries, { progress: params.progress });
+            for (const entry of dirtyEntries) {
+              if (entry.source === "sessions") {
+                this.resetSessionDelta(entry.absPath, entry.size);
+              }
+            }
           }
 
           const meta: MemoryIndexMeta = {
@@ -1794,19 +1835,37 @@ export abstract class MemoryManagerSyncOps {
       true,
     );
 
+    const dirtyEntries: MemoryIndexEntry[] = [];
     if (shouldSyncMemory) {
-      await this.syncMemoryFiles({ needsFullReindex: true, progress: params.progress });
+      const memoryDirty = await this.syncMemoryFiles({
+        needsFullReindex: true,
+        progress: params.progress,
+      });
+      dirtyEntries.push(...memoryDirty);
       this.dirty = false;
     }
 
     if (shouldSyncSessions) {
-      await this.syncSessionFiles({ needsFullReindex: true, progress: params.progress });
+      const sessionDirty = await this.syncSessionFiles({
+        needsFullReindex: true,
+        progress: params.progress,
+      });
+      dirtyEntries.push(...sessionDirty);
       this.sessionsDirty = false;
       this.sessionsDirtyFiles.clear();
     } else if (this.sessionsDirtyFiles.size > 0) {
       this.sessionsDirty = true;
     } else {
       this.sessionsDirty = false;
+    }
+
+    if (dirtyEntries.length > 0) {
+      await this.indexFiles(dirtyEntries, { progress: params.progress });
+      for (const entry of dirtyEntries) {
+        if (entry.source === "sessions") {
+          this.resetSessionDelta(entry.absPath, entry.size);
+        }
+      }
     }
 
     const nextMeta: MemoryIndexMeta = {

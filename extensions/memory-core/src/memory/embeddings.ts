@@ -78,6 +78,7 @@ function adaptGenericRuntime(
     ...(typeof runtime.inlineBatchTimeoutMs === "number"
       ? { inlineBatchTimeoutMs: runtime.inlineBatchTimeoutMs }
       : {}),
+    ...(runtime.batchEmbed ? { batchEmbed: runtime.batchEmbed } : {}),
   };
 }
 

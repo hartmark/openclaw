@@ -698,7 +698,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
 
   protected async indexFiles(
     entries: MemoryIndexEntry[],
-    options: { source: MemorySource; progress?: MemorySyncProgressState },
+    options: { progress?: MemorySyncProgressState },
   ) {
     if (entries.length === 0) {
       return;
@@ -712,6 +712,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     }> = [];
 
     for (const entry of entries) {
+      const source = entry.source!;
       // FTS-only mode: no embedding provider, but we can still build a FTS index
       if (!this.provider) {
         // Multimodal files require an embedding provider; skip in FTS-only mode.
@@ -721,10 +722,10 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
         }
         const content = entry.content ?? (await fs.readFile(entry.absPath, "utf-8"));
         const chunks = filterNonEmptyMemoryChunks(chunkMarkdown(content, this.settings.chunking));
-        if (options.source === "sessions" && "lineMap" in entry && entry.lineMap) {
+        if (source === "sessions" && "lineMap" in entry && entry.lineMap) {
           remapChunkLines(chunks, entry.lineMap);
         }
-        this.writeChunks(entry, options.source, "fts-only", chunks, [], false);
+        this.writeChunks(entry, source, "fts-only", chunks, [], false);
         this.reportProgress(options.progress);
         continue;
       }
@@ -734,8 +735,8 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
       if ("kind" in entry && entry.kind === "multimodal") {
         const multimodalChunk = await buildMultimodalChunkForIndexing(entry);
         if (!multimodalChunk) {
-          this.clearIndexedFileData(entry.path, options.source);
-          this.deleteFileRecord(entry.path, options.source);
+          this.clearIndexedFileData(entry.path, source);
+          this.deleteFileRecord(entry.path, source);
           this.reportProgress(options.progress);
           continue;
         }
@@ -751,7 +752,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
           baseChunks,
           EMBEDDING_BATCH_MAX_TOKENS,
         );
-        if (options.source === "sessions" && "lineMap" in entry && entry.lineMap) {
+        if (source === "sessions" && "lineMap" in entry && entry.lineMap) {
           remapChunkLines(chunks, entry.lineMap);
         }
       }
@@ -767,8 +768,9 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     let allEmbeddings: number[][];
 
     try {
+      const firstSource = items[0].entry.source!;
       allEmbeddings = this.batch.enabled
-        ? await this.embedChunksWithBatch(allChunks, options.source)
+        ? await this.embedChunksWithBatch(allChunks, firstSource)
         : await this.embedChunksInBatches(allChunks);
     } catch (err) {
       const message = formatErrorMessage(err);
@@ -791,8 +793,8 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
             model: this.provider.model,
             error: message,
           });
-          this.clearIndexedFileData(item.entry.path, options.source);
-          this.upsertFileRecord(item.entry, options.source);
+          this.clearIndexedFileData(item.entry.path, item.entry.source!);
+          this.upsertFileRecord(item.entry, item.entry.source!);
           this.reportProgress(options.progress);
           return;
         }
@@ -812,7 +814,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
 
       this.writeChunks(
         item.entry,
-        options.source,
+        item.entry.source!,
         this.provider!.model,
         item.chunks,
         embeddings,
@@ -836,8 +838,9 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     entry: MemoryIndexEntry,
     options: { source: MemorySource; content?: string },
   ) {
-    await this.indexFiles([{ ...entry, content: options.content ?? entry.content }], {
-      source: options.source,
-    });
+    await this.indexFiles(
+      [{ ...entry, source: options.source, content: options.content ?? entry.content }],
+      {},
+    );
   }
 }

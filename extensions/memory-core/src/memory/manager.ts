@@ -132,13 +132,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   protected providerUnavailableReason?: string;
   protected override providerLifecycle: MemoryProviderLifecycleState;
   protected override providerRuntime?: EmbeddingProviderRuntime;
-  protected batch: {
-    enabled: boolean;
-    wait: boolean;
-    concurrency: number;
-    pollIntervalMs: number;
-    timeoutMs: number;
-  };
   protected batchFailureCount = 0;
   protected batchFailureLastError?: string;
   protected batchFailureLastProvider?: string;
@@ -738,6 +731,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     if (this.closed) {
       return;
     }
+    await this.ensureProviderInitialized();
     if (this.syncing) {
       if (params?.sessionFiles?.some((sessionFile) => sessionFile.trim().length > 0)) {
         return this.enqueueTargetedSessionSync(params.sessionFiles);
