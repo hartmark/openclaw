@@ -55,6 +55,19 @@ export async function quiesceMatrixClientSync(params: {
     params.markStopped();
     return;
   }
+  if (syncApi.getSyncState() === SyncState.Error) {
+    // matrix-js-sdk 41.9.0's SyncApi.stop() (lib/sync.js) only sets
+    // running=false, aborts any in-flight request, and clears the Error-state
+    // keepAliveTimer; it never emits sync.state itself. The STOPPED
+    // transition is only emitted by the sync loop noticing running=false the
+    // next time it runs. In the Error state the loop is parked inside that
+    // same keepAliveTimer, so stop() cancels the only thing that would ever
+    // re-enter it: no STOPPED event can follow, and waiting for one always
+    // burns the full timeout.
+    syncApi.stop();
+    params.markStopped();
+    return;
+  }
 
   await new Promise<void>((resolve, reject) => {
     let settled = false;
