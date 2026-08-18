@@ -17,8 +17,17 @@ import {
 } from "./message-delivery-progress-store.js";
 
 const AUDIT_MAINTENANCE_INTERVAL_MS = 60 * 60_000;
+// The Gateway main thread also opens and schema-verifies this shared database
+// on its own first access. Running that same fresh-open verification from this
+// worker's first tick at the same moment races the main thread for the file
+// and can stall both for many seconds. Wait for the Gateway's "start" signal
+// (sent once its own shared state database is open) so only one side pays the
+// fresh-open cost; fall back to starting anyway so maintenance is never lost
+// if that signal never arrives.
+const STARTUP_MAINTENANCE_FALLBACK_MS = 10_000;
 
 type AuditWriterRequest =
+  | { type: "start" }
   | { type: "record-event"; input: AuditEventInput }
   | { type: "record-execution-identity"; work: unknown }
   | { type: "record-execution-decision"; receipt: unknown }
@@ -81,11 +90,26 @@ function reportMaintenance(): void {
   }
 }
 
-reportMaintenance();
-const maintenanceTimer = setInterval(reportMaintenance, AUDIT_MAINTENANCE_INTERVAL_MS);
+let maintenanceStarted = false;
+let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
+function startMaintenance(): void {
+  if (maintenanceStarted) {
+    return;
+  }
+  maintenanceStarted = true;
+  clearTimeout(startupFallbackTimer);
+  reportMaintenance();
+  maintenanceTimer = setInterval(reportMaintenance, AUDIT_MAINTENANCE_INTERVAL_MS);
+}
+const startupFallbackTimer = setTimeout(startMaintenance, STARTUP_MAINTENANCE_FALLBACK_MS);
+startupFallbackTimer.unref?.();
 port.postMessage({ type: "ready" });
 
 port.on("message", (message: AuditWriterRequest) => {
+  if (message.type === "start") {
+    startMaintenance();
+    return;
+  }
   if (message.type === "record-event") {
     try {
       if (isOutboundMessageProgressInput(message.input)) {
@@ -117,6 +141,7 @@ port.on("message", (message: AuditWriterRequest) => {
     }
     return;
   }
+  clearTimeout(startupFallbackTimer);
   clearInterval(maintenanceTimer);
   reportMaintenance();
   try {

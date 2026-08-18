@@ -6,7 +6,10 @@ import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { DecisionReceiptV1 } from "../../packages/gateway-protocol/src/index.js";
 import { resolveStateDir } from "../config/paths.js";
 import { redactSensitiveText } from "../logging/redact.js";
-import { OPENCLAW_SQLITE_BUSY_TIMEOUT_MS } from "../state/openclaw-state-db.js";
+import {
+  OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
+  registerOpenClawStateDatabaseLifecycleListener,
+} from "../state/openclaw-state-db.js";
 import type { AuditEventInput } from "./audit-event-types.js";
 import type { ExecutionIdentityAdmissionWork } from "./execution-identity-admission.js";
 
@@ -82,6 +85,37 @@ export function createAuditEventWriter(
   }
   worker.unref?.();
 
+  // Let the Gateway's own first shared-state-database open finish before the
+  // worker's first maintenance tick opens and schema-verifies the same file;
+  // running both fresh opens at once can stall each other for many seconds
+  // (see the audit-event-writer.worker.ts comment on AUDIT_MAINTENANCE_INTERVAL_MS).
+  let unregisterStateDbListener: (() => void) | undefined;
+  let stateDbOpenSeen = false;
+  const handleStateDbLifecycleEvent: Parameters<
+    typeof registerOpenClawStateDatabaseLifecycleListener
+  >[0] = (event) => {
+    if (event.kind !== "opened" || stateDbOpenSeen) {
+      return;
+    }
+    stateDbOpenSeen = true;
+    // The listener can fire synchronously from the register call below, before
+    // it has returned its own unsubscribe function.
+    unregisterStateDbListener?.();
+    try {
+      // Node Worker.postMessage is not the browser Window API and has no targetOrigin.
+      // oxlint-disable-next-line unicorn/require-post-message-target-origin
+      worker.postMessage({ type: "start" });
+    } catch {
+      // Worker already unavailable; its own error/exit handlers cover this.
+    }
+  };
+  unregisterStateDbListener = registerOpenClawStateDatabaseLifecycleListener(
+    handleStateDbLifecycleEvent,
+  );
+  if (stateDbOpenSeen) {
+    unregisterStateDbListener();
+  }
+
   let pending = 0;
   let stopped = false;
   let unavailable = false;
@@ -100,6 +134,7 @@ export function createAuditEventWriter(
     }
   };
   const finishStop = () => {
+    unregisterStateDbListener?.();
     if (stopTimer) {
       clearTimeout(stopTimer);
       stopTimer = undefined;
