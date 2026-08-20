@@ -179,4 +179,77 @@ describe("OpenAI Responses continuation", () => {
     expect(next?.request.previous_response_id).toBeUndefined();
     next?.release();
   });
+
+  it("reports no_previous_response for a first turn with no cached state", () => {
+    expect(resolveResponsesContinuationRequest(undefined, nextRequest())).toEqual({
+      request: nextRequest(),
+      continuationStatus: "no_previous_response",
+    });
+  });
+
+  it("reports request_changed when a non-input request field diverges from the cached baseline", () => {
+    const changedModel = { ...nextRequest(), model: "gpt-5.6-terra" };
+    expect(
+      resolveResponsesContinuationRequest(continuationState(), changedModel).continuationStatus,
+    ).toBe("request_changed");
+
+    const changedStore = { ...nextRequest(), store: false };
+    expect(
+      resolveResponsesContinuationRequest(continuationState(), changedStore).continuationStatus,
+    ).toBe("request_changed");
+  });
+
+  it("reports history_shorter when the replayed input is shorter than the cached baseline", () => {
+    const shorterInput = {
+      ...nextRequest(),
+      input: [firstUser] as never,
+    };
+    expect(
+      resolveResponsesContinuationRequest(continuationState(), shorterInput).continuationStatus,
+    ).toBe("history_shorter");
+  });
+
+  it("reports history_changed when the replayed prefix diverges from the cached request input", () => {
+    const differentFirstUser = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "not the original first message" }],
+    };
+    const divergedPrefix = {
+      ...nextRequest(),
+      input: [
+        differentFirstUser,
+        {
+          type: "message",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{ type: "output_text", text: "answer", annotations: [] }],
+        },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "second" }] },
+      ] as never,
+    };
+    expect(
+      resolveResponsesContinuationRequest(continuationState(), divergedPrefix).continuationStatus,
+    ).toBe("history_changed");
+  });
+
+  it("reports history_changed when the replayed assistant turn is a reasoning stub instead of the cached response item", () => {
+    // Observed live against a custom OpenAI-Responses-compatible endpoint: the
+    // session replayed the prior assistant turn as a bare `{type: "reasoning"}`
+    // placeholder while the cached response was a plain assistant text message,
+    // so the tail comparison correctly refuses to treat it as a continuation
+    // rather than silently reusing the wrong response id.
+    const reasoningStubTail = {
+      ...nextRequest(),
+      input: [
+        firstUser,
+        { type: "reasoning" },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "second" }] },
+      ] as never,
+    };
+    expect(
+      resolveResponsesContinuationRequest(continuationState(), reasoningStubTail)
+        .continuationStatus,
+    ).toBe("history_changed");
+  });
 });
