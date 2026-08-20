@@ -292,6 +292,9 @@ export async function processResponsesStream<TApi extends Api>(
       // provider progress; keep the idle watchdog alive without exposing them,
       // matching the completions and anthropic transports.
       notifyLlmRequestActivity(options?.signal);
+      if (model.provider === "omniroute") {
+        process.stderr.write(`[RAW-SSE-DEBUG] model=${model.id} ${JSON.stringify(event)}\n`);
+      }
       if (event.type === "response.created") {
         output.responseId = event.response.id;
       } else if (event.type === "response.output_item.added") {
