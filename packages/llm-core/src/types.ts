@@ -532,6 +532,15 @@ export interface OpenAIResponsesCompat {
   sendSessionIdHeader?: boolean;
   /** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
   supportsLongCacheRetention?: boolean;
+  /**
+   * Explicit opt-in for HTTP continuation (client-side delta + `previous_response_id`)
+   * on a custom/proxy OpenAI-Responses-compatible endpoint. A native `api.openai.com`
+   * connection is eligible by default; a custom endpoint carries no trust signal of
+   * its own, so this is the only path to eligibility there — set it once you've
+   * verified the backend correctly resolves `previous_response_id` and persists
+   * `store: true` turns. Default: false.
+   */
+  supportsResponsesContinuation?: boolean;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */
