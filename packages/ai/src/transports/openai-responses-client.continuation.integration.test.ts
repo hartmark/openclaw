@@ -5,6 +5,23 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanupSessionResources } from "../session-resources.js";
 import { createOpenAIResponsesTransportStreamFn } from "./openai-responses-client.js";
 
+// Matches the identically-named symbol in src/agents/provider-request-config.ts
+// (and the sibling local copy in openai-completions.test-support.ts) via the
+// global symbol registry, without a packages/ai -> src/agents import.
+const MODEL_PROVIDER_REQUEST_TRANSPORT_SYMBOL = Symbol.for(
+  "openclaw.modelProviderRequestTransport",
+);
+
+function attachModelProviderRequestTransport<TModel extends object>(
+  model: TModel,
+  request: { allowPrivateNetwork?: boolean },
+): TModel {
+  return {
+    ...model,
+    [MODEL_PROVIDER_REQUEST_TRANSPORT_SYMBOL]: request,
+  };
+}
+
 // Real loopback HTTP + SSE server standing in for a self-hosted OpenAI-Responses
 // proxy (e.g. OmniRoute). Unlike openai-responses-client.continuation.test.ts,
 // nothing here mocks the `openai` SDK: requests leave the process over a real
@@ -80,7 +97,7 @@ function userMessage(text: string, timestamp: number) {
 }
 
 function customEndpointModel(baseUrl: string): Model<"openai-responses"> {
-  return {
+  const model = {
     id: "scripted-model",
     name: "Scripted Model",
     api: "openai-responses",
@@ -92,8 +109,8 @@ function customEndpointModel(baseUrl: string): Model<"openai-responses"> {
     contextWindow: 200_000,
     maxTokens: 8192,
     compat: { supportsResponsesContinuation: true },
-    request: { allowPrivateNetwork: true },
   } satisfies Model<"openai-responses">;
+  return attachModelProviderRequestTransport(model, { allowPrivateNetwork: true });
 }
 
 async function run(
