@@ -25,12 +25,14 @@ export type ResponsesContinuationStatus =
   | "no_previous_response"
   | "request_changed";
 
-function jsonValuesEqual(left: object, right: object): boolean {
+function stableStringifyRoundTrip(value: object): string {
   // Round-trip first so stable key ordering retains JSON's omitted/undefined wire semantics.
-  return (
-    stableStringify(JSON.parse(JSON.stringify(left) as string)) ===
-    stableStringify(JSON.parse(JSON.stringify(right) as string))
-  );
+  // SAFETY: value is a plain JSON-serializable object, so JSON.stringify always returns a string.
+  return stableStringify(JSON.parse(JSON.stringify(value) as string));
+}
+
+function jsonValuesEqual(left: object, right: object): boolean {
+  return stableStringifyRoundTrip(left) === stableStringifyRoundTrip(right);
 }
 
 function requestWithoutInput(request: ResponsesContinuationRequest): ResponsesContinuationRequest {
@@ -69,6 +71,42 @@ function normalizeAssistantReplayInput(input: readonly unknown[]): unknown[] {
     }
     return stableItem;
   });
+}
+
+function diffFirstMismatch(a: object, b: object): string {
+  const aStr = stableStringifyRoundTrip(a);
+  const bStr = stableStringifyRoundTrip(b);
+  let i = 0;
+  const len = Math.min(aStr.length, bStr.length);
+  while (i < len && aStr[i] === bStr[i]) i++;
+  return (
+    `diffAt=${i} aLen=${aStr.length} bLen=${bStr.length} ` +
+    `aAround=${JSON.stringify(aStr.slice(Math.max(0, i - 40), i + 120))} ` +
+    `bAround=${JSON.stringify(bStr.slice(Math.max(0, i - 40), i + 120))}`
+  );
+}
+
+function debugHistoryMismatch(
+  continuation: ResponsesContinuationState | undefined,
+  request: ResponsesContinuationRequest,
+): string | undefined {
+  if (!continuation) return undefined;
+  const currentInput = request.input ?? [];
+  const previousInput = continuation.lastRequest.input ?? [];
+  const baselineLength = previousInput.length + continuation.lastResponseItems.length;
+  const prefixA = normalizeAssistantReplayInput(currentInput.slice(0, previousInput.length));
+  const prefixB = normalizeAssistantReplayInput(previousInput);
+  if (!jsonValuesEqual(prefixA, prefixB)) {
+    return `prefix-mismatch ${diffFirstMismatch(prefixA, prefixB)}`;
+  }
+  const replyA = normalizeAssistantReplayInput(
+    currentInput.slice(previousInput.length, baselineLength),
+  );
+  const replyB = normalizeAssistantReplayInput(continuation.lastResponseItems);
+  if (!jsonValuesEqual(replyA, replyB)) {
+    return `reply-mismatch ${diffFirstMismatch(replyA, replyB)}`;
+  }
+  return "no-mismatch-found";
 }
 
 export function resolveResponsesContinuationRequest(
@@ -165,12 +203,24 @@ export function claimOpenAIResponsesHttpContinuation(
   const generation = nextHttpContinuationGeneration++;
   const claimed = { kind: "claimed", sessionId: params.sessionId, generation } as const;
   httpContinuationEntries.set(key, claimed);
-  const wireRequest = resolveResponsesContinuationRequest(
-    previous?.kind === "ready" ? previous.state : undefined,
-    params.request,
-  ).request;
+  const previousState = previous?.kind === "ready" ? previous.state : undefined;
+  const resolved = resolveResponsesContinuationRequest(previousState, params.request);
+  const wireRequest = resolved.request;
   return {
     request: wireRequest,
+    debugStatus: resolved.continuationStatus,
+    debugMismatch:
+      resolved.continuationStatus === "history_changed"
+        ? debugHistoryMismatch(previousState, params.request)
+        : resolved.continuationStatus === "request_changed"
+          ? // SAFETY: resolveResponsesContinuationRequest only returns "request_changed"
+            // when `continuation` (previousState) was defined; see its no_previous_response
+            // early return above.
+            diffFirstMismatch(
+              requestWithoutInput(params.request),
+              requestWithoutInput(previousState!.lastRequest),
+            )
+          : undefined,
     commit: (effectiveRequest: ResponsesContinuationRequest, response: ContinuationResponse) => {
       if (httpContinuationEntries.get(key) !== claimed) {
         return;

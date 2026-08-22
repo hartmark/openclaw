@@ -305,23 +305,41 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
       currentUserTurnMessage,
       durableUserTurnMessage: orphanRepairCandidate?.messageEntry.message,
       userTurnAlreadyPersisted: attempt.userTurnTranscriptRecorder?.hasPersisted() === true,
+      currentEntryId: attempt.userTurnTranscriptRecorder?.getAdmissionReceipt()?.entryId,
+      candidateEntryId: orphanRepairCandidate?.messageEntry.id,
     });
-  const orphanRepair = reconciledCurrentUser ? undefined : orphanRepairCandidate;
-  if (orphanRepair?.removeLeaf) {
-    if (orphanRepair.messageEntry.parentId) {
-      sessionManager.branch(orphanRepair.messageEntry.parentId);
+  // A found candidate is discarded from the active branch whether it is a
+  // genuine stale orphan or (per reconcilePrePersistedCurrentUserTurn) this
+  // turn's own earlier admission-time persist. In the reconciled case the
+  // runtime is about to append its own merged copy of the same logical turn
+  // as a new durable entry; without discarding the admission-time duplicate
+  // first, both survive as two chained user-role entries, and every later
+  // turn's history replay reconstructs a duplicate consecutive user message
+  // for one logical turn, breaking HTTP continuation's positional replay
+  // comparison (packages/ai/.../openai-responses-continuation.ts). Only a
+  // genuine orphan also merges its text into the current prompt (below,
+  // gated on `orphanRepair` staying set) -- a reconciled duplicate has
+  // nothing to merge, it is simply superseded.
+  if (orphanRepairCandidate?.removeLeaf) {
+    if (orphanRepairCandidate.messageEntry.parentId) {
+      sessionManager.branch(orphanRepairCandidate.messageEntry.parentId);
     } else {
       sessionManager.resetLeaf();
     }
-    replayTrailingEntriesForOrphanRepair(sessionManager, orphanRepair.trailingEntries);
+    replayTrailingEntriesForOrphanRepair(sessionManager, orphanRepairCandidate.trailingEntries);
     // The old canonical user turn is gone. Its persistence suppression must not
     // discard the merged replacement prompt.
     sessionManager.clearNextUserMessagePersistenceSuppression?.();
     attempt.onUserMessagePersistenceInvalidated?.();
+    // Model-facing rebuild: must match sdk.ts's createAgentSessionForEmbeddedRunner
+    // (preferReplayContent: true), or this rebuild silently discards
+    // replayContent for every other historical turn and reintroduces the HTTP
+    // continuation replay-stability break this option exists to fix.
     activeSession.agent.state.messages = sanitizeCompactionReplayMessages(
-      sessionManager.buildSessionContext().messages,
+      sessionManager.buildSessionContext({ preferReplayContent: true }).messages,
     );
   }
+  const orphanRepair = reconciledCurrentUser ? undefined : orphanRepairCandidate;
 
   // This is the single timestamping source for user messages sent to the LLM.
   // Raw probes retain exact prompt bytes.

@@ -301,8 +301,12 @@ async function createAgentSessionImpl(
     modelRegistry.refresh();
   }
 
-  // Check if session has existing data to restore
-  const existingSession = sessionManager.buildSessionContext();
+  // Check if session has existing data to restore. Model-facing (this always
+  // prepares a session for an actual agent run): prefer each user turn's
+  // replayContent over its persisted display text where the two diverge, so
+  // history reconstructs byte-identical to what was actually sent (required
+  // for HTTP continuation's replay comparison to succeed past turn one).
+  const existingSession = sessionManager.buildSessionContext({ preferReplayContent: true });
   const hasExistingSession = existingSession.messages.length > 0;
   const hasThinkingEntry = sessionManager
     .getBranch()

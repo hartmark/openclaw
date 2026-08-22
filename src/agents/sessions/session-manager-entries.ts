@@ -388,8 +388,11 @@ export class SessionManagerEntries extends SessionManagerPersistence {
     return path;
   }
 
-  buildSessionContext(): SessionContext {
-    return buildCoreSessionContext(this.getBranch() as CoreSessionTreeEntry[]) as SessionContext;
+  buildSessionContext(options?: { preferReplayContent?: boolean }): SessionContext {
+    return buildCoreSessionContext(
+      this.getBranch() as CoreSessionTreeEntry[],
+      options,
+    ) as SessionContext;
   }
 
   getBoundaryCount(): number {

@@ -330,6 +330,19 @@ export interface UserMessage {
    * turn. Anchoring stays on the last stable (non-carrier) user message.
    */
   runtimeContextCarrier?: boolean;
+  /**
+   * What was actually sent to the model for this turn, when a producer
+   * intentionally persists different text than it sends (e.g. heartbeat
+   * turns always persist the constant HEARTBEAT_TRANSCRIPT_PROMPT for a
+   * readable transcript, regardless of the real per-turn content). History
+   * replay for a new model request must prefer this over `content` so a
+   * later turn's request reconstructs byte-identical bytes to what this
+   * turn's request actually carried — required for HTTP continuation's
+   * replay comparison (openai-responses-continuation.ts) to ever succeed
+   * past turn one. Display/compaction/search paths must keep using
+   * `content` unchanged.
+   */
+  replayContent?: string | (TextContent | ImageContent)[];
 }
 
 /** Assistant turn, including provider identity and final stop state. */

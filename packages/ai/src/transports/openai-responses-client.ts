@@ -373,6 +373,13 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
             baseUrl: model.baseUrl,
           }) ||
             resolveOpenAIResponsesPayloadPolicy(model).explicitContinuationOptIn);
+        emitModelTransportDebug(
+          log,
+          `[continuation-debug] gate provider=${model.provider} sessionId=${sessionId ?? "none"} ` +
+            `httpContinuationEligible=${httpContinuationEligible} store=${params.store} ` +
+            `hasPrevRespId=${Boolean(params.previous_response_id)} websocketMode=${websocketMode} ` +
+            `configHttpContinuation=${Boolean(config.httpContinuation)}`,
+        );
         if (
           httpContinuationEligible &&
           sessionId &&
@@ -392,6 +399,17 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
             ),
             request: params as ResponsesContinuationRequest,
           });
+        }
+        emitModelTransportDebug(
+          log,
+          `[continuation-debug] claim-result hasClaim=${Boolean(continuationClaim)} ` +
+            `status=${continuationClaim?.debugStatus ?? "none"} ` +
+            `claimHasPrevRespId=${Boolean(continuationClaim?.request?.previous_response_id)} ` +
+            `claimInputLen=${Array.isArray(continuationClaim?.request?.input) ? continuationClaim!.request.input.length : -1}`,
+        );
+        const debugMismatch = continuationClaim?.debugMismatch;
+        if (debugMismatch) {
+          emitModelTransportDebug(log, `[continuation-debug] mismatch ${debugMismatch}`);
         }
         const observePrompt = createResponsesPromptEgressObserver(
           responsesOptions,
@@ -592,6 +610,12 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
             // Keep the provider's terminal fact; the catch-side projection would overwrite it.
             throw new Error(output.errorMessage ?? "An unknown error occurred");
           }
+          emitModelTransportDebug(
+            log,
+            `[continuation-debug] terminal-check hasClaim=${Boolean(continuationClaim)} ` +
+              `hasBaseline=${Boolean(continuationBaseline)} hasTerminal=${Boolean(terminal)} ` +
+              `stopReason=${output.stopReason ?? "none"}`,
+          );
           if (continuationClaim && continuationBaseline && terminal) {
             continuationClaim.commit(continuationBaseline, terminal);
           }

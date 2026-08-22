@@ -146,11 +146,13 @@ export function buildPersistedUserTurnMessage(params: UserTurnInput): PersistedU
   // here would NOT match the bare-current arrival (the gateway no longer stamps
   // the live turn) — see https://github.com/openclaw/openclaw/issues/3658.
   const openClawMeta = buildPersistedUserTurnMetadata(params, normalizedMedia);
+  const replayText = params.replayText ?? undefined;
   const message = {
     role: "user",
     content: text,
     timestamp: params.timestamp ?? Date.now(),
     ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
+    ...(replayText !== undefined && replayText !== text ? { replayContent: replayText } : {}),
     ...(Object.keys(openClawMeta).length > 0 ? { __openclaw: openClawMeta } : {}),
   } as PersistedUserTurnMessage;
   return applyInputProvenanceToUserMessage(message, params.provenance) as PersistedUserTurnMessage;

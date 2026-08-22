@@ -36,6 +36,11 @@ export type PersistedUserTurnMessage = Extract<AgentMessage, { role: "user" }> &
 
 export type UserTurnInput = {
   text?: string | null;
+  /** What was actually sent to the model for this turn, when a caller
+   * intentionally persists different display text (e.g. heartbeat's constant
+   * transcript placeholder). See UserMessage.replayContent for why replay
+   * needs this separate from `text`. */
+  replayText?: string | null;
   media?: readonly PersistedUserTurnMediaInput[] | null;
   /** Restart-safe native image placement; model-visible prompt bytes remain separate. */
   mediaImageLayout?: {

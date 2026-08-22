@@ -253,6 +253,18 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     !hasUserBody && transcriptBody === MEDIA_ONLY_USER_TEXT
       ? ""
       : resolvePersistedUserTurnText(transcriptBody);
+  // Heartbeat always persists the constant HEARTBEAT_TRANSCRIPT_PROMPT display
+  // placeholder above (prompt-prelude.ts) regardless of what's actually sent.
+  // Persist the real per-turn content too (already computed alongside
+  // transcriptBody from the same prelude call) so history replay for a later
+  // turn can recover it instead of only ever seeing the placeholder -- required
+  // for HTTP continuation's byte-exact replay comparison to succeed past turn
+  // one. Scoped to heartbeat only for now; other transcriptBody/prefixedBody
+  // divergences (bare-session-reset, room-event) are separately motivated and
+  // not yet audited for this treatment.
+  const userTurnReplayText = isHeartbeat
+    ? resolvePersistedUserTurnText(prefixedCommandBody)
+    : undefined;
   const conversationIdentity = conversationIdentityFromMsgContext({ ctx: sessionCtx });
   const conversationRef = conversationIdentity?.conversationRef;
   const transportMessageId =
@@ -287,6 +299,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     userTurnTranscriptText !== undefined || userTurnMediaForPersistence.length > 0
       ? {
           text: userTurnTranscriptText,
+          ...(userTurnReplayText !== undefined ? { replayText: userTurnReplayText } : {}),
           senderIsOwner: command.senderIsOwner,
           ...(sourceTurnId ? { idempotencyKey: sourceTurnId } : {}),
           ...(inputProvenance && !isHeartbeat ? { provenance: inputProvenance } : {}),

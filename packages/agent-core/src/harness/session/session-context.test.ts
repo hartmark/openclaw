@@ -16,6 +16,21 @@ function userEntry(id: string, parentId: string | null, content: string): Sessio
   };
 }
 
+function userEntryWithReplay(
+  id: string,
+  parentId: string | null,
+  content: string,
+  replayContent: string,
+): SessionTreeEntry {
+  return {
+    type: "message",
+    id,
+    parentId,
+    timestamp,
+    message: { role: "user", content, replayContent, timestamp: Date.parse(timestamp) },
+  };
+}
+
 function bashEntry(
   id: string,
   parentId: string,
@@ -519,6 +534,140 @@ describe("buildSessionContext", () => {
     expect(buildSessionContext(entries).messages).toMatchObject([
       { role: "compactionSummary", summary: "latest summary" },
       { role: "user", content: "post reset" },
+    ]);
+  });
+});
+
+// preferReplayContent backs the heartbeat-continuation replay-stability fix
+// (docs/plan/heartbeat-continuation-replay-stability.md): model-facing history
+// replay must substitute what a turn actually sent for what it displayed,
+// while display/compaction/search consumers (the default, option omitted)
+// keep seeing the persisted display text unchanged.
+describe("preferReplayContent", () => {
+  it("projectSessionEntryMessage keeps persisted content by default", () => {
+    const entry = userEntryWithReplay("turn", null, "[OpenClaw heartbeat poll]", "real content");
+
+    expect(projectSessionEntryMessage(entry)).toMatchObject({
+      content: "[OpenClaw heartbeat poll]",
+    });
+  });
+
+  it("projectSessionEntryMessage substitutes replayContent when requested", () => {
+    const entry = userEntryWithReplay("turn", null, "[OpenClaw heartbeat poll]", "real content");
+
+    expect(projectSessionEntryMessage(entry, { preferReplayContent: true })).toMatchObject({
+      content: "real content",
+    });
+  });
+
+  it("leaves a user message without replayContent unchanged even when requested", () => {
+    const entry = userEntry("turn", null, "ordinary message");
+
+    expect(projectSessionEntryMessage(entry, { preferReplayContent: true })).toMatchObject({
+      content: "ordinary message",
+    });
+  });
+
+  it("never substitutes replayContent for non-user roles", () => {
+    const entry = assistantEntry("assistant", null, "assistant reply");
+
+    expect(projectSessionEntryMessage(entry, { preferReplayContent: true })).toBe(
+      entry.type === "message" ? entry.message : undefined,
+    );
+  });
+
+  it("buildSessionContext keeps persisted content by default (no boundary)", () => {
+    const entries = [
+      userEntryWithReplay("turn", null, "[OpenClaw heartbeat poll]", "real content"),
+    ];
+
+    expect(buildSessionContext(entries).messages).toMatchObject([
+      { content: "[OpenClaw heartbeat poll]" },
+    ]);
+  });
+
+  it("buildSessionContext substitutes replayContent when requested (no boundary)", () => {
+    const entries = [
+      userEntryWithReplay("turn", null, "[OpenClaw heartbeat poll]", "real content"),
+    ];
+
+    expect(buildSessionContext(entries, { preferReplayContent: true }).messages).toMatchObject([
+      { content: "real content" },
+    ]);
+  });
+
+  it("buildSessionContext substitutes replayContent for entries after a compaction boundary", () => {
+    const entries: SessionTreeEntry[] = [
+      userEntry("kept", null, "kept"),
+      {
+        type: "compaction",
+        id: "compaction",
+        parentId: "kept",
+        timestamp,
+        summary: "older context",
+        firstKeptEntryId: "kept",
+        tokensBefore: 10,
+      },
+      userEntryWithReplay(
+        "post-boundary",
+        "compaction",
+        "[OpenClaw heartbeat poll]",
+        "real content",
+      ),
+    ];
+
+    const messages = buildSessionContext(entries, { preferReplayContent: true }).messages;
+
+    expect(messages).toMatchObject([
+      { role: "compactionSummary" },
+      { role: "user", content: "kept" },
+      { role: "user", content: "real content" },
+    ]);
+  });
+
+  it("buildSessionContext substitutes replayContent through the reset-kept-tail path", () => {
+    const entries: SessionTreeEntry[] = [
+      userEntry("discarded", null, "discarded"),
+      userEntryWithReplay("kept-user", "discarded", "[OpenClaw heartbeat poll]", "real content"),
+      {
+        type: "reset",
+        id: "reset",
+        parentId: "kept-user",
+        timestamp,
+        reason: "new",
+        firstKeptEntryId: "kept-user",
+      },
+      userEntry("new", "reset", "new turn"),
+    ];
+
+    const messages = buildSessionContext(entries, { preferReplayContent: true }).messages;
+
+    expect(messages).toMatchObject([
+      { role: "user", content: "real content" },
+      { role: "user", content: "new turn" },
+    ]);
+  });
+
+  it("keeps the reset-kept-tail path unchanged by default", () => {
+    const entries: SessionTreeEntry[] = [
+      userEntry("discarded", null, "discarded"),
+      userEntryWithReplay("kept-user", "discarded", "[OpenClaw heartbeat poll]", "real content"),
+      {
+        type: "reset",
+        id: "reset",
+        parentId: "kept-user",
+        timestamp,
+        reason: "new",
+        firstKeptEntryId: "kept-user",
+      },
+      userEntry("new", "reset", "new turn"),
+    ];
+
+    const messages = buildSessionContext(entries).messages;
+
+    expect(messages).toMatchObject([
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "user", content: "new turn" },
     ]);
   });
 });
