@@ -150,6 +150,20 @@ function connectionIdentity(params: HttpContinuationIdentity): string {
   );
 }
 
+function scheduleHttpContinuationIdleCleanup(
+  key: string,
+  generation: number,
+): ReturnType<typeof setTimeout> {
+  const idleTimer = setTimeout(() => {
+    const current = httpContinuationEntries.get(key);
+    if (current?.kind === "ready" && current.generation === generation) {
+      httpContinuationEntries.delete(key);
+    }
+  }, HTTP_CONTINUATION_IDLE_TTL_MS);
+  idleTimer.unref?.();
+  return idleTimer;
+}
+
 export function claimOpenAIResponsesHttpContinuation(
   params: HttpContinuationIdentity & {
     sessionId: string;
@@ -175,13 +189,6 @@ export function claimOpenAIResponsesHttpContinuation(
       if (httpContinuationEntries.get(key) !== claimed) {
         return;
       }
-      const idleTimer = setTimeout(() => {
-        const current = httpContinuationEntries.get(key);
-        if (current?.kind === "ready" && current.generation === generation) {
-          httpContinuationEntries.delete(key);
-        }
-      }, HTTP_CONTINUATION_IDLE_TTL_MS);
-      idleTimer.unref?.();
       const ready = {
         ...claimed,
         kind: "ready",
@@ -190,14 +197,32 @@ export function claimOpenAIResponsesHttpContinuation(
           lastResponseId: response.id,
           lastResponseItems: response.output,
         },
-        idleTimer,
+        idleTimer: scheduleHttpContinuationIdleCleanup(key, generation),
       } satisfies Extract<HttpContinuationEntry, { kind: "ready" }>;
       httpContinuationEntries.set(key, ready);
     },
     release: () => {
-      if (httpContinuationEntries.get(key) === claimed) {
-        httpContinuationEntries.delete(key);
+      if (httpContinuationEntries.get(key) !== claimed) {
+        return;
       }
+      // This claim never committed a new state (e.g. the request errored
+      // before a response came back). Restore whatever was ready before this
+      // claim rather than deleting it: a different model/connection sharing
+      // this session (client-side model fallback routes every candidate
+      // through the same sessionId+connectionIdentity key, since the cache is
+      // not model-scoped) must not destroy a still-valid prior continuation
+      // baseline just by claiming and failing. Without this, an unrelated
+      // model that always errors first (e.g. an exhausted free-tier fallback
+      // primary) permanently prevents the model that actually succeeds from
+      // ever accumulating continuation state across turns.
+      if (previous?.kind === "ready") {
+        httpContinuationEntries.set(key, {
+          ...previous,
+          idleTimer: scheduleHttpContinuationIdleCleanup(key, previous.generation),
+        });
+        return;
+      }
+      httpContinuationEntries.delete(key);
     },
   };
 }

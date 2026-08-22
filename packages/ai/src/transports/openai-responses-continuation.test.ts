@@ -166,6 +166,35 @@ describe("OpenAI Responses continuation", () => {
     next?.release();
   });
 
+  it("restores the prior ready state on release instead of destroying it", () => {
+    // Mirrors client-side model fallback: every candidate model shares the
+    // same sessionId + connection identity (the cache key is not model-
+    // scoped), so an unrelated model's claim must not permanently wipe out
+    // a different, already-working model's continuation baseline just
+    // because that unrelated attempt errors out before committing.
+    const first = claim({});
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_owner",
+      output: continuationState().lastResponseItems,
+    });
+
+    const failedFallbackAttempt = claim({ request: nextRequest() });
+    expect(failedFallbackAttempt?.request.previous_response_id).toBe("resp_owner");
+    failedFallbackAttempt?.release();
+
+    const retry = claim({ request: nextRequest() });
+    expect(retry?.request.previous_response_id).toBe("resp_owner");
+  });
+
+  it("releasing a claim with no prior ready state just clears the slot", () => {
+    const first = claim({});
+    first?.release();
+
+    const next = claim({ request: nextRequest() });
+    expect(next?.request.previous_response_id).toBeUndefined();
+    next?.release();
+  });
+
   it("expires completed continuation state after the bounded idle TTL", () => {
     vi.useFakeTimers();
     const first = claim({});

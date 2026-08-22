@@ -318,14 +318,56 @@ one PR, but if it needs trimming further:
     live gateway process, no restart — turn 2's
     `claimOpenAIResponsesHttpContinuation` now reports
     `status=continued, claimHasPrevRespId=true, claimInputLen=1`.
-- **Phase 3 (optional, only if Phase 1+2 don't fully explain remaining
-  production `history_changed` cases):** audit for other
-  `promptForSession !== promptForModel` producers not yet covered, and
-  confirm whether root cause B above (persisted duplicate not discarded)
-  also explains the previously-investigated general-room 275-turn session
-  case, independent of heartbeat — plausible since the reconciliation gap
-  it fixes is not heartbeat-specific, but not yet directly confirmed
-  against that session.
+- **Phase 3 — root cause C found and fixed, unrelated to Phase 1/2:**
+  after deploying Phase 1+2 to Ping, continuation still never engaged on
+  her real traffic. Root cause: her configured primary model
+  (`opencode-zen/deepseek-v4-flash-free`) fails with a 400 on essentially
+  every turn (upstream free-tier unavailability), and openclaw's
+  client-side model-fallback mechanism (`model-fallback-runner.ts`)
+  immediately retries with her secondary model
+  (`opencode-zen/mimo-v2.5-free`) within the same logical turn — both
+  routed through the same OmniRoute base URL/API key. Confirmed via
+  OmniRoute's own call-log database (`call_logs`/`call_logs` artifact
+  JSON) showing this exact deepseek-fails-then-mimo-succeeds pattern on
+  every single turn, and via direct code reading (not guesswork):
+  - `claimOpenAIResponsesHttpContinuation`'s cache key is
+    `sessionId + connectionIdentity(apiKey, baseUrl, headers)` — it does
+    **not** include the model. Since every fallback candidate shares the
+    same `sessionId` (`model-fallback-runner.ts` builds one
+    `runAttribution` reused for every candidate in the fallback loop) and
+    the same connection (same OmniRoute endpoint), deepseek's and mimo's
+    attempts collide on the exact same cache key.
+  - A claim unconditionally overwrites an existing `ready` entry with a
+    `claimed` placeholder, regardless of whether the new request is
+    expected to succeed.
+  - `release()` (called from the `finally` block on any error, including
+    the doomed deepseek 400) simply **deleted** the claimed entry — it
+    never restored what was there before. So every turn's failed deepseek
+    attempt claimed (and thereby destroyed) the continuation state that
+    the _previous_ turn's successful mimo call had just committed, before
+    mimo's own fallback attempt for the current turn even ran. Mimo could
+    never accumulate continuation state across turns, because the
+    interleaved failed deepseek attempt wiped the slot clean first, every
+    single time.
+  - **Fix:** `claimOpenAIResponsesHttpContinuation` now captures the prior
+    `ready` entry (if any) at claim time, and `release()` restores it
+    (with a fresh idle timer) instead of deleting it, whenever the current
+    claim never reached `.commit()`. A different model/connection sharing
+    the same session+connection cache key can no longer destroy a
+    still-valid prior continuation baseline just by claiming and failing.
+  - Regression test added (`openai-responses-continuation.test.ts`,
+    "restores the prior ready state on release instead of destroying it")
+    — confirmed to fail on pre-fix code with the exact repro shape
+    (commit → claim+release without commit → claim again, asserting the
+    third claim still sees the first commit's `previous_response_id`).
+  - This is independent of Phase 1/2 and would have prevented continuation
+    from ever working for Ping's real traffic even with those fixes fully
+    deployed, since her real traffic always goes through this fallback
+    pattern.
+- **Still open:** audit for other `promptForSession !== promptForModel`
+  producers not yet covered, and confirm whether root cause B (persisted
+  duplicate not discarded) also explains the previously-investigated
+  general-room 275-turn session case, independent of heartbeat.
 
 ## Evidence trail / how to reproduce
 
