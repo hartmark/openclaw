@@ -33,7 +33,9 @@ class ScriptedResponsesServer {
         const frame = this.script[index];
         if (!frame) {
           res.writeHead(500, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: { message: `no scripted response for request ${index}` } }));
+          res.end(
+            JSON.stringify({ error: { message: `no scripted response for request ${index}` } }),
+          );
           return;
         }
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -135,7 +137,11 @@ describe("real HTTP/SSE OpenAI-Responses continuation (loopback server, no SDK m
       expect(server.requests[0]).not.toHaveProperty("previous_response_id");
       expect(server.requests[1]).toMatchObject({ previous_response_id: "resp_1" });
       expect(server.requests[1]?.input).toEqual([
-        { type: "message", role: "user", content: [{ type: "input_text", text: "second question" }] },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "second question" }],
+        },
       ]);
     } finally {
       await server.close();
@@ -173,7 +179,11 @@ describe("real HTTP/SSE OpenAI-Responses continuation (loopback server, no SDK m
       expect(server.requests[1]?.input).toHaveLength(1);
       expect(server.requests[2]).toMatchObject({ previous_response_id: "resp_2" });
       expect(server.requests[2]?.input).toEqual([
-        { type: "message", role: "user", content: [{ type: "input_text", text: "third question" }] },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "third question" }],
+        },
       ]);
     } finally {
       await server.close();

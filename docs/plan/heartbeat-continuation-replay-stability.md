@@ -1,4 +1,5 @@
 # Make HTTP continuation replay-stable for heartbeat (and any other
+
 # display-vs-sent divergent) turns
 
 ## Summary
@@ -69,7 +70,7 @@ const currentUserTimestampOverride =
 `alternateText` already captures exactly the right value (what was actually
 sent) at exactly the right point in the pipeline. It is computed today
 purely to let `attempt-history.ts:99` and `attempt-llm-boundary.ts:442` match
-the *current* turn's freshly-submitted text against a timestamp-override
+the _current_ turn's freshly-submitted text against a timestamp-override
 candidate. It is never persisted, and never read back for replay.
 
 The same `promptForSession !== promptForModel` divergence — for a different
@@ -90,17 +91,17 @@ trailing "user" transcript leaf unanswered — confirmed via direct SQLite
 inspection of `transcript_events` in the isolated repro: two separate
 root-parented chains appeared after a single clean `wake` call, one from an
 automatic heartbeat check at gateway startup that never reached a model call
-(the mock backend's first scripted reply was consumed by the *next* firing,
+(the mock backend's first scripted reply was consumed by the _next_ firing,
 not the automatic one). `attempt-orphan-repair.ts`'s
 `findTrailingMessageEntryForOrphanRepair` then finds that dangling leaf on
-the *next* turn and merges it. Ping's real logs show this "Merged and
+the _next_ turn and merges it. Ping's real logs show this "Merged and
 removed orphaned user message to prevent consecutive user turns" event on
 essentially every heartbeat firing (133/133 sampled,
 `trigger=heartbeat`) — this is steady-state behavior, not an edge case.
 
 This third factor is not required to reproduce the bug (§1/§2 alone
 guarantee `history_changed` on every heartbeat turn), but it means the
-model-bound prompt for a "normal" heartbeat turn is *also* routinely
+model-bound prompt for a "normal" heartbeat turn is _also_ routinely
 different from a naive replay in a second, independent way, which the fix
 needs to cover too.
 
@@ -110,10 +111,10 @@ needs to cover too.
 `resolveResponsesContinuationRequest`, requires the new turn's `input`
 prefix to be byte-identical (via `jsonValuesEqual`, after
 `normalizeAssistantReplayInput`) to what was stored as `lastRequest.input`
-from the previous turn's *actually sent* request. The prefix gets rebuilt
+from the previous turn's _actually sent_ request. The prefix gets rebuilt
 for a new turn by replaying the session transcript
 (`packages/agent-core/src/harness/session/session.ts`,
-`projectSessionEntryMessage`, returns `entry.message` — i.e. the *persisted*
+`projectSessionEntryMessage`, returns `entry.message` — i.e. the _persisted_
 `content` — verbatim). Persisted content is `HEARTBEAT_TRANSCRIPT_PROMPT`;
 sent content was the real prompt. They can never match. Status is always
 `history_changed`, silently, with no log line from the continuation code
@@ -128,8 +129,8 @@ orphan is also present, or the real heartbeat prompt body otherwise).
 
 ## Why this is a design fork, not a one-line fix
 
-`resolveResponsesContinuationRequest`'s correctness *requires* "replay of
-transcript == what was sent." `prompt-prelude.ts` *deliberately* violates
+`resolveResponsesContinuationRequest`'s correctness _requires_ "replay of
+transcript == what was sent." `prompt-prelude.ts` _deliberately_ violates
 that for heartbeat, for a legitimate, separate reason (transcript
 readability). The two are incompatible as currently built. Two honest ways
 to resolve that:
@@ -141,7 +142,7 @@ to resolve that:
   the original motivation for chasing this.
 - **B — Persist a replay-authoritative variant of what was sent, separate
   from the display text, and use it (only) when rebuilding history for a new
-  model request.** Preserves both the clean transcript *and* continuation's
+  model request.** Preserves both the clean transcript _and_ continuation's
   benefit. Bigger: touches the shared session-entry shape and the transcript
   replay/projection layer used by every agent run, not just heartbeat.
 
@@ -175,7 +176,7 @@ export interface UserMessage {
 }
 ```
 
-Naming note: this is deliberately *not* called `alternateText` — that name
+Naming note: this is deliberately _not_ called `alternateText` — that name
 is already used for a narrower, currently ephemeral, current-turn-only
 concept (`CurrentUserTimestampOverride.alternateText`,
 `attempt-prompt-build.ts:452`). `replayContent` names the durable,
@@ -209,7 +210,7 @@ case "message":
 
 This function is the single shared projection used both to build
 `activeSession.agent.state.messages` (which flows into the actual model
-request) *and*, today, into anything else that walks session history. That
+request) _and_, today, into anything else that walks session history. That
 dual use is exactly the trap: a naive "always prefer `replayContent`" edit
 here would leak the replay-only content into transcript display, dashboard
 history views, and compaction summaries meant for human review — the
@@ -274,8 +275,8 @@ one PR, but if it needs trimming further:
     intentionally never mints one
     (`shouldMintChannelSourceTurnId` in
     `src/auto-reply/reply/source-turn-id.ts`), so the guard always fell
-    through to `false` for heartbeat, and *every* heartbeat turn's own
-    message was misidentified as an orphan of a *different* prior turn —
+    through to `false` for heartbeat, and _every_ heartbeat turn's own
+    message was misidentified as an orphan of a _different_ prior turn —
     even the very first heartbeat ever, with no restart or crash
     involved. `mergeOrphanedTrailingUserPrompt` then merged the turn's
     own content into its own prompt under the queued-message marker,
@@ -300,7 +301,7 @@ one PR, but if it needs trimming further:
     `reconcilePrePersistedCurrentUserTurn` already stripped the
     in-memory duplicate from `activeSession.agent.state.messages` (so the
     turn's own model call only ever saw it once) but never removed it
-    from the *persisted* branch, so every later turn's history replay
+    from the _persisted_ branch, so every later turn's history replay
     reconstructed two consecutive user-role entries for one logical turn,
     shifting `resolveResponsesContinuationRequest`'s positional
     prefix/reply comparison.
