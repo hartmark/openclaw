@@ -60,7 +60,9 @@ class ScriptedResponsesServer {
         res.end();
       });
     });
-    await new Promise<void>((resolve) => this.server?.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => {
+      this.server?.listen(0, "127.0.0.1", resolve);
+    });
     const address = this.server?.address() as AddressInfo;
     return `http://127.0.0.1:${address.port}/v1`;
   }
@@ -228,7 +230,7 @@ describe("real HTTP/SSE OpenAI-Responses continuation (loopback server, no SDK m
       );
 
       expect(server.requests[1]).not.toHaveProperty("previous_response_id");
-      expect((server.requests[1]?.input as unknown[]).length).toBe(3);
+      expect((server.requests[1]?.input as unknown[] | undefined)?.length).toBe(3);
     } finally {
       await server.close();
     }

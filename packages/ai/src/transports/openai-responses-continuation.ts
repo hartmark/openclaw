@@ -73,42 +73,6 @@ function normalizeAssistantReplayInput(input: readonly unknown[]): unknown[] {
   });
 }
 
-function diffFirstMismatch(a: object, b: object): string {
-  const aStr = stableStringifyRoundTrip(a);
-  const bStr = stableStringifyRoundTrip(b);
-  let i = 0;
-  const len = Math.min(aStr.length, bStr.length);
-  while (i < len && aStr[i] === bStr[i]) i++;
-  return (
-    `diffAt=${i} aLen=${aStr.length} bLen=${bStr.length} ` +
-    `aAround=${JSON.stringify(aStr.slice(Math.max(0, i - 40), i + 120))} ` +
-    `bAround=${JSON.stringify(bStr.slice(Math.max(0, i - 40), i + 120))}`
-  );
-}
-
-function debugHistoryMismatch(
-  continuation: ResponsesContinuationState | undefined,
-  request: ResponsesContinuationRequest,
-): string | undefined {
-  if (!continuation) return undefined;
-  const currentInput = request.input ?? [];
-  const previousInput = continuation.lastRequest.input ?? [];
-  const baselineLength = previousInput.length + continuation.lastResponseItems.length;
-  const prefixA = normalizeAssistantReplayInput(currentInput.slice(0, previousInput.length));
-  const prefixB = normalizeAssistantReplayInput(previousInput);
-  if (!jsonValuesEqual(prefixA, prefixB)) {
-    return `prefix-mismatch ${diffFirstMismatch(prefixA, prefixB)}`;
-  }
-  const replyA = normalizeAssistantReplayInput(
-    currentInput.slice(previousInput.length, baselineLength),
-  );
-  const replyB = normalizeAssistantReplayInput(continuation.lastResponseItems);
-  if (!jsonValuesEqual(replyA, replyB)) {
-    return `reply-mismatch ${diffFirstMismatch(replyA, replyB)}`;
-  }
-  return "no-mismatch-found";
-}
-
 export function resolveResponsesContinuationRequest(
   continuation: ResponsesContinuationState | undefined,
   request: ResponsesContinuationRequest,
@@ -204,23 +168,9 @@ export function claimOpenAIResponsesHttpContinuation(
   const claimed = { kind: "claimed", sessionId: params.sessionId, generation } as const;
   httpContinuationEntries.set(key, claimed);
   const previousState = previous?.kind === "ready" ? previous.state : undefined;
-  const resolved = resolveResponsesContinuationRequest(previousState, params.request);
-  const wireRequest = resolved.request;
+  const wireRequest = resolveResponsesContinuationRequest(previousState, params.request).request;
   return {
     request: wireRequest,
-    debugStatus: resolved.continuationStatus,
-    debugMismatch:
-      resolved.continuationStatus === "history_changed"
-        ? debugHistoryMismatch(previousState, params.request)
-        : resolved.continuationStatus === "request_changed"
-          ? // SAFETY: resolveResponsesContinuationRequest only returns "request_changed"
-            // when `continuation` (previousState) was defined; see its no_previous_response
-            // early return above.
-            diffFirstMismatch(
-              requestWithoutInput(params.request),
-              requestWithoutInput(previousState!.lastRequest),
-            )
-          : undefined,
     commit: (effectiveRequest: ResponsesContinuationRequest, response: ContinuationResponse) => {
       if (httpContinuationEntries.get(key) !== claimed) {
         return;

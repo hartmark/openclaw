@@ -355,6 +355,14 @@ one PR, but if it needs trimming further:
   investigation) and OmniRoute's own call-log/dashboard API for the same
   session, confirming the same failure signature and the "Merged and
   removed orphaned user message" event on 133/133 sampled heartbeat firings.
+- Phase 2's revised root cause (self-collision + persisted duplicate) was
+  found the same way: temporary logging (also added and removed) at
+  `reconcilePrePersistedCurrentUserTurn`'s call site in
+  `attempt-session-prepare.ts` and in the guard wrapper's
+  `onUserMessagePersisted` callback, plus repeated direct SQLite inspection
+  of `transcript_events` across several isolated-repro rebuild/relaunch
+  cycles, to trace exactly which entry ids the orphan-repair tree walk and
+  the recorder's own admission receipt disagreed on.
 
 ## Out of scope
 

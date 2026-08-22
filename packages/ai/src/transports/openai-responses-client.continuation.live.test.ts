@@ -71,7 +71,9 @@ class CapturingOpenAIForwardProxy {
         upstream.end(body);
       });
     });
-    await new Promise<void>((resolve) => this.server?.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => {
+      this.server?.listen(0, "127.0.0.1", resolve);
+    });
     const address = this.server?.address() as AddressInfo;
     return `http://127.0.0.1:${address.port}/v1`;
   }
@@ -178,7 +180,9 @@ describeLive("OpenAI Responses HTTP continuation (real api.openai.com)", () => {
         expect(proxy.requests[0]).not.toHaveProperty("previous_response_id");
         expect(proxy.requests[1]).toHaveProperty("previous_response_id");
         expect(typeof proxy.requests[1]?.previous_response_id).toBe("string");
-        expect((proxy.requests[1]?.previous_response_id as string).length).toBeGreaterThan(0);
+        expect(
+          (proxy.requests[1]?.previous_response_id as string | undefined)?.length,
+        ).toBeGreaterThan(0);
         expect(proxy.requests[1]?.input).toEqual([
           {
             type: "message",
