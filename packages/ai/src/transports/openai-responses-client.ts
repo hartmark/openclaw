@@ -373,6 +373,13 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
             baseUrl: model.baseUrl,
           }) ||
             resolveOpenAIResponsesPayloadPolicy(model).explicitContinuationOptIn);
+        // eslint-disable-next-line no-console
+        console.error(
+          `[continuation-debug] model=${model.id} provider=${model.provider} baseUrl=${model.baseUrl} ` +
+            `httpContinuationEligible=${httpContinuationEligible} sessionId=${sessionId} ` +
+            `params.store=${params.store} params.previous_response_id=${params.previous_response_id} ` +
+            `websocketMode=${websocketMode} configHttpContinuation=${config.httpContinuation}`,
+        );
         if (
           httpContinuationEligible &&
           sessionId &&
