@@ -886,8 +886,16 @@ export async function sanitizeSessionHistory(params: {
     !isOpenAIResponsesApi && policy.repairToolUseResultPairing
       ? sanitizeToolUseResultPairingForModel(openAISafeToolCalls, false)
       : openAISafeToolCalls;
+  // OpenAI Responses ids are already normalized above by
+  // normalizeOpenAIResponsesToolCallIds, which understands the call_id|fc_id
+  // pairing and rewrites both sides through one resolver. Running the
+  // generic Cloud-Code-Assist-style sanitizer again on top re-hashes those
+  // already-valid ids into a doubled/suffixed shape the provider never
+  // returned, which breaks HTTP continuation's replay-vs-cache comparison
+  // (and any other id-identity-sensitive replay) for every unowned
+  // openai-responses provider that reaches this fallback policy.
   const sanitizedToolIds =
-    policy.sanitizeToolCallIds && policy.toolCallIdMode
+    !isOpenAIResponsesApi && policy.sanitizeToolCallIds && policy.toolCallIdMode
       ? sanitizeToolCallIdsForCloudCodeAssist(pairedToolCalls, policy.toolCallIdMode, {
           preserveNativeAnthropicToolUseIds: policy.preserveNativeAnthropicToolUseIds,
           duplicateToolCallIdStyle: policy.duplicateToolCallIdStyle,

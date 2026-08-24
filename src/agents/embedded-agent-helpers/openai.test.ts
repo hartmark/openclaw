@@ -152,4 +152,17 @@ describe("normalizeOpenAIResponsesToolCallIds", () => {
     expect(toolResultId(out[4])).toMatch(/^call_[A-Za-z0-9_-]+\|fc_[A-Za-z0-9_-]+$/);
     expect(toolCallId(out[3])).not.toBe(toolResultId(out[4]));
   });
+
+  it("backfills toolCallId from a tool_use_id-only legacy wire alias", () => {
+    const rawId = "call_gateway_0|fc_gateway_0";
+    const { toolCallId: _toolCallId, ...aliasOnlyResult } = buildToolResult(rawId);
+    const messages: AgentMessage[] = [
+      buildAssistantToolCall(rawId),
+      { ...aliasOnlyResult, tool_use_id: rawId } as unknown as AgentMessage,
+    ];
+
+    const out = normalizeOpenAIResponsesToolCallIds(messages);
+
+    expect(toolResultId(out[1])).toBe(toolCallId(out[0]));
+  });
 });
