@@ -111,6 +111,48 @@ function sdkCompletion(responseId: string, content: string): SdkResponse {
   return sdkEvents(completedEvent(responseId, content));
 }
 
+function functionCallEvent(responseId: string, callId: string, name: string, args: unknown) {
+  const output = [
+    {
+      id: `fc_${responseId}`,
+      type: "function_call",
+      call_id: callId,
+      name,
+      arguments: JSON.stringify(args),
+      status: "completed",
+    },
+  ];
+  return {
+    type: "response.completed",
+    response: {
+      id: responseId,
+      status: "completed",
+      output,
+      usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+    },
+  };
+}
+
+function sdkFunctionCall(
+  responseId: string,
+  callId: string,
+  name: string,
+  args: unknown,
+): SdkResponse {
+  return sdkEvents(functionCallEvent(responseId, callId, name, args));
+}
+
+function toolResultMessage(callId: string, toolName: string, text: string, timestamp: number) {
+  return {
+    role: "toolResult" as const,
+    toolCallId: callId,
+    toolName,
+    content: [{ type: "text" as const, text }],
+    isError: false,
+    timestamp,
+  };
+}
+
 function sdkEvents(...events: Array<Record<string, unknown>>): SdkResponse {
   return {
     data: (async function* () {
@@ -220,6 +262,34 @@ describe("native OpenAI Responses SSE continuation", () => {
         },
       ],
     });
+  });
+
+  // Reproduces the real-world failure: a cron/agent turn where the model
+  // calls a tool, the tool result gets appended, and the loop calls the
+  // model again for the next round -- as opposed to every other test in
+  // this file, which only exercises plain user/assistant text turns. Ping's
+  // real vibe-image cron (multiple exec/read tool rounds per turn, routed
+  // through a self-hosted OmniRoute proxy with the compat opt-in) never got
+  // previous_response_id on any round after the first, even seconds apart,
+  // well inside the continuation cache's TTL.
+  it("continues into the next round after a tool call for an opted-in custom endpoint", async () => {
+    sseState.outcomes.push(
+      sdkFunctionCall("resp_1", "call_1", "exec", { command: "ls" }),
+      sdkCompletion("resp_2", "done"),
+    );
+    const onPayload = (payload: Record<string, unknown>) => ({ ...payload, store: true });
+    const firstUser = userMessage("run the vibe script", 1);
+    const first = await run(
+      { messages: [firstUser], tools: [] },
+      { onPayload, model: customEndpointModel },
+    );
+    const toolResult = toolResultMessage("call_1", "exec", "total 0", 2);
+    await run(
+      { messages: [firstUser, first, toolResult], tools: [] },
+      { onPayload, model: customEndpointModel },
+    );
+
+    expect(sseState.requests[1]).toMatchObject({ previous_response_id: "resp_1" });
   });
 
   it("engages for a custom/proxy endpoint once the operator opts a model in explicitly", async () => {

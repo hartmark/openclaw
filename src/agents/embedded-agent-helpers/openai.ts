@@ -238,6 +238,10 @@ export function normalizeOpenAIResponsesToolCallIds(messages: AgentMessage[]): A
     if (role === "toolResult") {
       const toolResult = msg as Extract<AgentMessage, { role: "toolResult" }> & {
         toolUseId?: unknown;
+        tool_call_id?: unknown;
+        tool_use_id?: unknown;
+        callId?: unknown;
+        call_id?: unknown;
       };
       let toolResultChanged = false;
       const updates: Record<string, string> = {};
@@ -246,6 +250,21 @@ export function normalizeOpenAIResponsesToolCallIds(messages: AgentMessage[]): A
         const nextToolCallId = resolveId(toolResult.toolCallId);
         if (nextToolCallId !== toolResult.toolCallId) {
           updates.toolCallId = nextToolCallId;
+          toolResultChanged = true;
+        }
+      } else {
+        // The generic Cloud-Code-Assist-style sanitizer this normalizer
+        // replaces for openai-responses history also backfilled toolCallId
+        // from these legacy/wire-shape alias fields; keep that repair so
+        // callers that only set call_id (raw provider echo shape) still get
+        // a canonical toolCallId once this is the sole normalizer running.
+        const aliasId =
+          toolResult.call_id ??
+          toolResult.callId ??
+          toolResult.tool_call_id ??
+          toolResult.toolUseId;
+        if (typeof aliasId === "string" && aliasId) {
+          updates.toolCallId = resolveId(aliasId);
           toolResultChanged = true;
         }
       }
