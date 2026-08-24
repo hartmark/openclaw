@@ -262,6 +262,7 @@ export function normalizeOpenAIResponsesToolCallIds(messages: AgentMessage[]): A
           toolResult.call_id ??
           toolResult.callId ??
           toolResult.tool_call_id ??
+          toolResult.tool_use_id ??
           toolResult.toolUseId;
         if (typeof aliasId === "string" && aliasId) {
           updates.toolCallId = resolveId(aliasId);
