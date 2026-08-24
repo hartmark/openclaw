@@ -174,7 +174,7 @@ export function claimOpenAIResponsesHttpContinuation(
   const previous = httpContinuationEntries.get(key);
   // eslint-disable-next-line no-console
   console.error(
-    `[continuation-debug] CLAIM key=${key} previousKind=${previous?.kind ?? "none"} ` +
+    `[continuation-debug] CLAIM key=${key.replace("\0", "|")} previousKind=${previous?.kind ?? "none"} ` +
       `entriesSize=${httpContinuationEntries.size}`,
   );
   if (previous?.kind === "claimed") {
@@ -194,7 +194,7 @@ export function claimOpenAIResponsesHttpContinuation(
       const stillClaimed = httpContinuationEntries.get(key) === claimed;
       // eslint-disable-next-line no-console
       console.error(
-        `[continuation-debug] COMMIT key=${key} stillClaimed=${stillClaimed} responseId=${response?.id}`,
+        `[continuation-debug] COMMIT key=${key.replace("\0", "|")} stillClaimed=${stillClaimed} responseId=${response?.id}`,
       );
       if (!stillClaimed) {
         return;
@@ -215,7 +215,7 @@ export function claimOpenAIResponsesHttpContinuation(
       const stillClaimed = httpContinuationEntries.get(key) === claimed;
       // eslint-disable-next-line no-console
       console.error(
-        `[continuation-debug] RELEASE key=${key} stillClaimed=${stillClaimed} ` +
+        `[continuation-debug] RELEASE key=${key.replace("\0", "|")} stillClaimed=${stillClaimed} ` +
           `previousKind=${previous?.kind ?? "none"}`,
       );
       if (!stillClaimed) {
