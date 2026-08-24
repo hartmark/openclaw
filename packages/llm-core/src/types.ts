@@ -532,6 +532,12 @@ export interface OpenAIResponsesCompat {
   sendSessionIdHeader?: boolean;
   /** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
   supportsLongCacheRetention?: boolean;
+  /**
+   * Minutes an HTTP continuation baseline (client-side delta + `previous_response_id`)
+   * stays cached in process memory since its last use before eviction. A gap between
+   * turns longer than this falls back to a full-history request. Default: 90.
+   */
+  responsesContinuationIdleMinutes?: number;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */

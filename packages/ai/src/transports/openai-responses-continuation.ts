@@ -5,7 +5,10 @@ import { getAiTransportHost, resolveAiTransportHeaderSentinels } from "../host.j
 import { registerSessionResourceCleanup } from "../session-resources.js";
 import { sha256Hex } from "./transport-utils.js";
 
-const HTTP_CONTINUATION_IDLE_TTL_MS = 5 * 60 * 1000;
+// Default only for callers that don't resolve a per-model TTL via
+// resolveOpenAIResponsesPayloadPolicy (e.g. direct test/tooling callers).
+// The real transport call site always passes an explicit idleTtlMs.
+const DEFAULT_HTTP_CONTINUATION_IDLE_TTL_MS = 90 * 60 * 1000;
 const TURN_HEADERS = new Set(["traceparent", "x-openclaw-turn-id", "x-openclaw-turn-attempt"]);
 
 export type ResponsesContinuationRequest = Record<string, unknown> & {
@@ -152,9 +155,12 @@ export function claimOpenAIResponsesHttpContinuation(
   params: HttpContinuationIdentity & {
     sessionId: string;
     request: ResponsesContinuationRequest;
+    /** Idle eviction bound; resolved per-model via resolveOpenAIResponsesPayloadPolicy. */
+    idleTtlMs?: number;
   },
 ) {
   const key = `${params.sessionId}\0${connectionIdentity(params)}`;
+  const idleTtlMs = params.idleTtlMs ?? DEFAULT_HTTP_CONTINUATION_IDLE_TTL_MS;
   const previous = httpContinuationEntries.get(key);
   if (previous?.kind === "claimed") {
     return undefined;
@@ -180,7 +186,7 @@ export function claimOpenAIResponsesHttpContinuation(
         if (current?.kind === "ready" && current.generation === generation) {
           httpContinuationEntries.delete(key);
         }
-      }, HTTP_CONTINUATION_IDLE_TTL_MS);
+      }, idleTtlMs);
       idleTimer.unref?.();
       const ready = {
         ...claimed,

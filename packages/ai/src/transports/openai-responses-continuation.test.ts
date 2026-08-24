@@ -166,14 +166,49 @@ describe("OpenAI Responses continuation", () => {
     next?.release();
   });
 
-  it("expires completed continuation state after the bounded idle TTL", () => {
+  it("expires completed continuation state after the default 90-minute idle TTL", () => {
     vi.useFakeTimers();
     const first = claim({});
     first?.commit(continuationState().lastRequest, {
       id: "resp_expiring",
       output: continuationState().lastResponseItems,
     });
-    vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+    vi.advanceTimersByTime(90 * 60 * 1000 + 1);
+
+    const next = claim({ request: nextRequest() });
+    expect(next?.request.previous_response_id).toBeUndefined();
+    next?.release();
+  });
+
+  it("survives a gap shorter than the default 90-minute idle TTL", () => {
+    vi.useFakeTimers();
+    const first = claim({});
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_surviving",
+      output: continuationState().lastResponseItems,
+    });
+    vi.advanceTimersByTime(89 * 60 * 1000);
+
+    const next = claim({ request: nextRequest() });
+    expect(next?.request.previous_response_id).toBe("resp_surviving");
+    next?.release();
+  });
+
+  it("honors a shorter per-model idleTtlMs override", () => {
+    vi.useFakeTimers();
+    const first = claimOpenAIResponsesHttpContinuation({
+      sessionId: "session-1",
+      apiKey: "api-key",
+      baseUrl: "https://api.openai.com/v1",
+      headers: { Authorization: "Bearer tenant-a" },
+      request: continuationState().lastRequest,
+      idleTtlMs: 60_000,
+    });
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_custom_ttl",
+      output: continuationState().lastResponseItems,
+    });
+    vi.advanceTimersByTime(60_000 + 1);
 
     const next = claim({ request: nextRequest() });
     expect(next?.request.previous_response_id).toBeUndefined();
