@@ -172,11 +172,6 @@ export function claimOpenAIResponsesHttpContinuation(
 ) {
   const key = `${params.sessionId}\0${connectionIdentity(params)}`;
   const previous = httpContinuationEntries.get(key);
-  // eslint-disable-next-line no-console
-  console.error(
-    `[continuation-debug] CLAIM key=${key.replace("\0", "|")} previousKind=${previous?.kind ?? "none"} ` +
-      `entriesSize=${httpContinuationEntries.size}`,
-  );
   if (previous?.kind === "claimed") {
     return undefined;
   }
@@ -189,19 +184,10 @@ export function claimOpenAIResponsesHttpContinuation(
   const previousState = previous?.kind === "ready" ? previous.state : undefined;
   const resolved = resolveResponsesContinuationRequest(previousState, params.request);
   const wireRequest = resolved.request;
-  // eslint-disable-next-line no-console
-  console.error(
-    `[continuation-debug] RESOLVE key=${key.replace("\0", "|")} status=${resolved.continuationStatus} ` +
-      `hasPreviousState=${previousState !== undefined}`,
-  );
   return {
     request: wireRequest,
     commit: (effectiveRequest: ResponsesContinuationRequest, response: ContinuationResponse) => {
       const stillClaimed = httpContinuationEntries.get(key) === claimed;
-      // eslint-disable-next-line no-console
-      console.error(
-        `[continuation-debug] COMMIT key=${key.replace("\0", "|")} stillClaimed=${stillClaimed} responseId=${response?.id}`,
-      );
       if (!stillClaimed) {
         return;
       }
@@ -219,11 +205,6 @@ export function claimOpenAIResponsesHttpContinuation(
     },
     release: () => {
       const stillClaimed = httpContinuationEntries.get(key) === claimed;
-      // eslint-disable-next-line no-console
-      console.error(
-        `[continuation-debug] RELEASE key=${key.replace("\0", "|")} stillClaimed=${stillClaimed} ` +
-          `previousKind=${previous?.kind ?? "none"}`,
-      );
       if (!stillClaimed) {
         return;
       }
