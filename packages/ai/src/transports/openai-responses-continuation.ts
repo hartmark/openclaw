@@ -172,6 +172,11 @@ export function claimOpenAIResponsesHttpContinuation(
 ) {
   const key = `${params.sessionId}\0${connectionIdentity(params)}`;
   const previous = httpContinuationEntries.get(key);
+  // eslint-disable-next-line no-console
+  console.error(
+    `[continuation-debug] CLAIM key=${key} previousKind=${previous?.kind ?? "none"} ` +
+      `entriesSize=${httpContinuationEntries.size}`,
+  );
   if (previous?.kind === "claimed") {
     return undefined;
   }
@@ -186,7 +191,12 @@ export function claimOpenAIResponsesHttpContinuation(
   return {
     request: wireRequest,
     commit: (effectiveRequest: ResponsesContinuationRequest, response: ContinuationResponse) => {
-      if (httpContinuationEntries.get(key) !== claimed) {
+      const stillClaimed = httpContinuationEntries.get(key) === claimed;
+      // eslint-disable-next-line no-console
+      console.error(
+        `[continuation-debug] COMMIT key=${key} stillClaimed=${stillClaimed} responseId=${response?.id}`,
+      );
+      if (!stillClaimed) {
         return;
       }
       const ready = {
@@ -202,7 +212,13 @@ export function claimOpenAIResponsesHttpContinuation(
       httpContinuationEntries.set(key, ready);
     },
     release: () => {
-      if (httpContinuationEntries.get(key) !== claimed) {
+      const stillClaimed = httpContinuationEntries.get(key) === claimed;
+      // eslint-disable-next-line no-console
+      console.error(
+        `[continuation-debug] RELEASE key=${key} stillClaimed=${stillClaimed} ` +
+          `previousKind=${previous?.kind ?? "none"}`,
+      );
+      if (!stillClaimed) {
         return;
       }
       // This claim never committed a new state (e.g. the request errored
