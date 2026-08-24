@@ -11,8 +11,11 @@ import {
 } from "./openai-responses-reasoning-update.js";
 import { sha256Hex } from "./transport-utils.js";
 
-// A real chat conversation's turns are commonly minutes to hours apart, well
-// past the original 5-minute TTL -- continuation only ever engaged within one
+// Default only for callers that don't resolve a per-model TTL via
+// resolveOpenAIResponsesPayloadPolicy (e.g. direct test/tooling callers).
+// The real transport call site always passes an explicit idleTtlMs. A real
+// chat conversation's turns are commonly minutes to hours apart, well past
+// the original 5-minute TTL -- continuation only ever engaged within one
 // multi-round tool-calling turn (seconds between rounds), never across
 // separate incoming messages, even though sessionId and connection identity
 // are both stable across turns (confirmed by tracing the full call chain).
@@ -20,7 +23,7 @@ import { sha256Hex } from "./transport-utils.js";
 // in-memory/process-local design generally, never the specific value.
 const HTTP_CONTINUATION_IDLE_TTL_MS = 90 * 60 * 1000;
 // A ready entry retains the full request/response baseline for as long as
-// HTTP_CONTINUATION_IDLE_TTL_MS, and that TTL is now 18x longer (5m -> 90m).
+// its resolved idleTtlMs, and the default is now 18x longer (5m -> 90m).
 // Without a capacity cap, a burst of concurrent sessions/connections could
 // grow this process-wide map unbounded for the entire idle window. Claimed
 // entries (in-flight, no retained baseline) don't count against the cap --
@@ -321,9 +324,12 @@ export function claimOpenAIResponsesHttpContinuation(
     sessionId: string;
     request: ResponsesContinuationRequest;
     restoreRequest?: () => ResponsesContinuationRequest;
+    /** Idle eviction bound; resolved per-model via resolveOpenAIResponsesPayloadPolicy. */
+    idleTtlMs?: number;
   },
 ) {
   const key = `${params.sessionId}\0${connectionIdentity(params)}`;
+  const idleTtlMs = params.idleTtlMs ?? HTTP_CONTINUATION_IDLE_TTL_MS;
   const previous = httpContinuationEntries.get(key);
   if (previous?.kind === "claimed") {
     return undefined;
@@ -368,10 +374,7 @@ export function claimOpenAIResponsesHttpContinuation(
           ...claimed,
           kind: "ready",
           state,
-          idleTimer: setTimeout(
-            () => deleteHttpContinuationIfOwned(key, ready),
-            HTTP_CONTINUATION_IDLE_TTL_MS,
-          ),
+          idleTimer: setTimeout(() => deleteHttpContinuationIfOwned(key, ready), idleTtlMs),
           readySequence: nextHttpContinuationReadySequence++,
           retainedBytes,
         } satisfies Extract<HttpContinuationEntry, { kind: "ready" }>;
