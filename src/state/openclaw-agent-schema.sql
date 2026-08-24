@@ -649,6 +649,35 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_transcript_active_messages
   ON session_transcript_active_events(session_id, message_position)
   WHERE message_position IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS session_transcript_display_state (
+  session_id TEXT NOT NULL PRIMARY KEY,
+  generation TEXT NOT NULL,
+  indexed_seq INTEGER NOT NULL CHECK (indexed_seq >= -1),
+  row_count INTEGER NOT NULL CHECK (row_count >= 0),
+  needs_rebuild INTEGER NOT NULL DEFAULT 0 CHECK (needs_rebuild IN (0, 1)),
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES session_windows(session_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_transcript_display_rows (
+  session_id TEXT NOT NULL,
+  row_id TEXT NOT NULL,
+  row_version INTEGER NOT NULL CHECK (row_version = 1),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  display_ordinal INTEGER NOT NULL CHECK (display_ordinal >= 0),
+  source_event_seq INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user', 'assistant', 'compaction', 'reset', 'opaque')),
+  PRIMARY KEY (session_id, row_id),
+  FOREIGN KEY (session_id) REFERENCES session_transcript_display_state(session_id) ON DELETE CASCADE,
+  FOREIGN KEY (session_id, source_event_seq) REFERENCES transcript_events(session_id, seq) ON DELETE CASCADE
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_transcript_display_ordinal
+  ON session_transcript_display_rows(session_id, display_ordinal);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_transcript_display_source
+  ON session_transcript_display_rows(session_id, source_event_seq);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS session_transcript_fts USING fts5(
   text,
   session_id UNINDEXED,

@@ -6,10 +6,7 @@ import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { truncateUtf16Safe } from "../../utils.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import { listSessionsNeedingTranscriptIndexReconcile } from "./session-transcript-index.js";
-import {
-  isSessionTranscriptIndexReconcileRunning,
-  startSessionTranscriptIndexReconcile,
-} from "./session-transcript-reconcile.js";
+import { startSessionTranscriptIndexReconcile } from "./session-transcript-reconcile.js";
 
 const SEARCH_SNIPPET_MAX_CHARS = 500;
 const SEARCH_LIMIT_MAX = 25;
@@ -70,8 +67,7 @@ export function searchSessionTranscripts(params: {
   if (dirtySessions.length > 0) {
     startSessionTranscriptIndexReconcile(databaseOptions);
   }
-  const indexing =
-    dirtySessions.length > 0 || isSessionTranscriptIndexReconcileRunning(databaseOptions);
+  const indexing = dirtySessions.length > 0;
   const limit = Math.min(Math.max(1, params.limit ?? 10), SEARCH_LIMIT_MAX);
   const sessionKeys = params.sessionKeys ?? [];
   const whereSession =

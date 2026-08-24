@@ -83,6 +83,11 @@ export function historicalV15AgentSchemaSql(): string {
     "-- Canonical cold-tier owner for reclaimed transcript generations.",
     "CREATE TABLE IF NOT EXISTS transcript_rewrite_watermarks (",
   );
+  sql = removeSchemaRange(
+    sql,
+    "CREATE TABLE IF NOT EXISTS session_transcript_display_state (",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS session_transcript_fts USING fts5(",
+  );
   return removeSchemaRange(
     sql,
     "CREATE TABLE IF NOT EXISTS standing_intents (",

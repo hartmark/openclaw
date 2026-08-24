@@ -97,7 +97,9 @@ export function appendTranscriptMessageInTransaction<TMessage>(
   const messageId = options.eventId ?? randomUUID();
   const now = options.now ?? Date.now();
   const finalMessage = serializeForStorage(prepared);
-  ensureTranscriptHeader(database, resolved, options.cwd);
+  ensureTranscriptHeader(database, resolved, options.cwd, {
+    maintainDisplayProjection: options.maintainDisplayProjection === true ? true : undefined,
+  });
   const parentId = resolveTranscriptMessageAppendParent(database, resolved.sessionId, options);
   const event = {
     type: "message",
@@ -110,6 +112,7 @@ export function appendTranscriptMessageInTransaction<TMessage>(
     dedupeByMessageIdempotency:
       options.idempotencyLookup !== "caller-checked" &&
       options.idempotencyLookup !== "scan-assistant",
+    maintainDisplayProjection: options.maintainDisplayProjection === true ? true : undefined,
   });
   if (!appended && idempotencyKey && options.idempotencyLookup !== "caller-checked") {
     const existing = readTranscriptMessageByScopedIdempotencyKey(

@@ -30,6 +30,11 @@ import {
   ensureSessionAdditiveColumns,
   ensureSessionEntryValidityProjection,
 } from "./openclaw-agent-db-session-migrations.js";
+import {
+  SESSION_TRANSCRIPT_DISPLAY_ROWS_TABLE,
+  SESSION_TRANSCRIPT_DISPLAY_STATE_TABLE,
+  validateOpenClawAgentDisplayRowSchema,
+} from "./openclaw-agent-display-row-schema.js";
 import { MESSAGE_TOOL_RUN_OUTCOMES_TABLE } from "./openclaw-agent-message-tool-outcome-schema.js";
 import {
   ensureOpenClawAgentProgressCardSchemaInTransaction,
@@ -66,6 +71,8 @@ const AGENT_SCHEMA_COMPATIBILITY = {
     SESSION_PARTICIPANTS_TABLE,
     SESSION_PROGRESS_CARDS_TABLE,
     SESSION_TRANSCRIPT_ARCHIVES_TABLE,
+    SESSION_TRANSCRIPT_DISPLAY_ROWS_TABLE,
+    SESSION_TRANSCRIPT_DISPLAY_STATE_TABLE,
     STANDING_INTENTS_TABLE,
     STANDING_INTENTS_FTS_TABLE,
     ...STANDING_INTENTS_FTS_SHADOW_TABLES,
@@ -126,6 +133,7 @@ export function assertOpenClawAgentCurrentRuntimeSchema(
     );
   }
   assertOpenClawAgentSchemaContains(database, options.pathname, OPENCLAW_AGENT_SCHEMA_SQL);
+  validateOpenClawAgentDisplayRowSchema(database);
 }
 
 function hasAnyCanonicalTable(database: DatabaseSync, schemaSql: string): boolean {
