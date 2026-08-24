@@ -187,7 +187,13 @@ export function claimOpenAIResponsesHttpContinuation(
   const claimed = { kind: "claimed", sessionId: params.sessionId, generation } as const;
   httpContinuationEntries.set(key, claimed);
   const previousState = previous?.kind === "ready" ? previous.state : undefined;
-  const wireRequest = resolveResponsesContinuationRequest(previousState, params.request).request;
+  const resolved = resolveResponsesContinuationRequest(previousState, params.request);
+  const wireRequest = resolved.request;
+  // eslint-disable-next-line no-console
+  console.error(
+    `[continuation-debug] RESOLVE key=${key.replace("\0", "|")} status=${resolved.continuationStatus} ` +
+      `hasPreviousState=${previousState !== undefined}`,
+  );
   return {
     request: wireRequest,
     commit: (effectiveRequest: ResponsesContinuationRequest, response: ContinuationResponse) => {
