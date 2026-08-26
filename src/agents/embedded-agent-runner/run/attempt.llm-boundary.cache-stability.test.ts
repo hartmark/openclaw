@@ -356,6 +356,60 @@ describe("prompt-cache byte-identity (issue #3658)", () => {
     expect(output[0]?.content).toBe(cron);
   });
 
+  it("strips inbound metadata from a cron turn even while active, so HTTP continuation sees it identically once historical", () => {
+    // A cron/heartbeat turn on a persistent session ("main" target) is replayed
+    // as history on the next round in the SAME session. The HTTP continuation
+    // cache (openai-responses-continuation.ts) stores the request exactly as
+    // sent and compares it byte-for-byte against this same turn once historical.
+    // Before this fix, the envelope/cron branch kept metadata while active but
+    // stripped it once historical -- two different byte forms for one logical
+    // turn, which continuation reads as changed history and never engages.
+    const metaBlock = `${markInboundContextLabel("Conversation info:")}\n\`\`\`json\n{"channel":"discord"}\n\`\`\`\n\n`;
+    const cronWithMeta = `Current time: 2026-06-05 10:30.\n${metaBlock}Run the scheduled job.`;
+
+    const active: AgentMsg[] = [storedUserMsg(cronWithMeta, TS_TURN1)];
+    const activeOutput = normalizeMessagesForLlmBoundary(active, {
+      timezone: TZ,
+    }) as unknown as Array<{ content?: unknown }>;
+
+    const historical: AgentMsg[] = [
+      storedUserMsg(cronWithMeta, TS_TURN1),
+      ASSISTANT_MSG,
+      currentUserMsg("next", TS_TURN2),
+    ];
+    const historicalOutput = normalizeMessagesForLlmBoundary(historical, {
+      timezone: TZ,
+    }) as unknown as Array<{ content?: unknown }>;
+
+    expect(activeOutput[0]?.content).toBe(historicalOutput[0]?.content);
+    expect(activeOutput[0]?.content).not.toContain("Conversation info");
+    expect(activeOutput[0]?.content).toContain("Current time: 2026-06-05 10:30.");
+    expect(activeOutput[0]?.content).toContain("Run the scheduled job.");
+  });
+
+  it("strips inbound metadata from a channel-envelope turn even while active (same continuation-stability contract)", () => {
+    const metaBlock = `${markInboundContextLabel("Conversation info:")}\n\`\`\`json\n{"channel":"discord"}\n\`\`\`\n\n`;
+    const envelopeWithMeta = `[Sat 2026-06-05 10:30 UTC+8] ${metaBlock}Hello from Discord`;
+
+    const active: AgentMsg[] = [storedUserMsg(envelopeWithMeta, TS_TURN1)];
+    const activeOutput = normalizeMessagesForLlmBoundary(active, {
+      timezone: TZ,
+    }) as unknown as Array<{ content?: unknown }>;
+
+    const historical: AgentMsg[] = [
+      storedUserMsg(envelopeWithMeta, TS_TURN1),
+      ASSISTANT_MSG,
+      currentUserMsg("next", TS_TURN2),
+    ];
+    const historicalOutput = normalizeMessagesForLlmBoundary(historical, {
+      timezone: TZ,
+    }) as unknown as Array<{ content?: unknown }>;
+
+    expect(activeOutput[0]?.content).toBe(historicalOutput[0]?.content);
+    expect(activeOutput[0]?.content).not.toContain("Conversation info");
+    expect(activeOutput[0]?.content).toBe("[Sat 2026-06-05 10:30 UTC+8] Hello from Discord");
+  });
+
   it("historical inbound metadata is stripped (UI-clean) before the timestamp is applied", () => {
     // Historical user turns get their inbound-metadata blocks stripped (same as
     // the original boundary behaviour), then stamped. The current turn keeps its
@@ -761,16 +815,22 @@ describe("prompt-cache tail carrier for current-turn metadata (issue #100271)", 
     expect(JSON.stringify(currentContent)).toBe(JSON.stringify(historicalContent));
     expect(typeof currentContent).toBe("string");
     expect(currentContent).toContain('"name":"Alice"');
-    expect(
-      normalizeMessagesForLlmBoundary(asCurrent, {
-        timezone: TZ,
-        userTranscriptContexts: [
-          {
-            runtimeMessage: activeGroupTurn,
-            transcriptMessage: persistedGroupTurn,
-          },
-        ],
-      }),
-    ).toEqual(asCurrent);
+    // Feeding the already-boundary-processed output back through the boundary
+    // is not a real production path (storage always keeps the bare form), but
+    // exercises it anyway: the output now carries a leading timestamp envelope,
+    // so a second pass strips the Conversation info block that was projected
+    // onto it -- the same unconditional envelope-branch stripping this file's
+    // cron/channel-envelope tests cover, not a regression in sender projection.
+    const reprocessed = normalizeMessagesForLlmBoundary(asCurrent, {
+      timezone: TZ,
+      userTranscriptContexts: [
+        {
+          runtimeMessage: activeGroupTurn,
+          transcriptMessage: persistedGroupTurn,
+        },
+      ],
+    }) as unknown as Array<{ content?: unknown }>;
+    expect(reprocessed[0]?.content).not.toContain("Conversation info");
+    expect(reprocessed[0]?.content).toContain("The launch is Friday");
   });
 });

@@ -491,16 +491,18 @@ function stripHistoricalInboundMetadataFromUserMessages(
     // Channel-envelope preservation: a message that already carries its OWN
     // leading `[DOW YYYY-MM-DD HH:MM ...] ` envelope (Discord/Telegram, or a
     // cron "Current time:" marker) keeps it verbatim — we strip metadata from
-    // the body but NEVER drop or replace the envelope, and never re-stamp. This
-    // keeps such messages byte-stable across current↔historical (the envelope is
-    // present in both forms) and avoids double-stamping.
+    // the body but NEVER drop or replace the envelope, and never re-stamp.
+    // Unlike the plain-text path below, this branch strips metadata even while
+    // active: an HTTP-continuation cache (openai-responses-continuation.ts)
+    // stores the request exactly as sent and compares it byte-for-byte against
+    // this same turn once it becomes historical on the next round. An isActive
+    // exemption here would mean the live and historical forms permanently
+    // disagree for any envelope/cron turn, which reads as changed history and
+    // silently defeats continuation forever for that session.
     const transformText = (raw: string): string => {
       const sourceText = injectMediaText && !raw.trim() ? mediaOnlyText : raw;
       const { body, envelope } = splitLeadingTimestampEnvelope(sourceText);
       if (envelope || sourceText.includes(BOUNDARY_CRON_TIME_MARKER)) {
-        if (isActive) {
-          return sourceText;
-        }
         // Strip metadata from the body but re-attach the original envelope.
         return `${envelope}${stripInboundMetadata(body)}`;
       }
