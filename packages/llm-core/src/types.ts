@@ -538,11 +538,17 @@ export interface OpenAIResponsesCompat {
    * Explicit opt-in for HTTP continuation (client-side delta + `previous_response_id`)
    * on a custom/proxy OpenAI-Responses-compatible endpoint. A native `api.openai.com`
    * connection is eligible by default; a custom endpoint carries no trust signal of
-   * its own, so this is the only path to eligibility there — set it once you've
+   * its own, so this is the only path to eligibility there -- set it once you've
    * verified the backend correctly resolves `previous_response_id` and persists
    * `store: true` turns. Default: false.
    */
   supportsResponsesContinuation?: boolean;
+  /**
+   * Minutes an HTTP continuation baseline (client-side delta + `previous_response_id`)
+   * stays cached in process memory since its last use before eviction. A gap between
+   * turns longer than this falls back to a full-history request. Default: 90.
+   */
+  responsesContinuationIdleMinutes?: number;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */

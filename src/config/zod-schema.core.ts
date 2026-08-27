@@ -268,6 +268,7 @@ const ModelCompatSchema = z
     supportsStore: z.boolean().optional(),
     supportsPromptCacheKey: z.boolean().optional(),
     supportsResponsesContinuation: z.boolean().optional(),
+    responsesContinuationIdleMinutes: z.number().positive().optional(),
     supportsDeveloperRole: z.boolean().optional(),
     supportsReasoningEffort: z.boolean().optional(),
     supportsTemperature: z.boolean().optional(),

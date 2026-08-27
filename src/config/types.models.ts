@@ -49,6 +49,7 @@ type SupportedOpenAICompatFields = Pick<
 
 type SupportedOpenAIResponsesCompatFields = Pick<
   OpenAIResponsesCompat,
+  | "responsesContinuationIdleMinutes"
   | "sendSessionIdHeader"
   | "supportsLongCacheRetention"
   | "supportsInstructions"
