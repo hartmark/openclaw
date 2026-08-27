@@ -1,4 +1,5 @@
 // Comfy plugin module implements workflow runtime behavior.
+import { randomInt } from "node:crypto";
 import fs from "node:fs/promises";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveGeneratedMediaMaxBytes } from "openclaw/plugin-sdk/media-generation-runtime";
@@ -18,6 +19,7 @@ import {
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
 import {
   normalizeSecretInputString,
+  resolveConfiguredSecretInputString,
   resolveSecretInputString,
 } from "openclaw/plugin-sdk/secret-input-runtime";
 import { canResolveEnvSecretRefInReadOnlyPath } from "openclaw/plugin-sdk/secret-ref-readonly";
@@ -41,8 +43,13 @@ const DEFAULT_COMFY_LOCAL_BASE_URL = "http://127.0.0.1:8188";
 const DEFAULT_COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org";
 const DEFAULT_PROMPT_INPUT_NAME = "text";
 const DEFAULT_INPUT_IMAGE_INPUT_NAME = "image";
+const DEFAULT_SEED_INPUT_NAME = "seed";
 const DEFAULT_POLL_INTERVAL_MS = 1_500;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
+// crypto.randomInt requires max < 2**48; that's still 15 digits of entropy
+// per submission, comfortably below Number.MAX_SAFE_INTEGER so the value
+// survives JSON round-tripping without float precision loss.
+const RANDOM_SEED_EXCLUSIVE_MAX = 2 ** 48 - 1;
 
 export const DEFAULT_COMFY_MODEL = "workflow";
 
@@ -250,6 +257,70 @@ function setWorkflowInput(params: {
     throw new Error(`Comfy workflow node "${params.nodeId}" is missing an inputs object`);
   }
   inputs[params.inputName] = params.value;
+}
+
+// Generates a fresh per-submission sampler seed. Static workflow JSON/paths
+// otherwise reuse whatever seed value is baked into the file on every run,
+// so a workflow whose sampler seed is meant to vary per generation (the
+// common case) would silently return the same image every time.
+function generateComfySeed(): number {
+  return randomInt(RANDOM_SEED_EXCLUSIVE_MAX);
+}
+
+// Local ComfyUI instances reachable over a network (not bare loopback) may
+// sit behind HTTP auth (Basic auth, a bearer token, etc.) that the plugin has
+// no built-in scheme for. A generic header passthrough -- same shape as the
+// established `remote.headers` config pattern (see the ollama plugin) --
+// covers that without inventing a Comfy-specific auth scheme. A literal
+// string resolves synchronously via the cheap inspect path; a SecretRef of
+// any provider (env, file, keychain, plugin-backed) resolves through the
+// same full async resolver the ollama plugin uses for its own headers --
+// unlike `resolveComfyApiKey`'s sync-only env fallback (constrained by its
+// additional use in the sync `isComfyCapabilityConfigured` veto), this
+// function is only ever called from the already-async request path, so it
+// can resolve any configured provider rather than just env.
+async function resolveComfyHeadersConfig(
+  value: unknown,
+  cfg: OpenClawConfig,
+): Promise<Record<string, string> | undefined> {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const headers: Record<string, string> = {};
+  for (const [name, headerValue] of Object.entries(value)) {
+    const path = `plugins.entries.comfy.config.headers.${name}`;
+    const inspected = resolveSecretInputString({
+      value: headerValue,
+      path,
+      defaults: cfg.secrets?.defaults,
+      mode: "inspect",
+    });
+    if (inspected.status === "available") {
+      const normalized = normalizeSecretInputString(inspected.value);
+      if (normalized) {
+        headers[name] = normalized;
+      }
+      continue;
+    }
+    if (inspected.status === "missing") {
+      continue;
+    }
+    const resolved = await resolveConfiguredSecretInputString({
+      config: cfg,
+      env: process.env,
+      value: headerValue,
+      path,
+      unresolvedReasonStyle: "detailed",
+    });
+    if (resolved.unresolvedRefReason) {
+      throw new Error(`${path} references an unavailable secret: ${resolved.unresolvedRefReason}`);
+    }
+    const normalized = normalizeSecretInputString(resolved.value);
+    if (normalized) {
+      headers[name] = normalized;
+    }
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
 function resolveComfyNetworkPolicy(params: {
@@ -600,6 +671,42 @@ async function downloadOutputFile(params: {
   }
 }
 
+// Only vetoes on a *definite* negative: a configured env ref whose env var
+// is confirmed empty/unset (env access needs no I/O, so this is decidable
+// synchronously, same check resolveComfyApiKey already does for apiKey). A
+// file/keychain/exec ref is NOT vetoed here even though inspect mode can't
+// confirm it either way -- unlike apiKey's cloud-only gate, this function
+// guards every local-mode image/video/music tool, so treating "can't
+// confirm yet" as "unavailable" would permanently hide the tool for any
+// operator using a legitimately-configured non-env credential provider (a
+// real regression, not a safety margin: silently vanishing a working
+// capability is worse than letting a genuinely broken one surface its
+// error at actual invocation, in runComfyWorkflow's async resolution).
+function hasUnavailableComfyHeaderSecret(value: unknown, cfg?: OpenClawConfig): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return Object.entries(value).some(([name, headerValue]) => {
+    const inspected = resolveSecretInputString({
+      value: headerValue,
+      path: `plugins.entries.comfy.config.headers.${name}`,
+      defaults: cfg?.secrets?.defaults,
+      mode: "inspect",
+    });
+    if (inspected.status !== "configured_unavailable" || inspected.ref.source !== "env") {
+      return false;
+    }
+    const envVarName = inspected.ref.id.trim();
+    const resolvable =
+      canResolveEnvSecretRefInReadOnlyPath({
+        cfg,
+        provider: inspected.ref.provider,
+        id: envVarName,
+      }) && Boolean(normalizeSecretInputString(process.env[envVarName]));
+    return !resolvable;
+  });
+}
+
 export function isComfyCapabilityConfigured(params: {
   cfg?: OpenClawConfig;
   agentDir?: string;
@@ -613,6 +720,9 @@ export function isComfyCapabilityConfigured(params: {
   );
   const hasPromptNode = Boolean(normalizeOptionalString(capabilityConfig.promptNodeId));
   if (!hasWorkflow || !hasPromptNode) {
+    return false;
+  }
+  if (hasUnavailableComfyHeaderSecret(capabilityConfig.headers, params.cfg)) {
     return false;
   }
   if (resolveComfyMode(capabilityConfig) === "local") {
@@ -653,6 +763,9 @@ export async function runComfyWorkflow(params: {
   const inputImageNodeId = normalizeOptionalString(capabilityConfig.inputImageNodeId);
   const inputImageInputName =
     normalizeOptionalString(capabilityConfig.inputImageInputName) ?? DEFAULT_INPUT_IMAGE_INPUT_NAME;
+  const seedNodeId = normalizeOptionalString(capabilityConfig.seedNodeId);
+  const seedInputName =
+    normalizeOptionalString(capabilityConfig.seedInputName) ?? DEFAULT_SEED_INPUT_NAME;
   const outputNodeId = normalizeOptionalString(capabilityConfig.outputNodeId);
   const pollIntervalMs = resolvePositiveTimerTimeoutMs(
     readConfigInteger(capabilityConfig, "pollIntervalMs"),
@@ -670,6 +783,15 @@ export async function runComfyWorkflow(params: {
     inputName: promptInputName,
     value: params.prompt,
   });
+
+  if (seedNodeId) {
+    setWorkflowInput({
+      workflow,
+      nodeId: seedNodeId,
+      inputName: seedInputName,
+      value: generateComfySeed(),
+    });
+  }
 
   const pluginApiKey = resolveComfyApiKey(capabilityConfig, params.cfg);
   const resolvedAuth =
@@ -700,6 +822,7 @@ export async function runComfyWorkflow(params: {
       defaultBaseUrl:
         mode === "cloud" ? DEFAULT_COMFY_CLOUD_BASE_URL : DEFAULT_COMFY_LOCAL_BASE_URL,
       allowPrivateNetwork: mode === "local" || explicitAllowPrivateNetwork,
+      headers: await resolveComfyHeadersConfig(capabilityConfig.headers, params.cfg),
       defaultHeaders:
         mode === "cloud"
           ? {
