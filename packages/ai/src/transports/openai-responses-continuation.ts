@@ -9,7 +9,11 @@ import {
   replayResponsesReasoningUpdates,
   type ResponsesConfigurationUpdate,
 } from "./openai-responses-reasoning-update.js";
-import { normalizeOpenAIResponsesFunctionCallId } from "./openai-responses-tool-call-id-shape.js";
+import {
+  normalizeOpenAIResponsesFunctionCallId,
+  shouldNormalizeOpenAIResponsesToolCallId,
+  splitOpenAIFunctionCallPairing,
+} from "./openai-responses-tool-call-id-shape.js";
 import { sha256Hex } from "./transport-utils.js";
 
 const HTTP_CONTINUATION_IDLE_TTL_MS = 5 * 60 * 1000;
@@ -74,6 +78,34 @@ function canonicalizeReplayedCallId(value: unknown): unknown {
   return typeof value === "string" ? normalizeOpenAIResponsesFunctionCallId(value) : value;
 }
 
+// A cached raw provider `function_call` still carries its separate,
+// un-reshaped `call_id` and item `id` fields exactly as the provider
+// returned them. Replay pairs those two into one `call_id|fc_id` string
+// before reshaping (normalizeOpenAIResponsesToolCallIds, mirrored by
+// normalizeOpenAIResponsesFunctionCallId), then the request builder splits
+// the reshaped pair back into separate wire fields -- so the replayed
+// call_id already reflects a hash of the *pair*, not of call_id alone.
+// Canonicalizing only the bare cached call_id (dropping id) hashes a
+// different input and never matches, permanently forcing history_changed.
+function canonicalizeCachedCallId(callId: unknown, itemId: unknown): unknown {
+  if (typeof callId !== "string") {
+    return callId;
+  }
+  const paired = typeof itemId === "string" && itemId ? `${callId}|${itemId}` : callId;
+  // Already-valid call_*/fc_* ids (the common case once a provider itself
+  // returns provider-shaped ids) never get reshaped by replay either --
+  // mirror that exact idempotent short-circuit, or a validly-shaped pair
+  // would be needlessly re-hashed here into a value replay never produces.
+  if (!shouldNormalizeOpenAIResponsesToolCallId(paired)) {
+    return callId;
+  }
+  return splitOpenAIFunctionCallPairing(normalizeOpenAIResponsesFunctionCallId(paired)).callId;
+}
+
+// fromResponse is true only for continuation.lastResponseItems (the cached
+// raw provider output), never for the replayed request's own input -- both
+// the call_id pairing above and the unsafe-integer handling below need to
+// know which side they're on, so this one flag drives both.
 function normalizeAssistantReplayInput(input: readonly unknown[], fromResponse = false): unknown[] {
   return input.map((item) => {
     if (!isRecord(item)) {
@@ -89,9 +121,11 @@ function normalizeAssistantReplayInput(input: readonly unknown[], fromResponse =
     ) {
       return item;
     }
-    const { id: _id, status: _status, ...stableItem } = item;
+    const { id: rawId, status: _status, ...stableItem } = item;
     if ("call_id" in stableItem) {
-      stableItem.call_id = canonicalizeReplayedCallId(stableItem.call_id);
+      stableItem.call_id = fromResponse
+        ? canonicalizeCachedCallId(stableItem.call_id, rawId)
+        : canonicalizeReplayedCallId(stableItem.call_id);
     }
     if (fromResponse && item.type === "function_call") {
       // Only provider output crosses terminal admission; sent arguments must retain real type edits.
@@ -150,8 +184,10 @@ function restoreRawCallIdsInDelta(
       continue;
     }
     const rawCallId = item.call_id;
-    const reshaped = normalizeOpenAIResponsesFunctionCallId(rawCallId);
-    if (reshaped !== rawCallId) {
+    // Mirror the eligibility comparison's pairing: the delta's call_id was
+    // reshaped from the paired call_id|id, not the bare call_id alone.
+    const reshaped = canonicalizeCachedCallId(rawCallId, item.id);
+    if (typeof reshaped === "string" && reshaped !== rawCallId) {
       rawCallIdByReshaped.set(reshaped, rawCallId);
     }
   }
