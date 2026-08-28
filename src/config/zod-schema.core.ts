@@ -250,8 +250,11 @@ const ModelCompatSchema = z
     supportsPromptCacheKey: z.boolean().optional(),
     /** Opts this model into stored HTTP continuation on a verified compatible endpoint. */
     supportsResponsesContinuation: z.boolean().optional(),
-    /** Minutes an HTTP continuation baseline stays cached before eviction. Default: 90. */
-    responsesContinuationIdleMinutes: z.number().positive().optional(),
+    // Converted to ms and passed straight to setTimeout, whose delay argument
+    // overflows above 2^31-1 ms (~35791.39 minutes) and fires almost
+    // immediately instead of after the configured wait -- reject values that
+    // would silently defeat the TTL they're supposed to set.
+    responsesContinuationIdleMinutes: z.number().positive().max(35_791).optional(),
     /** Whether the provider supports the `developer` role (vs `system`). Default: auto-detected from URL. */
     supportsDeveloperRole: z.boolean().optional(),
     /** Whether the provider supports `reasoning_effort`. Default: auto-detected from URL. */
