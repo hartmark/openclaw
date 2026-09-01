@@ -242,7 +242,7 @@ function readCompatPayloadBoolean(
  * minutes to hours apart, well past a short TTL, so this exists as a
  * per-model override rather than a fixed constant.
  */
-export const DEFAULT_HTTP_CONTINUATION_IDLE_MINUTES = 90;
+const DEFAULT_HTTP_CONTINUATION_IDLE_MINUTES = 90;
 
 // The resolved value is converted to ms and passed straight to setTimeout,
 // whose delay argument overflows above 2^31-1 ms and fires almost
@@ -256,6 +256,7 @@ function readCompatContinuationIdleMinutes(compat: unknown): number {
   if (!compat || typeof compat !== "object") {
     return DEFAULT_HTTP_CONTINUATION_IDLE_MINUTES;
   }
+  // SAFETY: same narrowing as readBooleanCompatField above; read defensively below.
   const value = (compat as Record<string, unknown>).responsesContinuationIdleMinutes;
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.min(value, MAX_HTTP_CONTINUATION_IDLE_MINUTES)

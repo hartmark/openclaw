@@ -9,9 +9,9 @@
  */
 import { sha256Hex } from "./transport-utils.js";
 
-export const OPENAI_RESPONSES_ID_MAX_LENGTH = 64;
-export const OPENAI_RESPONSES_CALL_ID_RE = /^call_[A-Za-z0-9_-]{1,59}$/;
-export const OPENAI_RESPONSES_FUNCTION_CALL_ITEM_ID_RE = /^fc_[A-Za-z0-9_-]{1,61}$/;
+const OPENAI_RESPONSES_ID_MAX_LENGTH = 64;
+const OPENAI_RESPONSES_CALL_ID_RE = /^call_[A-Za-z0-9_-]{1,59}$/;
+const OPENAI_RESPONSES_FUNCTION_CALL_ITEM_ID_RE = /^fc_[A-Za-z0-9_-]{1,61}$/;
 
 export function splitOpenAIFunctionCallPairing(id: string): {
   callId: string;

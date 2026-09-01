@@ -199,6 +199,7 @@ function restoreRawCallIdsInDelta(
     }
   }
   if (rawCallIdByReshaped.size === 0) {
+    // SAFETY: identity passthrough, never mutated -- only drops `readonly`.
     return delta as unknown[];
   }
   return delta.map((item) => {
@@ -250,6 +251,7 @@ export function resolveResponsesContinuationRequest(
       input: restoreRawCallIdsInDelta(
         currentInput.slice(baselineLength),
         continuation.lastResponseItems,
+        // SAFETY: restoreRawCallIdsInDelta only rewrites call_id, never restructures items.
       ) as ResponseInput,
     },
     continuationStatus: "continued",
