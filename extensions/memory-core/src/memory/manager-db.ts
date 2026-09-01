@@ -31,6 +31,11 @@ const MEMORY_REINDEX_ENTRY_SUFFIXES = ["-wal", "-shm", "-journal", ""] as const;
 const MEMORY_REINDEX_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MEMORY_REINDEX_ORPHAN_MIN_AGE_MS = 24 * 60 * 60_000;
+// `.memory-reindex-<uuid>` is the current shadow-db prefix (introduced in
+// 8b7269d1978). `.tmp-<uuid>` is the prior scheme it replaced; deployments
+// upgraded across that change can still carry orphaned shadow files under
+// the old name, which this cleanup must also recognize or they leak forever.
+const MEMORY_REINDEX_BASE_NAME_PREFIXES = ["memory-reindex-", "tmp-"] as const;
 
 function resolveMemoryReindexBaseName(
   databaseBaseName: string,
@@ -41,12 +46,14 @@ function resolveMemoryReindexBaseName(
       continue;
     }
     const baseName = entryName.slice(0, entryName.length - suffix.length);
-    const prefix = `${databaseBaseName}.memory-reindex-`;
-    if (
-      baseName.startsWith(prefix) &&
-      MEMORY_REINDEX_UUID_PATTERN.test(baseName.slice(prefix.length))
-    ) {
-      return baseName;
+    for (const reindexPrefix of MEMORY_REINDEX_BASE_NAME_PREFIXES) {
+      const prefix = `${databaseBaseName}.${reindexPrefix}`;
+      if (
+        baseName.startsWith(prefix) &&
+        MEMORY_REINDEX_UUID_PATTERN.test(baseName.slice(prefix.length))
+      ) {
+        return baseName;
+      }
     }
   }
   return undefined;
@@ -262,20 +269,24 @@ export function removeMemoryDatabaseFiles(dbPath: string): void {
   }
 }
 
-/** Remove crash-left shadow databases only when no full reindex is active. */
-export function cleanupAgedMemoryReindexTempFiles(dbPath: string, nowMs = Date.now()): void {
+/** Remove crash-left shadow databases only when no full reindex is active.
+ * Returns the shadow base names actually removed, so callers that report
+ * changes (doctor migrations) can say what happened instead of just that
+ * the sweep ran. */
+export function cleanupAgedMemoryReindexTempFiles(dbPath: string, nowMs = Date.now()): string[] {
+  const removedShadowBaseNames: string[] = [];
   if (!isRegularFile(dbPath)) {
-    return;
+    return removedShadowBaseNames;
   }
 
   let reindexLock: MemoryReindexLockHandle | undefined;
   try {
     reindexLock = tryAcquireMemoryReindexLock(dbPath);
   } catch {
-    return;
+    return removedShadowBaseNames;
   }
   if (!reindexLock) {
-    return;
+    return removedShadowBaseNames;
   }
 
   try {
@@ -286,7 +297,7 @@ export function cleanupAgedMemoryReindexTempFiles(dbPath: string, nowMs = Date.n
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
-      return;
+      return removedShadowBaseNames;
     }
 
     for (const entry of entries) {
@@ -329,12 +340,14 @@ export function cleanupAgedMemoryReindexTempFiles(dbPath: string, nowMs = Date.n
           fs.rmSync(filePath, { force: true });
         } catch {}
       }
+      removedShadowBaseNames.push(shadowBaseName);
     }
   } finally {
     try {
       reindexLock.release();
     } catch {}
   }
+  return removedShadowBaseNames;
 }
 
 export function openMemoryDatabaseAtPath(
