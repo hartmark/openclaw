@@ -26,6 +26,20 @@ const HTTP_CONTINUATION_IDLE_TTL_MS = 90 * 60 * 1000;
 // entries (in-flight, no retained baseline) don't count against the cap --
 // they're already bounded by the request they represent.
 const MAX_HTTP_CONTINUATION_READY_ENTRIES = 1000;
+// A count cap alone bounds cardinality, not memory: a full-context turn near
+// a large model's context window can retain a multi-megabyte baseline on its
+// own, so 1000 oversized entries could still exhaust process memory well
+// before the count cap engages. This aggregate budget is enforced alongside
+// the count cap (whichever evicts first), and also bypasses caching a single
+// candidate entry that exceeds the whole budget by itself -- evicting every
+// other entry still wouldn't make room for it, and the request itself
+// already succeeded, so skipping continuation for that one oversized turn
+// (falling back to a full-history resend next round) is strictly better than
+// either rejecting the response or growing past the budget. 64MB matches the
+// existing ANTHROPIC_INLINE_IMAGES_DECODE_SAFETY_BYTES precedent for a
+// single-request memory ceiling in this package -- comfortably above even a
+// 200K-token context's realistic JSON footprint (well under 4MB).
+const MAX_HTTP_CONTINUATION_RETAINED_BYTES = 64 * 1024 * 1024;
 const TURN_HEADERS = new Set(["traceparent", "x-openclaw-turn-id", "x-openclaw-turn-attempt"]);
 
 export type ResponsesContinuationRequest = Record<string, unknown> & {
@@ -192,6 +206,7 @@ type HttpContinuationEntry =
       state: ResponsesContinuationState;
       idleTimer: ReturnType<typeof setTimeout>;
       readySequence: number;
+      retainedBytes: number;
     }
   | { kind: "claimed"; sessionId: string };
 
@@ -203,40 +218,81 @@ const httpContinuationEntries = new Map<string, HttpContinuationEntry>();
 // one that happens to share a timestamp. A strictly incrementing sequence
 // makes "oldest" unambiguous regardless of timing.
 let nextHttpContinuationReadySequence = 1;
+// Running total of every ready entry's retainedBytes, kept in lockstep with
+// httpContinuationEntries by removeReadyEntry -- the only path that deletes a
+// ready entry -- so MAX_HTTP_CONTINUATION_RETAINED_BYTES can be enforced
+// without re-summing the map on every commit.
+let httpContinuationRetainedBytes = 0;
 
+// Reference-checked removal for a context that only *might* still own this
+// entry (a timer firing later, or `release()`): a foreign caller passes the
+// exact entry it was handed, and this is a no-op if that entry has since
+// been replaced or evicted. removeReadyEntry below is for a caller that
+// already knows -- from a synchronous map read of its own -- that the entry
+// it holds is still current.
 function deleteHttpContinuationIfOwned(key: string, entry: HttpContinuationEntry): void {
-  if (httpContinuationEntries.get(key) === entry) {
-    httpContinuationEntries.delete(key);
-  }
-}
-
-// Deterministic capacity policy for MAX_HTTP_CONTINUATION_READY_ENTRIES:
-// evict the least-recently-committed ready entry, since that's the one
-// least likely to be reused before its own idle TTL would have expired it
-// anyway. Scans only ready entries (bounded by the cap itself), not the
-// full map, so cost stays proportional to the configured limit.
-function evictOldestReadyEntryAtCapacity(): void {
-  let readyCount = 0;
-  let oldestKey: string | undefined;
-  let oldestReadySequence = Infinity;
-  for (const [key, entry] of httpContinuationEntries) {
-    if (entry.kind !== "ready") {
-      continue;
-    }
-    readyCount += 1;
-    if (entry.readySequence < oldestReadySequence) {
-      oldestReadySequence = entry.readySequence;
-      oldestKey = key;
-    }
-  }
-  if (readyCount < MAX_HTTP_CONTINUATION_READY_ENTRIES || !oldestKey) {
+  if (httpContinuationEntries.get(key) !== entry) {
     return;
   }
-  const evicted = httpContinuationEntries.get(oldestKey);
-  if (evicted?.kind === "ready") {
-    clearTimeout(evicted.idleTimer);
+  if (entry.kind === "ready") {
+    httpContinuationRetainedBytes -= entry.retainedBytes;
   }
-  httpContinuationEntries.delete(oldestKey);
+  httpContinuationEntries.delete(key);
+}
+
+/** Estimates a ready entry's retained memory: the same JSON that gets
+ * stringified for the eviction budget it counts against, no separate copy
+ * kept around just to size it. */
+function estimateRetainedBytes(state: ResponsesContinuationState): number {
+  return Buffer.byteLength(JSON.stringify(state), "utf8");
+}
+
+// Single removal path for a ready entry the caller already knows is still
+// current (reclaim-before-overwrite, capacity/budget eviction, session
+// cleanup) -- keeps idleTimer cleanup and the retainedBytes running total
+// symmetric with httpContinuationEntries without duplicating either at each
+// call site.
+function removeReadyEntry(
+  key: string,
+  entry: Extract<HttpContinuationEntry, { kind: "ready" }>,
+): void {
+  clearTimeout(entry.idleTimer);
+  httpContinuationRetainedBytes -= entry.retainedBytes;
+  httpContinuationEntries.delete(key);
+}
+
+// Deterministic capacity/budget policy: evict the least-recently-committed
+// ready entry first (the one least likely to be reused before its own idle
+// TTL would have expired it anyway) until both MAX_HTTP_CONTINUATION_READY_ENTRIES
+// and MAX_HTTP_CONTINUATION_RETAINED_BYTES (including the incoming
+// `pendingBytes` about to be inserted) are satisfied. Scans only ready
+// entries, bounded by the count cap itself, so cost stays proportional to
+// the configured limit rather than the full map.
+function evictReadyEntriesForCapacity(pendingBytes: number): void {
+  for (;;) {
+    let readyCount = 0;
+    let oldestKey: string | undefined;
+    let oldestEntry: Extract<HttpContinuationEntry, { kind: "ready" }> | undefined;
+    let oldestReadySequence = Infinity;
+    for (const [key, entry] of httpContinuationEntries) {
+      if (entry.kind !== "ready") {
+        continue;
+      }
+      readyCount += 1;
+      if (entry.readySequence < oldestReadySequence) {
+        oldestReadySequence = entry.readySequence;
+        oldestKey = key;
+        oldestEntry = entry;
+      }
+    }
+    const overCapacity = readyCount >= MAX_HTTP_CONTINUATION_READY_ENTRIES;
+    const overBudget =
+      httpContinuationRetainedBytes + pendingBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES;
+    if ((!overCapacity && !overBudget) || !oldestKey || !oldestEntry) {
+      return;
+    }
+    removeReadyEntry(oldestKey, oldestEntry);
+  }
 }
 
 type HttpContinuationIdentity = {
@@ -273,7 +329,7 @@ export function claimOpenAIResponsesHttpContinuation(
     return undefined;
   }
   if (previous?.kind === "ready") {
-    clearTimeout(previous.idleTimer);
+    removeReadyEntry(key, previous);
   }
   const claimed = { kind: "claimed", sessionId: params.sessionId } as const;
   httpContinuationEntries.set(key, claimed);
@@ -293,22 +349,34 @@ export function claimOpenAIResponsesHttpContinuation(
         if (httpContinuationEntries.get(key) !== claimed) {
           return;
         }
+        const state: ResponsesContinuationState = {
+          lastRequest: effectiveRequest,
+          lastResponseId: response.id,
+          lastResponseItems: response.output,
+        };
+        const retainedBytes = estimateRetainedBytes(state);
+        if (retainedBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES) {
+          // Evicting every other entry still wouldn't make this one fit --
+          // skip caching it. The turn's actual response already completed
+          // successfully; only the *next* turn loses continuation and falls
+          // back to a full-history resend, same as before this cache existed.
+          deleteHttpContinuationIfOwned(key, claimed);
+          return;
+        }
+        evictReadyEntriesForCapacity(retainedBytes);
         const ready = {
           ...claimed,
           kind: "ready",
-          state: {
-            lastRequest: effectiveRequest,
-            lastResponseId: response.id,
-            lastResponseItems: response.output,
-          },
+          state,
           idleTimer: setTimeout(
             () => deleteHttpContinuationIfOwned(key, ready),
             HTTP_CONTINUATION_IDLE_TTL_MS,
           ),
           readySequence: nextHttpContinuationReadySequence++,
+          retainedBytes,
         } satisfies Extract<HttpContinuationEntry, { kind: "ready" }>;
         ready.idleTimer.unref?.();
-        evictOldestReadyEntryAtCapacity();
+        httpContinuationRetainedBytes += retainedBytes;
         httpContinuationEntries.set(key, ready);
       },
       release: () => deleteHttpContinuationIfOwned(key, claimed),
@@ -324,9 +392,10 @@ registerSessionResourceCleanup((sessionId) => {
   for (const [key, entry] of httpContinuationEntries) {
     if (!sessionId || entry.sessionId === sessionId) {
       if (entry.kind === "ready") {
-        clearTimeout(entry.idleTimer);
+        removeReadyEntry(key, entry);
+      } else {
+        httpContinuationEntries.delete(key);
       }
-      httpContinuationEntries.delete(key);
     }
   }
 });
