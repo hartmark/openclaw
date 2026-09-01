@@ -26,6 +26,10 @@ import {
   type OpenAIResponsesReplayMode,
 } from "./openai-responses-compaction-replay.js";
 import {
+  createBoundedOpenAIResponsesCompactionFetch,
+  isOpenAIResponsesCompactionOutput,
+} from "./openai-responses-compaction-window.js";
+import {
   claimOpenAIResponsesHttpContinuation,
   type ResponsesContinuationRequest,
 } from "./openai-responses-continuation.js";
@@ -160,13 +164,14 @@ export function createOpenAIResponsesClient(
   optionHeaders?: Record<string, string>,
   turnHeaders?: Record<string, string>,
   sessionId?: string,
+  fetchOverride?: typeof globalThis.fetch,
 ) {
   return new OpenAI({
     apiKey,
     baseURL: resolveOpenAIClientBaseUrl(model),
     dangerouslyAllowBrowser: true,
     defaultHeaders: buildOpenAIClientHeaders(model, context, optionHeaders, turnHeaders, sessionId),
-    fetch: buildGuardedModelFetch(model),
+    fetch: fetchOverride ?? buildGuardedModelFetch(model),
     ...buildOpenAISdkClientOptions(model),
   });
 }
@@ -187,22 +192,12 @@ async function postOpenAIResponsesCompaction(params: {
   const response = await params.client.post<unknown>("/responses/compact", {
     ...buildOpenAISdkRequestOptions(params.model, params.options?.signal, {
       timeoutMs: params.options?.timeoutMs,
-      maxRetries: params.options?.maxRetries,
     }),
     body: { model: params.request.model, input: compactInput },
   });
   const output = isRecord(response) && Array.isArray(response.output) ? response.output : [];
   const item = output.at(-1);
   const retainedItems = output.slice(0, -1);
-  const retainedMessagesAreValid = retainedItems.every(
-    (candidate) =>
-      isRecord(candidate) &&
-      candidate.type === "message" &&
-      (candidate.role === "user" ||
-        candidate.role === "developer" ||
-        candidate.role === "system") &&
-      Array.isArray(candidate.content),
-  );
   const retainedUserMessageCount = retainedItems.filter(
     (candidate) =>
       isRecord(candidate) &&
@@ -221,7 +216,7 @@ async function postOpenAIResponsesCompaction(params: {
   if (
     !isRecord(response) ||
     response.object !== "response.compaction" ||
-    !retainedMessagesAreValid ||
+    !isOpenAIResponsesCompactionOutput(output, params.model) ||
     (retainedItems.length > 0 &&
       (!retainedMessagePrefixSupported || retainedUserMessageCount !== inputUserMessageCount)) ||
     !isRecord(item) ||
@@ -235,6 +230,7 @@ async function postOpenAIResponsesCompaction(params: {
     throw new Error("Responses compact endpoint did not return one trailing compaction item");
   }
   return {
+    output,
     item,
     historyMode: retainedUserMessageCount > 0 ? "retained-users" : "compacted-prefix",
     usage,
@@ -316,6 +312,9 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
           options?.headers,
           turnState?.headers,
           options?.sessionId,
+          compactRequest
+            ? createBoundedOpenAIResponsesCompactionFetch(buildGuardedModelFetch(model))
+            : undefined,
         );
         const buildRequest = async (replayMode: OpenAIResponsesReplayMode) => {
           let params = config.buildRequest(
@@ -423,7 +422,6 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
         const requestOptions = buildOpenAISdkRequestOptions(model, firstEvent.signal, {
           stream: config.streamRequest,
           timeoutMs: options?.timeoutMs,
-          maxRetries: options?.maxRetries,
         });
         const websocketSignal = combineWebSocketTimeoutSignal(
           firstEvent.signal,
@@ -676,10 +674,6 @@ export function createAzureOpenAIResponsesTransportStreamFn(): StreamFn {
   });
 }
 
-function normalizeAzureBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/+$/, "");
-}
-
 function resolveAzureDeploymentName(model: Model): string {
   return resolveAzureDeploymentNameFromMap({
     modelId: model.id,
@@ -693,14 +687,16 @@ export function createAzureOpenAIClient(
   apiKey: string,
   optionHeaders?: Record<string, string>,
   turnHeaders?: Record<string, string>,
+  _sessionId?: string,
+  fetchOverride?: typeof globalThis.fetch,
 ) {
-  const baseURL = normalizeAzureBaseUrl(model.baseUrl);
+  const baseURL = model.baseUrl.replace(/\/+$/, "");
   const clientOptions = {
     apiKey,
     dangerouslyAllowBrowser: true,
     defaultHeaders: buildOpenAIClientHeaders(model, context, optionHeaders, turnHeaders),
     baseURL,
-    fetch: buildGuardedModelFetch(model),
+    fetch: fetchOverride ?? buildGuardedModelFetch(model),
     ...buildOpenAISdkClientOptions(model),
   };
 

@@ -20,7 +20,10 @@ export {
   resolveChannelMessageIngress,
   resolveStableChannelMessageIngress,
 } from "../channels/message-access/runtime.js";
-export type { IdentifierAuthentication } from "../channels/message-access/identifier-authentication.js";
+export {
+  meetsIdentifierAuthentication,
+  type IdentifierAuthentication,
+} from "../channels/message-access/identifier-authentication.js";
 export {
   defineStableChannelIngressIdentity,
   identityEntryAuthenticationClassifier,
@@ -182,6 +185,11 @@ export function fanInChannelIngressLifecycles(
         handedOff = true;
         for (const lifecycle of lifecycles) {
           lifecycle.onDeferred();
+        }
+      },
+      onDeferredHeartbeat: () => {
+        for (const lifecycle of lifecycles) {
+          lifecycle.onDeferredHeartbeat?.();
         }
       },
       onAdoptionFinalizing: () => {

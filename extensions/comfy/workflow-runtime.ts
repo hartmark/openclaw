@@ -1,6 +1,7 @@
 // Comfy plugin module implements workflow runtime behavior.
 import { randomInt } from "node:crypto";
 import fs from "node:fs/promises";
+import { bufferToBlobPart } from "openclaw/plugin-sdk/blob-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveGeneratedMediaMaxBytes } from "openclaw/plugin-sdk/media-generation-runtime";
 import { extensionForMime } from "openclaw/plugin-sdk/media-mime";
@@ -14,6 +15,7 @@ import {
   assertOkOrThrowHttpError,
   normalizeBaseUrl,
   readProviderJsonResponse,
+  redactProviderResponseErrorText,
   resolveProviderHttpRequestConfig,
 } from "openclaw/plugin-sdk/provider-http";
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
@@ -46,9 +48,7 @@ const DEFAULT_INPUT_IMAGE_INPUT_NAME = "image";
 const DEFAULT_SEED_INPUT_NAME = "seed";
 const DEFAULT_POLL_INTERVAL_MS = 1_500;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
-// crypto.randomInt requires max < 2**48; that's still 15 digits of entropy
-// per submission, comfortably below Number.MAX_SAFE_INTEGER so the value
-// survives JSON round-tripping without float precision loss.
+// randomInt requires a range below 2**48; these seeds also round-trip through JSON exactly.
 const RANDOM_SEED_EXCLUSIVE_MAX = 2 ** 48 - 1;
 
 export const DEFAULT_COMFY_MODEL = "workflow";
@@ -259,34 +259,11 @@ function setWorkflowInput(params: {
   inputs[params.inputName] = params.value;
 }
 
-// Generates a fresh per-submission sampler seed. Static workflow JSON/paths
-// otherwise reuse whatever seed value is baked into the file on every run,
-// so a workflow whose sampler seed is meant to vary per generation (the
-// common case) would silently return the same image every time.
-function generateComfySeed(): number {
-  return randomInt(RANDOM_SEED_EXCLUSIVE_MAX);
-}
-
-// Local ComfyUI instances reachable over a network (not bare loopback) may
-// sit behind HTTP auth (Basic auth, a bearer token, etc.) that the plugin has
-// no built-in scheme for. A generic header passthrough -- same shape as the
-// established `remote.headers` config pattern (see the ollama plugin) --
-// covers that without inventing a Comfy-specific auth scheme. A literal
-// string resolves synchronously via the cheap inspect path; a SecretRef of
-// any provider (env, file, keychain, plugin-backed) resolves through the
-// same full async resolver the ollama plugin uses for its own headers --
-// unlike `resolveComfyApiKey`'s sync-only env fallback (constrained by its
-// additional use in the sync `isComfyCapabilityConfigured` veto), this
-// function is only ever called from the already-async request path, so it
-// can resolve any configured provider rather than just env.
-async function resolveComfyHeadersConfig(
-  value: unknown,
-  cfg: OpenClawConfig,
-): Promise<Record<string, string> | undefined> {
+async function resolveComfyHeadersConfig(value: unknown, cfg: OpenClawConfig): Promise<Headers> {
+  const headers = new Headers();
   if (!isRecord(value)) {
-    return undefined;
+    return headers;
   }
-  const headers: Record<string, string> = {};
   for (const [name, headerValue] of Object.entries(value)) {
     const path = `plugins.entries.comfy.config.headers.${name}`;
     const inspected = resolveSecretInputString({
@@ -296,10 +273,7 @@ async function resolveComfyHeadersConfig(
       mode: "inspect",
     });
     if (inspected.status === "available") {
-      const normalized = normalizeSecretInputString(inspected.value);
-      if (normalized) {
-        headers[name] = normalized;
-      }
+      headers.set(name, inspected.value);
       continue;
     }
     if (inspected.status === "missing") {
@@ -315,12 +289,11 @@ async function resolveComfyHeadersConfig(
     if (resolved.unresolvedRefReason) {
       throw new Error(`${path} references an unavailable secret: ${resolved.unresolvedRefReason}`);
     }
-    const normalized = normalizeSecretInputString(resolved.value);
-    if (normalized) {
-      headers[name] = normalized;
+    if (resolved.value) {
+      headers.set(name, resolved.value);
     }
   }
-  return Object.keys(headers).length > 0 ? headers : undefined;
+  return headers;
 }
 
 function resolveComfyNetworkPolicy(params: {
@@ -394,8 +367,9 @@ async function readJsonResponse<T>(params: {
     auditContext: params.auditContext,
   });
   try {
-    await assertOkOrThrowHttpError(response, params.errorPrefix);
-    return (await readProviderJsonResponse(response, params.errorPrefix)) as T;
+    const requestHeaders = params.init?.headers;
+    await assertOkOrThrowHttpError(response, params.errorPrefix, { requestHeaders });
+    return await readProviderJsonResponse<T>(response, params.errorPrefix, { requestHeaders });
   } finally {
     await release();
   }
@@ -417,12 +391,6 @@ function resolveFileExtension(params: { fileName?: string; mimeType?: string }):
   return fileName.slice(dotIndex + 1);
 }
 
-function toBlobBytes(buffer: Buffer): ArrayBuffer {
-  const arrayBuffer = new ArrayBuffer(buffer.byteLength);
-  new Uint8Array(arrayBuffer).set(buffer);
-  return arrayBuffer;
-}
-
 async function uploadInputImage(params: {
   baseUrl: string;
   headers: Headers;
@@ -436,7 +404,7 @@ async function uploadInputImage(params: {
   const form = new FormData();
   form.set(
     "image",
-    new Blob([toBlobBytes(params.image.buffer)], { type: params.image.mimeType }),
+    new Blob([bufferToBlobPart(params.image.buffer)], { type: params.image.mimeType }),
     normalizeOptionalString(params.image.fileName) ||
       `input.${resolveFileExtension({ mimeType: params.image.mimeType })}`,
   );
@@ -549,9 +517,11 @@ async function waitForCloudCompletion(params: {
       return;
     }
     if (status.status === "failed" || status.status === "cancelled") {
-      throw new Error(
-        `Comfy workflow ${status.status}: ${status.error ?? status.message ?? params.promptId}`,
+      const detail = redactProviderResponseErrorText(
+        status.error ?? status.message ?? params.promptId,
+        params.headers,
       );
+      throw new Error(`Comfy workflow ${status.status}: ${detail}`);
     }
 
     const pollDelayMs = resolveComfyRemainingMs(deadline, params.timeoutMs, params.pollIntervalMs);
@@ -652,7 +622,9 @@ async function downloadOutputFile(params: {
   });
 
   try {
-    await assertOkOrThrowHttpError(firstResponse.response, "Comfy output download failed");
+    await assertOkOrThrowHttpError(firstResponse.response, "Comfy output download failed", {
+      requestHeaders: params.headers,
+    });
     const mimeType =
       normalizeOptionalString(firstResponse.response.headers.get("content-type")) ||
       "application/octet-stream";
@@ -671,17 +643,8 @@ async function downloadOutputFile(params: {
   }
 }
 
-// Only vetoes on a *definite* negative: a configured env ref whose env var
-// is confirmed empty/unset (env access needs no I/O, so this is decidable
-// synchronously, same check resolveComfyApiKey already does for apiKey). A
-// file/keychain/exec ref is NOT vetoed here even though inspect mode can't
-// confirm it either way -- unlike apiKey's cloud-only gate, this function
-// guards every local-mode image/video/music tool, so treating "can't
-// confirm yet" as "unavailable" would permanently hide the tool for any
-// operator using a legitimately-configured non-env credential provider (a
-// real regression, not a safety margin: silently vanishing a working
-// capability is worse than letting a genuinely broken one surface its
-// error at actual invocation, in runComfyWorkflow's async resolution).
+// Only env refs can be checked without I/O. Keep other refs selectable until
+// the async request resolver can establish their availability.
 function hasUnavailableComfyHeaderSecret(value: unknown, cfg?: OpenClawConfig): boolean {
   if (!isRecord(value)) {
     return false;
@@ -789,7 +752,7 @@ export async function runComfyWorkflow(params: {
       workflow,
       nodeId: seedNodeId,
       inputName: seedInputName,
-      value: generateComfySeed(),
+      value: randomInt(RANDOM_SEED_EXCLUSIVE_MAX),
     });
   }
 

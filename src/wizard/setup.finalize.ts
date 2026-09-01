@@ -295,7 +295,8 @@ export async function ensureGatewayServiceForOnboarding(params: {
     );
   }
 
-  if (process.platform === "linux" && systemdAvailable) {
+  // Foreground setup must not enable lingering as a side effect of skipping the service.
+  if (process.platform === "linux" && systemdAvailable && opts.installDaemon !== false) {
     const { ensureSystemdUserLingerInteractive } = await import("../commands/systemd-linger.js");
     await ensureSystemdUserLingerInteractive({
       runtime,
@@ -459,11 +460,13 @@ export async function ensureGatewayServiceForOnboarding(params: {
             t("wizard.finalize.gatewayInstallFixAuth"),
           ].join(" ");
         } else {
+          const existingCommand = await service.readCommand(process.env).catch(() => null);
           const { programArguments, workingDirectory, environment, environmentValueSources } =
             await buildGatewayInstallPlan({
               env: process.env,
               port: settings.port,
               runtime: daemonRuntime,
+              existingCommand,
               warn: (message, title) => {
                 installWarnings.push({ message, title });
               },

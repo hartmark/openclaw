@@ -134,6 +134,36 @@ function readMemorySearchFtsTokenizer(
   return raw === "unicode61" || raw === "trigram" ? raw : undefined;
 }
 
+async function isCanonicalAgentDatabaseSymlink(params: {
+  legacyPath: string;
+  agentDatabasePath: string;
+}): Promise<boolean> {
+  try {
+    if (!(await fs.lstat(params.legacyPath)).isSymbolicLink()) {
+      return false;
+    }
+    for (const suffix of LEGACY_MEMORY_SIDECAR_SUFFIXES.slice(1)) {
+      try {
+        await fs.lstat(`${params.legacyPath}${suffix}`);
+        return false;
+      } catch (err: unknown) {
+        if (!err || typeof err !== "object" || !("code" in err) || err.code !== "ENOENT") {
+          return false;
+        }
+      }
+    }
+    const [legacyTarget, canonicalTarget] = await Promise.all([
+      fs.realpath(params.legacyPath),
+      fs.realpath(params.agentDatabasePath),
+    ]);
+    return legacyTarget === canonicalTarget;
+  } catch {
+    // Only the exact compatibility alias is known non-legacy state. Any unresolved
+    // target remains visible so Doctor cannot hide data it failed to classify.
+    return false;
+  }
+}
+
 async function collectLegacyMemorySidecarSources(params: {
   config: unknown;
   env: NodeJS.ProcessEnv;
@@ -169,11 +199,23 @@ async function collectLegacyMemorySidecarSources(params: {
       return;
     }
     seen.add(key);
+    const agentDatabasePath = resolveOpenClawAgentSqlitePath({
+      agentId,
+      env: migrationEnv,
+    });
+    if (
+      await isCanonicalAgentDatabaseSymlink({
+        legacyPath: normalizedPath,
+        agentDatabasePath,
+      })
+    ) {
+      return;
+    }
     sources.push({
       agentId,
       legacyPath: normalizedPath,
       stateDir: params.stateDir,
-      agentDatabasePath: resolveOpenClawAgentSqlitePath({ agentId, env: migrationEnv }),
+      agentDatabasePath,
     });
   }
   for (const agentId of agentIds) {
@@ -477,6 +519,30 @@ async function migrateLegacyMemorySidecarSource(params: {
   }
 }
 
+// The reindex producer (runInPlaceReindex in manager-db.ts) only ever sweeps
+// aged orphan shadow files beside the *current* per-agent SQLite path -- a
+// deployment that upgraded across the legacy-sidecar-to-per-agent-database
+// change can carry a `.tmp-<uuid>` or `.memory-reindex-<uuid>` orphan beside
+// the *legacy* sidecar path that nothing in the current runtime call chain
+// ever revisits, since `resolveOpenClawAgentSqlitePath` never resolves back
+// to it. This migration is the one place that still knows the legacy path,
+// so it is the only reachable owner for cleaning those orphans up. Must run
+// before archiveLegacyMemorySidecar renames the legacy `.sqlite` file away --
+// cleanupAgedMemoryReindexTempFiles requires the exact dbPath it's given to
+// still be a regular file, and needs it to derive the shadow-file basename.
+async function sweepLegacyMemorySidecarReindexOrphans(
+  legacyPath: string,
+  changes: string[],
+): Promise<void> {
+  const { cleanupAgedMemoryReindexTempFiles } = await import("../memory/manager-db.js");
+  const removed = cleanupAgedMemoryReindexTempFiles(legacyPath);
+  if (removed.length > 0) {
+    changes.push(
+      `Removed ${removed.length} aged Memory Core reindex orphan shadow database(s) beside legacy memory index sidecar ${legacyPath}`,
+    );
+  }
+}
+
 function groupLegacyMemorySidecarSourcesByPath(
   sources: LegacyMemorySidecarSource[],
 ): LegacyMemorySidecarSource[][] {
@@ -519,6 +585,9 @@ export const memorySidecarStateMigration: PluginDoctorStateMigration = {
       }),
     );
     for (const sources of groups) {
+      if (sources[0]) {
+        await sweepLegacyMemorySidecarReindexOrphans(sources[0].legacyPath, changes);
+      }
       let archiveReady = true;
       for (const source of sources) {
         try {

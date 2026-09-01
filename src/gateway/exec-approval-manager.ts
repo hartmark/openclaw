@@ -110,6 +110,9 @@ export type ExecApprovalRecord<TPayload = ExecApprovalRequestPayload> = {
   executionIdentityToken?: ExecutionIdentityAdmissionToken;
   /** Exact source authority retained only for use-time liveness validation. */
   agentRuntimeDelegatedAuthority?: AgentRuntimeDelegatedAuthority;
+  /** Closure-bound authority for approvals created by in-process delegated tools. */
+  approvalAuthority?: () => boolean | void;
+  approvalSignals?: readonly AbortSignal[];
 };
 
 type OperatorApprovalPersistenceRuntime = {
@@ -137,6 +140,9 @@ type ExecApprovalManagerOptions<TPayload> = {
    * durable resolution transaction. Returning null keeps the decision
    * grant-free (non-cron requests, aborted runs, missing bindings). */
   resolveStandingGrantMint?: (request: TPayload) => CronStandingGrantMintSpec | null;
+  /** Default grant terms frozen at resolve time: config-driven expiry stamp,
+   * or null for until-revoked. A per-resolve override wins over this default. */
+  resolveStandingGrantExpiresAtMs?: (nowMs: number) => number | null;
   /** Durable timeout expiry can be first observed by a timer, lookup, or replay.
    * Publish from the local settlement owner so every ordering reaches reviewers. */
   onExpired?: (record: OperatorApprovalRecord, liveRecord: ExecApprovalRecord<TPayload>) => void;
@@ -296,6 +302,9 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
     ) {
       throw new Error("agent runtime approval authority is no longer active");
     }
+    if (record.approvalAuthority && record.approvalAuthority() === false) {
+      throw new Error("approval authority is no longer active");
+    }
     const persistence = this.options.persistence;
     const allowedDecisions = persistence
       ? normalizeAllowedDecisions(this.options.resolveAllowedDecisions?.(record.request))
@@ -382,6 +391,22 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       admissionContinuation: captureGatewayRootWorkAdmissionContinuationScope(),
     };
     this.pending.set(record.id, entry);
+    for (const signal of record.approvalSignals ?? []) {
+      if (signal.aborted) {
+        this.forceDenyIfDelegatedAuthorityClosed(record.id);
+        continue;
+      }
+      signal.addEventListener(
+        "abort",
+        () => {
+          const closed = this.forceDenyIfDelegatedAuthorityClosed(record.id);
+          if (closed?.outcome === "denied" && closed.liveRecord) {
+            this.options.onExpired?.(closed.record, closed.liveRecord);
+          }
+        },
+        { once: true },
+      );
+    }
     this.scheduleExpiryTimer(entry);
     if (insertedRecord) {
       this.emitLifecycle({ phase: "pending", record: insertedRecord });
@@ -451,6 +476,10 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
     resolver: OperatorApprovalResolver,
     localResolvedBy: string | null = null,
     localResolutionSource: ExecApprovalResolutionSource = "operator",
+    options: {
+      /** Explicit grant expiry override; undefined defers to the configured default. */
+      grantExpiresAtMs?: number | null;
+    } = {},
   ): ExecApprovalResolveResult<TPayload> {
     if (decision !== "deny") {
       const closed = this.forceDenyIfDelegatedAuthorityClosed(recordId);
@@ -524,10 +553,19 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       return { outcome: "not-found" };
     }
 
-    const standingGrant =
+    const standingGrantSpec =
       decision === "allow-always" && localEntry
         ? (this.options.resolveStandingGrantMint?.(localEntry.record.request) ?? undefined)
         : undefined;
+    const standingGrant = standingGrantSpec
+      ? {
+          ...standingGrantSpec,
+          expiresAtMs:
+            options.grantExpiresAtMs !== undefined
+              ? options.grantExpiresAtMs
+              : (this.options.resolveStandingGrantExpiresAtMs?.(Date.now()) ?? null),
+        }
+      : undefined;
     let result: ResolveOperatorApprovalResult;
     try {
       result = resolveOperatorApproval({
@@ -977,8 +1015,16 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
     });
   }
 
-  resolve(recordId: string, decision: ExecApprovalDecision, resolvedBy?: string | null): boolean {
+  resolve(
+    recordId: string,
+    decision: ExecApprovalDecision,
+    resolvedBy?: string | null,
+    options: { grantExpiresAtMs?: number | null } = {},
+  ): boolean {
     if (!this.options.persistence) {
+      if (decision !== "deny" && this.forceDenyIfDelegatedAuthorityClosed(recordId)) {
+        return false;
+      }
       return this.resolveLocal(recordId, decision, resolvedBy ?? null);
     }
     return (
@@ -990,6 +1036,8 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
           id: resolvedBy ?? null,
         },
         resolvedBy ?? null,
+        "operator",
+        options,
       ).outcome === "resolved"
     );
   }
@@ -1020,9 +1068,9 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
   /**
    * One-shot ask-fallback re-admission for a timed-out approval. This is
    * pre-gate policy on the process-local record only: the durable row stays
-   * `expired` and no execution authority is minted here. The strict exec
-   * timeout cutover is deferred (docs/refactor/operator-approvals.md); until
-   * then system.run replay uses this flag to keep re-admission single-use.
+   * `expired` and no execution authority is minted here. The shipped askFallback
+   * policy (docs/tools/exec-approvals.md) still applies; system.run replay
+   * uses this flag to keep re-admission single-use.
    */
   consumeAskFallback(recordId: string): boolean {
     const entry = this.pending.get(recordId);
@@ -1215,8 +1263,15 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
   forceDenyIfDelegatedAuthorityClosed(
     recordId: string,
   ): ExecApprovalForceDenyResult<TPayload> | null {
-    const authority = this.pending.get(recordId)?.record.agentRuntimeDelegatedAuthority;
-    if (!authority || this.options.validateAgentRuntimeDelegatedAuthority?.(authority) === true) {
+    const record = this.pending.get(recordId)?.record;
+    const authority = record?.agentRuntimeDelegatedAuthority;
+    const delegatedAuthorityClosed =
+      authority !== undefined &&
+      this.options.validateAgentRuntimeDelegatedAuthority?.(authority) !== true;
+    const approvalAuthorityClosed =
+      record?.approvalAuthority !== undefined && record.approvalAuthority() === false;
+    const approvalSignalClosed = record?.approvalSignals?.some((signal) => signal.aborted) === true;
+    if (!delegatedAuthorityClosed && !approvalAuthorityClosed && !approvalSignalClosed) {
       return null;
     }
     return this.forceDenyDetailed(
