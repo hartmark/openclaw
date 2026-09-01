@@ -402,6 +402,7 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
               sessionId,
             ),
             request: params as ResponsesContinuationRequest,
+            idleTtlMs: resolveOpenAIResponsesPayloadPolicy(model).httpContinuationIdleTtlMs,
           });
         }
         const observePrompt = createResponsesPromptEgressObserver(
