@@ -1,10 +1,12 @@
+// LLM Core module implements validation behavior.
 import { Compile } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
-import { Value } from "typebox/value";
 import type { Tool, ToolCall } from "./types.js";
 
 const validatorCache = new WeakMap<object, ReturnType<typeof Compile>>();
-const TYPEBOX_KIND = Symbol.for("TypeBox.Kind");
+
+/** Maximum string length accepted for schema-gated JSON coercion. */
+const MAX_JSON_COERCE_LENGTH = 64 * 1024;
 
 interface JsonSchemaObject {
   type?: string | string[];
@@ -16,16 +18,12 @@ interface JsonSchemaObject {
   oneOf?: JsonSchemaObject[];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+function isObjectBackedRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
 function isJsonSchemaObject(value: unknown): value is JsonSchemaObject {
-  return isRecord(value);
-}
-
-function hasTypeBoxMetadata(schema: unknown): boolean {
-  return isRecord(schema) && Object.getOwnPropertySymbols(schema).includes(TYPEBOX_KIND);
+  return isObjectBackedRecord(value);
 }
 
 function getSchemaTypes(schema: JsonSchemaObject): string[] {
@@ -53,14 +51,14 @@ function matchesJsonType(value: unknown, type: string): boolean {
     case "array":
       return Array.isArray(value);
     case "object":
-      return isRecord(value) && !Array.isArray(value);
+      return isObjectBackedRecord(value) && !Array.isArray(value);
     default:
       return false;
   }
 }
 
 function isValidatorSchema(value: unknown): value is Tool["parameters"] {
-  return isRecord(value);
+  return isObjectBackedRecord(value);
 }
 
 const JSON_NUMBER_TOKEN_RE = /^[+-]?(?:(?:\d+\.?\d*)|(?:\.\d+))(?:e[+-]?\d+)?$/iu;
@@ -153,6 +151,40 @@ function coercePrimitiveByType(value: unknown, type: string): unknown {
       }
       return value;
     }
+    case "array": {
+      if (
+        typeof value === "string" &&
+        value.trim() !== "" &&
+        value.length <= MAX_JSON_COERCE_LENGTH
+      ) {
+        try {
+          const parsed: unknown = JSON.parse(value);
+          if (Array.isArray(parsed)) {
+            return parsed;
+          }
+        } catch {
+          // Not valid JSON; leave as-is for the validator to reject.
+        }
+      }
+      return value;
+    }
+    case "object": {
+      if (
+        typeof value === "string" &&
+        value.trim() !== "" &&
+        value.length <= MAX_JSON_COERCE_LENGTH
+      ) {
+        try {
+          const parsed: unknown = JSON.parse(value);
+          if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+            return parsed;
+          }
+        } catch {
+          // Not valid JSON; leave as-is for the validator to reject.
+        }
+      }
+      return value;
+    }
     case "null": {
       if (value === "" || value === 0 || value === false) {
         return null;
@@ -204,7 +236,28 @@ function applySchemaArrayCoercion(value: unknown[], schema: JsonSchemaObject): v
 }
 
 function coerceWithUnionSchema(value: unknown, schemas: JsonSchemaObject[]): unknown {
+  // When value is null, check if any union member accepts null directly
+  // (type: "null") before falling through to coercion.  Without this check,
+  // anyOf [{type: "string"}, {type: "null"}] coerces null → "" via the
+  // string branch and never reaches the null branch.
+  if (value === null) {
+    for (const schema of schemas) {
+      const types = getSchemaTypes(schema);
+      if (types.includes("null")) {
+        const validator = getSubSchemaValidator(schema);
+        if (!validator || validator.Check(value)) {
+          return value;
+        }
+      }
+    }
+  }
   for (const schema of schemas) {
+    const types = getSchemaTypes(schema);
+    // A nullable alternative represents absence, not a fallback for invalid
+    // non-null values such as zero below an integer branch's minimum.
+    if (value !== null && types.length === 1 && types[0] === "null") {
+      continue;
+    }
     const candidate = structuredClone(value);
     const coerced = coerceWithJsonSchema(candidate, schema);
     const validator = getSubSchemaValidator(schema);
@@ -246,7 +299,11 @@ function coerceWithJsonSchema(value: unknown, schema: JsonSchemaObject): unknown
     }
   }
 
-  if (schemaTypes.includes("object") && isRecord(nextValue) && !Array.isArray(nextValue)) {
+  if (
+    schemaTypes.includes("object") &&
+    isObjectBackedRecord(nextValue) &&
+    !Array.isArray(nextValue)
+  ) {
     applySchemaObjectCoercion(nextValue, schema);
   }
 
@@ -290,18 +347,29 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): unknown {
   return validateToolArguments(tool, toolCall);
 }
 
+function introducesNullValue(previous: unknown, converted: unknown): boolean {
+  if (converted === null) {
+    return previous !== null;
+  }
+  if (!isObjectBackedRecord(previous) || !isObjectBackedRecord(converted)) {
+    return false;
+  }
+  return Object.entries(converted).some(([key, value]) =>
+    introducesNullValue(previous[key], value),
+  );
+}
+
 /** Validates tool arguments against TypeBox or plain JSON-schema parameters. */
 export function validateToolArguments(tool: Tool, toolCall: ToolCall): unknown {
   const args = structuredClone(toolCall.arguments);
-  Value.Convert(tool.parameters, args);
-
   const validator = getValidator(tool.parameters);
-  if (!hasTypeBoxMetadata(tool.parameters) && isJsonSchemaObject(tool.parameters)) {
-    // TypeBox Value.Convert is intentionally conservative for plain JSON schemas;
-    // mirror the provider-facing coercions so model-emitted string numbers validate.
+
+  if (isJsonSchemaObject(tool.parameters)) {
+    // Apply nullable-union policy before TypeBox's more permissive conversion
+    // can replace invalid non-null values with null.
     const coerced = coerceWithJsonSchema(args, tool.parameters);
     if (coerced !== args) {
-      if (isRecord(args) && isRecord(coerced)) {
+      if (isObjectBackedRecord(args) && isObjectBackedRecord(coerced)) {
         for (const key of Object.keys(args)) {
           delete args[key];
         }
@@ -314,6 +382,13 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): unknown {
 
   if (validator.Check(args)) {
     return args;
+  }
+
+  // Retain TypeBox-specific recovery (for example numeric enums and records),
+  // but never turn a rejected value into a nullable placeholder to pass validation.
+  const converted = validator.Convert(structuredClone(args));
+  if (!introducesNullValue(args, converted) && validator.Check(converted)) {
+    return converted;
   }
 
   const errors =

@@ -1,0 +1,397 @@
+import { stableStringify } from "@openclaw/normalization-core";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import type { ResponseInput, ResponseOutputItem } from "openai/resources/responses/responses.js";
+import { getAiTransportHost, resolveAiTransportHeaderSentinels } from "../host.js";
+import { registerSessionResourceCleanup } from "../session-resources.js";
+import { parseJsonObjectPreservingUnsafeIntegers } from "./json-unsafe-integers.js";
+import {
+  canReferenceResponsesReasoningHistory,
+  replayResponsesReasoningUpdates,
+  type ResponsesConfigurationUpdate,
+} from "./openai-responses-reasoning-update.js";
+import { sha256Hex } from "./transport-utils.js";
+
+// A real chat conversation's turns are commonly minutes to hours apart, well
+// past the original 5-minute TTL -- continuation only ever engaged within one
+// multi-round tool-calling turn (seconds between rounds), never across
+// separate incoming messages, even though sessionId and connection identity
+// are both stable across turns (confirmed by tracing the full call chain).
+// Unchanged since #122194 introduced it; review only ever flagged the
+// in-memory/process-local design generally, never the specific value.
+const HTTP_CONTINUATION_IDLE_TTL_MS = 90 * 60 * 1000;
+// A ready entry retains the full request/response baseline for as long as
+// HTTP_CONTINUATION_IDLE_TTL_MS, and that TTL is now 18x longer (5m -> 90m).
+// Without a capacity cap, a burst of concurrent sessions/connections could
+// grow this process-wide map unbounded for the entire idle window. Claimed
+// entries (in-flight, no retained baseline) don't count against the cap --
+// they're already bounded by the request they represent.
+const MAX_HTTP_CONTINUATION_READY_ENTRIES = 1000;
+// A count cap alone bounds cardinality, not memory: a full-context turn near
+// a large model's context window can retain a multi-megabyte baseline on its
+// own, so 1000 oversized entries could still exhaust process memory well
+// before the count cap engages. This aggregate budget is enforced alongside
+// the count cap (whichever evicts first), and also bypasses caching a single
+// candidate entry that exceeds the whole budget by itself -- evicting every
+// other entry still wouldn't make room for it, and the request itself
+// already succeeded, so skipping continuation for that one oversized turn
+// (falling back to a full-history resend next round) is strictly better than
+// either rejecting the response or growing past the budget. 64MB matches the
+// existing ANTHROPIC_INLINE_IMAGES_DECODE_SAFETY_BYTES precedent for a
+// single-request memory ceiling in this package -- comfortably above even a
+// 200K-token context's realistic JSON footprint (well under 4MB).
+const MAX_HTTP_CONTINUATION_RETAINED_BYTES = 64 * 1024 * 1024;
+const TURN_HEADERS = new Set(["traceparent", "x-openclaw-turn-id", "x-openclaw-turn-attempt"]);
+
+export type ResponsesContinuationRequest = Record<string, unknown> & {
+  input?: Array<ResponseInput[number] | ResponsesConfigurationUpdate>;
+  previous_response_id?: string;
+};
+export type ResponsesSteeringContinuationMode = "automatic" | "required-input";
+export type ResponsesContinuationState = {
+  lastRequest: ResponsesContinuationRequest;
+  lastResponseId: string;
+  lastResponseItems: ResponseOutputItem[];
+};
+export type ResponsesContinuationStatus =
+  | "continued"
+  | "explicit_previous_response_id"
+  | "history_changed"
+  | "history_shorter"
+  | "no_previous_response"
+  | "request_changed";
+
+function jsonValuesEqual(left: object, right: object): boolean {
+  // Normalize the left side first to preserve serialization errors and toJSON ordering.
+  const leftJson = JSON.stringify(left) as string;
+  const normalizedLeft = stableStringify(JSON.parse(leftJson));
+  const rightJson = JSON.stringify(right) as string;
+  return leftJson === rightJson || normalizedLeft === stableStringify(JSON.parse(rightJson));
+}
+
+function requestWithoutInput(request: ResponsesContinuationRequest): ResponsesContinuationRequest {
+  // Instructions and tools apply to the current response and remain on every wire request.
+  const {
+    input: _input,
+    previous_response_id: _previousResponseId,
+    instructions: _instructions,
+    tools: _tools,
+    ...rest
+  } = request;
+  if (!isRecord(rest.metadata)) {
+    return rest;
+  }
+  const metadata = Object.fromEntries(
+    Object.entries(rest.metadata).filter(
+      ([key]) => key !== "openclaw_turn_id" && key !== "openclaw_turn_attempt",
+    ),
+  );
+  return { ...rest, metadata };
+}
+
+function normalizeAssistantReplayInput(input: readonly unknown[], fromResponse = false): unknown[] {
+  return input.map((item) => {
+    if (!isRecord(item)) {
+      return item;
+    }
+    if (item.type === "reasoning") {
+      return { type: "reasoning" };
+    }
+    if (item.type !== "function_call" && !(item.type === "message" && item.role === "assistant")) {
+      return item;
+    }
+    const { id: _id, status: _status, ...stableItem } = item;
+    if (fromResponse && item.type === "function_call") {
+      // Only provider output crosses terminal admission; sent arguments must retain real type edits.
+      const args = parseJsonObjectPreservingUnsafeIntegers(stableItem.arguments);
+      stableItem.arguments = args ? JSON.stringify(args) : stableItem.arguments;
+    }
+    if (item.type === "message" && Array.isArray(stableItem.content)) {
+      stableItem.content = stableItem.content.map((part) => {
+        if (!isRecord(part) || part.type !== "output_text") {
+          return part;
+        }
+        const { annotations: _annotations, logprobs: _logprobs, ...stablePart } = part;
+        return stablePart;
+      });
+    }
+    return stableItem;
+  });
+}
+
+export function resolveResponsesContinuationRequest(
+  continuation: ResponsesContinuationState | undefined,
+  request: ResponsesContinuationRequest,
+  steering?: ResponsesSteeringContinuationMode,
+): {
+  request: ResponsesContinuationRequest;
+  fullRequest?: ResponsesContinuationRequest;
+  continuationStatus: ResponsesContinuationStatus;
+} {
+  if (!continuation) {
+    return { request, continuationStatus: "no_previous_response" };
+  }
+  if (request.previous_response_id) {
+    return { request, continuationStatus: "explicit_previous_response_id" };
+  }
+  // Referenced controls remain active even when omitted from the wire delta.
+  // Check compatibility whether the caller supplied them or needs rehydration.
+  if (!canReferenceResponsesReasoningHistory(continuation.lastRequest, request)) {
+    return { request, continuationStatus: "request_changed" };
+  }
+  const prepared = replayResponsesReasoningUpdates(
+    continuation.lastRequest,
+    request,
+    continuation.lastResponseItems.length,
+    steering,
+  );
+  // Required input creates a new response with current settings. The same
+  // history validation below still binds it to the accepted steering's parent.
+  if (
+    steering !== "required-input" &&
+    !jsonValuesEqual(requestWithoutInput(prepared), requestWithoutInput(continuation.lastRequest))
+  ) {
+    return { request, continuationStatus: "request_changed" };
+  }
+  const currentInput = prepared.input ?? [];
+  const previousInput = continuation.lastRequest.input ?? [];
+  const baselineLength = previousInput.length + continuation.lastResponseItems.length;
+  if (currentInput.length < baselineLength) {
+    return { request, continuationStatus: "history_shorter" };
+  }
+  if (
+    !jsonValuesEqual(
+      normalizeAssistantReplayInput(currentInput.slice(0, previousInput.length)),
+      normalizeAssistantReplayInput(previousInput),
+    ) ||
+    !jsonValuesEqual(
+      normalizeAssistantReplayInput(currentInput.slice(previousInput.length, baselineLength)),
+      normalizeAssistantReplayInput(continuation.lastResponseItems, true),
+    )
+  ) {
+    return { request, continuationStatus: "history_changed" };
+  }
+  return {
+    request: {
+      ...prepared,
+      previous_response_id: continuation.lastResponseId,
+      input: currentInput.slice(baselineLength),
+    },
+    ...(prepared !== request ? { fullRequest: prepared } : {}),
+    continuationStatus: "continued",
+  };
+}
+
+type HttpContinuationEntry =
+  | {
+      kind: "ready";
+      sessionId: string;
+      state: ResponsesContinuationState;
+      idleTimer: ReturnType<typeof setTimeout>;
+      readySequence: number;
+      retainedBytes: number;
+    }
+  | { kind: "claimed"; sessionId: string };
+
+const httpContinuationEntries = new Map<string, HttpContinuationEntry>();
+
+function deleteHttpContinuationIfOwned(key: string, entry: HttpContinuationEntry): void {
+  if (httpContinuationEntries.get(key) === entry) {
+    httpContinuationEntries.delete(key);
+  }
+}
+
+// Monotonic counter for ready-entry commit order: Date.now() is not a unique
+// completion order (two commits can land in the same millisecond, e.g. a
+// reclaimed session key completing alongside another), so an eviction based
+// on wall-clock time can pick a newer entry over an older one that happens
+// to share a timestamp. A strictly incrementing sequence makes "oldest"
+// unambiguous regardless of timing.
+let nextHttpContinuationReadySequence = 1;
+// Running total of every ready entry's retainedBytes, kept in lockstep with
+// httpContinuationEntries by removeReadyEntry -- the only path that deletes a
+// ready entry -- so MAX_HTTP_CONTINUATION_RETAINED_BYTES can be enforced
+// without re-summing the map on every commit.
+let httpContinuationRetainedBytes = 0;
+// Ready-only key order, kept in lockstep with httpContinuationEntries by the
+// same two paths that add/remove a ready entry (see removeReadyEntry and the
+// commit callback below). httpContinuationEntries itself also holds "claimed"
+// (in-flight) entries, which are NOT capped -- evictReadyEntriesForCapacity
+// used to scan that whole map and skip non-ready entries after visiting them,
+// so its cost was proportional to total (claimed + ready) entries, not the
+// configured ready-entry cap, under concurrent load (ClawSweeper P1 finding).
+// A Set preserves insertion order but a plain `.add()` on an existing key does
+// NOT move it -- delete-then-add is required to correctly reorder a refreshed
+// (reclaimed) key to the newest position, same reason readySequence exists;
+// kept alongside readySequence rather than replacing it, since readySequence
+// remains the field regression tests assert on for eviction-order proof.
+const httpContinuationReadyKeyOrder = new Set<string>();
+
+/** Estimates a ready entry's retained memory: the same JSON that gets
+ * stringified for the eviction budget it counts against, no separate copy
+ * kept around just to size it. */
+function estimateRetainedBytes(state: ResponsesContinuationState): number {
+  return Buffer.byteLength(JSON.stringify(state), "utf8");
+}
+
+// Single removal path for a ready entry, used by every path that discards
+// one (idle expiry, capacity/budget eviction, reclaim-before-overwrite,
+// session cleanup) -- keeps idleTimer cleanup and the retainedBytes running
+// total symmetric with httpContinuationEntries without duplicating either at
+// each call site.
+function removeReadyEntry(
+  key: string,
+  entry: Extract<HttpContinuationEntry, { kind: "ready" }>,
+): void {
+  clearTimeout(entry.idleTimer);
+  httpContinuationReadyKeyOrder.delete(key);
+  httpContinuationRetainedBytes -= entry.retainedBytes;
+  httpContinuationEntries.delete(key);
+}
+
+// Deterministic capacity/budget policy: evict the least-recently-committed
+// ready entry first (the one least likely to be reused before its own idle
+// TTL would have expired it anyway) until both MAX_HTTP_CONTINUATION_READY_ENTRIES
+// and MAX_HTTP_CONTINUATION_RETAINED_BYTES (including the incoming
+// `pendingBytes` about to be inserted) are satisfied. Reads
+// httpContinuationReadyKeyOrder (ready-only, insertion-ordered) instead of
+// scanning httpContinuationEntries -- that map also holds "claimed" (in-
+// flight) entries, which aren't capped, so scanning it and skipping non-ready
+// entries after visiting them made cost proportional to total (claimed +
+// ready) entries under concurrent load, not the configured ready-entry cap
+// this comment claimed (ClawSweeper P1 finding, fixed here).
+function evictReadyEntriesForCapacity(pendingBytes: number): void {
+  for (;;) {
+    const overCapacity = httpContinuationReadyKeyOrder.size >= MAX_HTTP_CONTINUATION_READY_ENTRIES;
+    const overBudget =
+      httpContinuationRetainedBytes + pendingBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES;
+    if (!overCapacity && !overBudget) {
+      return;
+    }
+    const oldestKey = httpContinuationReadyKeyOrder.values().next().value;
+    const oldestEntry = oldestKey ? httpContinuationEntries.get(oldestKey) : undefined;
+    if (!oldestKey || oldestEntry?.kind !== "ready") {
+      return;
+    }
+    removeReadyEntry(oldestKey, oldestEntry);
+  }
+}
+
+type HttpContinuationIdentity = {
+  apiKey: string;
+  baseUrl: string;
+  headers: Record<string, string>;
+};
+type ContinuationResponse = { id: string; output: ResponseOutputItem[] };
+
+function connectionIdentity(params: HttpContinuationIdentity): string {
+  const headers = Object.entries(resolveAiTransportHeaderSentinels(params.headers) ?? {})
+    .map(([name, value]) => [name.toLowerCase(), value] as const)
+    .filter(([name]) => !TURN_HEADERS.has(name))
+    .toSorted(([a], [b]) => a.localeCompare(b));
+  return sha256Hex(
+    JSON.stringify([
+      getAiTransportHost().resolveSecretSentinel(params.apiKey),
+      params.baseUrl,
+      headers,
+    ]),
+  );
+}
+
+export function claimOpenAIResponsesHttpContinuation(
+  params: HttpContinuationIdentity & {
+    sessionId: string;
+    request: ResponsesContinuationRequest;
+  },
+) {
+  const key = `${params.sessionId}\0${connectionIdentity(params)}`;
+  const previous = httpContinuationEntries.get(key);
+  if (previous?.kind === "claimed") {
+    return undefined;
+  }
+  if (previous?.kind === "ready") {
+    removeReadyEntry(key, previous);
+  }
+  const claimed = { kind: "claimed", sessionId: params.sessionId } as const;
+  httpContinuationEntries.set(key, claimed);
+  try {
+    const resolved = resolveResponsesContinuationRequest(
+      previous?.kind === "ready" ? previous.state : undefined,
+      params.request,
+    );
+    const fullRequest = resolved.fullRequest ?? params.request;
+    return {
+      // Unstored HTTP responses cannot be referenced, but their prompt prefix can still be cached.
+      request: params.request.store === false ? fullRequest : resolved.request,
+      fullRequest,
+      commit: (effectiveRequest: ResponsesContinuationRequest, response: ContinuationResponse) => {
+        if (httpContinuationEntries.get(key) !== claimed) {
+          return;
+        }
+        const state: ResponsesContinuationState = {
+          lastRequest: effectiveRequest,
+          lastResponseId: response.id,
+          lastResponseItems: response.output,
+        };
+        const retainedBytes = estimateRetainedBytes(state);
+        // estimateRetainedBytes JSON.stringifies caller-supplied request/response
+        // content, which can invoke an attacker- or caller-controlled toJSON or
+        // getter synchronously -- exactly like the same concern already covered
+        // above in the claim path (see "keeps preparation exclusive..." test).
+        // That callback could reentrantly release this claim (session cleanup)
+        // and let a fresh claim/commit land at this key before this call resumes.
+        // Re-check ownership before touching the map again so a stale commit
+        // can never overwrite or evict entries a newer, legitimate claim owns.
+        if (httpContinuationEntries.get(key) !== claimed) {
+          return;
+        }
+        if (retainedBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES) {
+          // Evicting every other entry still wouldn't make this one fit --
+          // skip caching it. The turn's actual response already completed
+          // successfully; only the *next* turn loses continuation and falls
+          // back to a full-history resend, same as before this cache existed.
+          deleteHttpContinuationIfOwned(key, claimed);
+          return;
+        }
+        evictReadyEntriesForCapacity(retainedBytes);
+        const ready = {
+          ...claimed,
+          kind: "ready",
+          state,
+          idleTimer: setTimeout(() => {
+            const current = httpContinuationEntries.get(key);
+            if (current === ready) {
+              removeReadyEntry(key, current);
+            }
+          }, HTTP_CONTINUATION_IDLE_TTL_MS),
+          readySequence: nextHttpContinuationReadySequence++,
+          retainedBytes,
+        } satisfies Extract<HttpContinuationEntry, { kind: "ready" }>;
+        ready.idleTimer.unref?.();
+        httpContinuationRetainedBytes += retainedBytes;
+        httpContinuationEntries.set(key, ready);
+        // delete-then-add, not a bare add: Set.add() on an existing key does
+        // NOT move it to the newest insertion position, which would leave a
+        // reclaimed (refreshed) key's eviction order stale.
+        httpContinuationReadyKeyOrder.delete(key);
+        httpContinuationReadyKeyOrder.add(key);
+      },
+      release: () => deleteHttpContinuationIfOwned(key, claimed),
+    };
+  } catch (error) {
+    // Preparation failed before the caller received a handle that could release this claim.
+    deleteHttpContinuationIfOwned(key, claimed);
+    throw error;
+  }
+}
+
+registerSessionResourceCleanup((sessionId) => {
+  for (const [key, entry] of httpContinuationEntries) {
+    if (!sessionId || entry.sessionId === sessionId) {
+      if (entry.kind === "ready") {
+        removeReadyEntry(key, entry);
+      } else {
+        httpContinuationEntries.delete(key);
+      }
+    }
+  }
+});

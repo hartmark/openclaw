@@ -14,7 +14,7 @@
 import { OcEmitSentinelError, REDACTED_SENTINEL } from "../sentinel.js";
 import type { JsoncAst, JsoncValue } from "./ast.js";
 
-export interface JsoncEmitOptions {
+interface JsoncEmitOptions {
   readonly mode?: "roundtrip" | "render";
   readonly fileNameForGuard?: string;
   readonly acceptPreExistingSentinel?: boolean;
@@ -33,21 +33,31 @@ export function emitJsonc(ast: JsoncAst, opts: JsoncEmitOptions = {}): string {
   }
 
   // Render mode loses comments; walks leaves for caller-injected sentinel.
-  if (ast.root === null) {return "";}
-  return renderValue(ast.root, guardPath, []);
+  if (ast.root === null) {
+    return "";
+  }
+  return renderJsoncValue(ast.root, guardPath, " ");
 }
 
-function renderValue(value: JsoncValue, guardPath: string, walked: readonly string[]): string {
+export function renderJsoncValue(
+  value: JsoncValue,
+  guardPath: string,
+  space: "" | " ",
+  walked: readonly string[] = [],
+): string {
   switch (value.kind) {
     case "object": {
       const parts = value.entries.map(
-        (e) => `${JSON.stringify(e.key)}: ${renderValue(e.value, guardPath, [...walked, e.key])}`,
+        (e) =>
+          `${JSON.stringify(e.key)}:${space}${renderJsoncValue(e.value, guardPath, space, [...walked, e.key])}`,
       );
-      return `{ ${parts.join(", ")} }`;
+      return `{${space}${parts.join(`,${space}`)}${space}}`;
     }
     case "array": {
-      const parts = value.items.map((v, i) => renderValue(v, guardPath, [...walked, String(i)]));
-      return `[ ${parts.join(", ")} ]`;
+      const parts = value.items.map((v, i) =>
+        renderJsoncValue(v, guardPath, space, [...walked, String(i)]),
+      );
+      return `[${space}${parts.join(`,${space}`)}${space}]`;
     }
     case "string":
       // Substring match: embedded sentinel leaks marker bytes too.

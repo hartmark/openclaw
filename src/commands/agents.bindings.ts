@@ -1,15 +1,17 @@
+import { expectDefined } from "@openclaw/normalization-core";
+// Pure helpers for parsing, adding, removing, and generating agent route bindings.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeSortedUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { getBundledChannelSetupPlugin } from "../channels/plugins/bundled.js";
 import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import { getLoadedChannelPlugin } from "../channels/plugins/index.js";
 import type { ChannelId } from "../channels/plugins/types.public.js";
-import { normalizeChannelId as normalizeBundledChannelId } from "../channels/registry.js";
+import { normalizeChatChannelId as normalizeBundledChannelId } from "../channels/registry.js";
 import { formatUnknownChannelMessage } from "../cli/error-format.js";
 import { isRouteBinding, listRouteBindings } from "../config/bindings.js";
 import type { AgentRouteBinding } from "../config/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { listManifestChannelContributionIds } from "../plugins/manifest-contribution-ids.js";
+import { listPluginContributionIds } from "../plugins/plugin-registry.js";
 import { DEFAULT_ACCOUNT_ID, normalizeAgentId } from "../routing/session-key.js";
 import type { ChannelChoice } from "./onboard-types.js";
 
@@ -53,6 +55,7 @@ function canUpgradeBindingAccountScope(params: {
   );
 }
 
+/** Merge new route bindings into config while reporting adds, upgrades, skips, and conflicts. */
 export function applyAgentBindings(
   cfg: OpenClawConfig,
   bindings: AgentRouteBinding[],
@@ -139,6 +142,7 @@ export function applyAgentBindings(
   };
 }
 
+/** Remove matching route bindings from config without disturbing non-route binding entries. */
 export function removeAgentBindings(
   cfg: OpenClawConfig,
   bindings: AgentRouteBinding[],
@@ -215,31 +219,6 @@ function resolveDefaultAccountId(cfg: OpenClawConfig, provider: ChannelId): stri
   return resolveChannelDefaultAccountId({ plugin, cfg });
 }
 
-function listManifestChannelIds(config: OpenClawConfig): Set<string> {
-  return new Set(
-    listManifestChannelContributionIds({
-      includeDisabled: true,
-      config,
-      env: process.env,
-    }),
-  );
-}
-
-function normalizeBindingChannelId(
-  raw: string | undefined,
-  config: OpenClawConfig,
-): ChannelId | null {
-  const bundled = normalizeBundledChannelId(raw);
-  if (bundled) {
-    return bundled;
-  }
-  const normalized = normalizeOptionalString(raw)?.toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  return listManifestChannelIds(config).has(normalized) ? normalized : null;
-}
-
 function getBindingChannelPlugin(channel: ChannelId) {
   return getLoadedChannelPlugin(channel) ?? getBundledChannelSetupPlugin(channel);
 }
@@ -256,7 +235,9 @@ function resolveBindingAccountId(params: {
   }
 
   const plugin = getBindingChannelPlugin(params.channel);
-  const pluginAccountId = plugin?.setup?.resolveBindingAccountId?.({
+  const resolvePluginAccountId =
+    plugin?.setupContract?.resolveBindingAccountId ?? plugin?.setup?.resolveBindingAccountId;
+  const pluginAccountId = resolvePluginAccountId?.({
     cfg: params.config,
     agentId: params.agentId,
   });
@@ -308,15 +289,43 @@ export function parseBindingSpecs(params: {
   const errors: string[] = [];
   const specs = params.specs ?? [];
   const agentId = normalizeAgentId(params.agentId);
+  let manifestChannelIds: Set<string> | undefined;
   for (const raw of specs) {
     const trimmed = raw?.trim();
     if (!trimmed) {
       continue;
     }
-    const [channelRaw, accountRaw] = trimmed.split(":", 2);
-    const channel = normalizeBindingChannelId(channelRaw, params.config);
+    // Bind specs are exactly <channel> or <channel>:<account>; extra colon
+    // segments would silently change the requested account if truncated.
+    const [channelRaw, accountRaw, ...extraSegments] = trimmed.split(":");
+    if (extraSegments.length > 0) {
+      errors.push(
+        `Invalid binding "${trimmed}". Account id cannot contain ":". Use <channel>:<account>, for example telegram:default.`,
+      );
+      continue;
+    }
+    let channel: ChannelId | null = normalizeBundledChannelId(channelRaw);
     if (!channel) {
-      errors.push(formatUnknownChannelMessage({ channel: channelRaw }));
+      const normalized = normalizeOptionalString(channelRaw)?.toLowerCase();
+      if (normalized) {
+        // One parse owns the inventory; blank, extra-colon, and bundled specs never need it.
+        manifestChannelIds ??= new Set(
+          listPluginContributionIds({
+            contribution: "channels",
+            includeDisabled: true,
+            config: params.config,
+            env: process.env,
+          }),
+        );
+        channel = manifestChannelIds.has(normalized) ? normalized : null;
+      }
+    }
+    if (!channel) {
+      errors.push(
+        formatUnknownChannelMessage({
+          channel: expectDefined(channelRaw, "agents.bindings channel raw"),
+        }),
+      );
       continue;
     }
     let accountId: string | undefined = accountRaw?.trim();
