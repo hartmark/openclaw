@@ -27,10 +27,6 @@ type OpenAIReasoningSignature = {
   type: string;
 };
 
-type DowngradeOpenAIReasoningBlocksOptions = {
-  dropReplayableReasoningBefore?: number;
-};
-
 function parseOpenAIReasoningSignature(value: unknown): OpenAIReasoningSignature | null {
   if (!value) {
     return null;
@@ -65,23 +61,6 @@ function parseOpenAIReasoningSignature(value: unknown): OpenAIReasoningSignature
 
 function parseTimestampMs(value: unknown): number | null {
   return parseDateFirstTimestampMs(value) ?? null;
-}
-
-function hasFollowingNonThinkingBlock(
-  content: Extract<AgentMessage, { role: "assistant" }>["content"],
-  index: number,
-): boolean {
-  for (let i = index + 1; i < content.length; i++) {
-    const block = content[i];
-    if (!block || typeof block !== "object") {
-      return true;
-    }
-    // SAFETY: already checked above that block is a non-null object; only reads its optional type.
-    if ((block as { type?: unknown }).type !== "thinking") {
-      return true;
-    }
-  }
-  return false;
 }
 
 function isOpenAIToolCallType(type: unknown): boolean {
