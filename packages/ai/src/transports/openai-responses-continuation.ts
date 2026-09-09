@@ -334,6 +334,19 @@ let nextHttpContinuationReadySequence = 1;
 // ready entry -- so MAX_HTTP_CONTINUATION_RETAINED_BYTES can be enforced
 // without re-summing the map on every commit.
 let httpContinuationRetainedBytes = 0;
+// Ready-only key order, kept in lockstep with httpContinuationEntries by the
+// same two paths that add/remove a ready entry (see removeReadyEntry and the
+// commit callback below). httpContinuationEntries itself also holds "claimed"
+// (in-flight) entries, which are NOT capped -- evictReadyEntriesForCapacity
+// used to scan that whole map and skip non-ready entries after visiting them,
+// so its cost was proportional to total (claimed + ready) entries, not the
+// configured ready-entry cap, under concurrent load (ClawSweeper P1 finding).
+// A Set preserves insertion order but a plain `.add()` on an existing key does
+// NOT move it -- delete-then-add is required to correctly reorder a refreshed
+// (reclaimed) key to the newest position, same reason readySequence exists;
+// kept alongside readySequence rather than replacing it, since readySequence
+// remains the field regression tests assert on for eviction-order proof.
+const httpContinuationReadyKeyOrder = new Set<string>();
 
 /** Estimates a ready entry's retained memory: the same JSON that gets
  * stringified for the eviction budget it counts against, no separate copy
@@ -352,6 +365,7 @@ function removeReadyEntry(
   entry: Extract<HttpContinuationEntry, { kind: "ready" }>,
 ): void {
   clearTimeout(entry.idleTimer);
+  httpContinuationReadyKeyOrder.delete(key);
   httpContinuationRetainedBytes -= entry.retainedBytes;
   httpContinuationEntries.delete(key);
 }
@@ -360,30 +374,24 @@ function removeReadyEntry(
 // ready entry first (the one least likely to be reused before its own idle
 // TTL would have expired it anyway) until both MAX_HTTP_CONTINUATION_READY_ENTRIES
 // and MAX_HTTP_CONTINUATION_RETAINED_BYTES (including the incoming
-// `pendingBytes` about to be inserted) are satisfied. Scans only ready
-// entries, bounded by the count cap itself, so cost stays proportional to
-// the configured limit rather than the full map.
+// `pendingBytes` about to be inserted) are satisfied. Reads
+// httpContinuationReadyKeyOrder (ready-only, insertion-ordered) instead of
+// scanning httpContinuationEntries -- that map also holds "claimed" (in-
+// flight) entries, which aren't capped, so scanning it and skipping non-ready
+// entries after visiting them made cost proportional to total (claimed +
+// ready) entries under concurrent load, not the configured ready-entry cap
+// this comment claimed (ClawSweeper P1 finding, fixed here).
 function evictReadyEntriesForCapacity(pendingBytes: number): void {
   for (;;) {
-    let readyCount = 0;
-    let oldestKey: string | undefined;
-    let oldestEntry: Extract<HttpContinuationEntry, { kind: "ready" }> | undefined;
-    let oldestReadySequence = Infinity;
-    for (const [key, entry] of httpContinuationEntries) {
-      if (entry.kind !== "ready") {
-        continue;
-      }
-      readyCount += 1;
-      if (entry.readySequence < oldestReadySequence) {
-        oldestReadySequence = entry.readySequence;
-        oldestKey = key;
-        oldestEntry = entry;
-      }
-    }
-    const overCapacity = readyCount >= MAX_HTTP_CONTINUATION_READY_ENTRIES;
+    const overCapacity = httpContinuationReadyKeyOrder.size >= MAX_HTTP_CONTINUATION_READY_ENTRIES;
     const overBudget =
       httpContinuationRetainedBytes + pendingBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES;
-    if ((!overCapacity && !overBudget) || !oldestKey || !oldestEntry) {
+    if (!overCapacity && !overBudget) {
+      return;
+    }
+    const oldestKey = httpContinuationReadyKeyOrder.values().next().value;
+    const oldestEntry = oldestKey ? httpContinuationEntries.get(oldestKey) : undefined;
+    if (!oldestKey || oldestEntry?.kind !== "ready") {
       return;
     }
     removeReadyEntry(oldestKey, oldestEntry);
@@ -453,12 +461,23 @@ export function claimOpenAIResponsesHttpContinuation(
           lastResponseItems: response.output,
         };
         const retainedBytes = estimateRetainedBytes(state);
+        // estimateRetainedBytes JSON.stringifies caller-supplied request/response
+        // content, which can invoke an attacker- or caller-controlled toJSON or
+        // getter synchronously -- exactly like the same concern already covered
+        // above in the claim path (see "keeps preparation exclusive..." test).
+        // That callback could reentrantly release this claim (session cleanup)
+        // and let a fresh claim/commit land at this key before this call resumes.
+        // Re-check ownership before touching the map again so a stale commit
+        // can never overwrite or evict entries a newer, legitimate claim owns.
+        if (httpContinuationEntries.get(key) !== claimed) {
+          return;
+        }
         if (retainedBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES) {
           // Evicting every other entry still wouldn't make this one fit --
           // skip caching it. The turn's actual response already completed
           // successfully; only the *next* turn loses continuation and falls
           // back to a full-history resend, same as before this cache existed.
-          httpContinuationEntries.delete(key);
+          deleteHttpContinuationIfOwned(key, claimed);
           return;
         }
         evictReadyEntriesForCapacity(retainedBytes);
@@ -466,13 +485,23 @@ export function claimOpenAIResponsesHttpContinuation(
           ...claimed,
           kind: "ready",
           state,
-          idleTimer: setTimeout(() => deleteHttpContinuationIfOwned(key, ready), idleTtlMs),
+          idleTimer: setTimeout(() => {
+            const current = httpContinuationEntries.get(key);
+            if (current === ready) {
+              removeReadyEntry(key, current);
+            }
+          }, idleTtlMs),
           readySequence: nextHttpContinuationReadySequence++,
           retainedBytes,
         } satisfies Extract<HttpContinuationEntry, { kind: "ready" }>;
         ready.idleTimer.unref?.();
         httpContinuationRetainedBytes += retainedBytes;
         httpContinuationEntries.set(key, ready);
+        // delete-then-add, not a bare add: Set.add() on an existing key does
+        // NOT move it to the newest insertion position, which would leave a
+        // reclaimed (refreshed) key's eviction order stale.
+        httpContinuationReadyKeyOrder.delete(key);
+        httpContinuationReadyKeyOrder.add(key);
       },
       release: () => deleteHttpContinuationIfOwned(key, claimed),
     };

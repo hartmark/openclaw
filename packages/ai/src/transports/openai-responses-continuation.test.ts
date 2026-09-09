@@ -579,6 +579,45 @@ describe("OpenAI Responses continuation", () => {
     next?.release();
   });
 
+  it("does not let a commit-time serialization callback resurrect or clobber a replacement claim", () => {
+    // estimateRetainedBytes JSON.stringifies the committed request/response --
+    // a caller-supplied toJSON can run reentrant cleanup and claim a
+    // replacement between commit's initial ownership check and its actual
+    // map writes (eviction/set), unlike the sibling "keeps preparation
+    // exclusive..." test above which covers the same concern on the claim
+    // path via resolveResponsesContinuationRequest's own JSON.stringify.
+    const stale = claim({});
+    let replacement: ReturnType<typeof claim>;
+    const staleEffectiveRequest = {
+      ...continuationState().lastRequest,
+      metadata: {
+        value: {
+          toJSON() {
+            cleanupSessionResources("session-1");
+            replacement = claim({ request: nextRequest() });
+            return "opaque";
+          },
+        },
+      },
+    };
+    stale?.commit(staleEffectiveRequest, {
+      id: "resp_stale",
+      output: continuationState().lastResponseItems,
+    });
+
+    expect(replacement).toBeDefined();
+    replacement?.commit(continuationState().lastRequest, {
+      id: "resp_replacement",
+      output: continuationState().lastResponseItems,
+    });
+
+    // The stale commit must not have overwritten the replacement's own ready
+    // entry with its own (now ownerless) state.
+    const next = claim({ request: nextRequest() });
+    expect(next?.request.previous_response_id).toBe("resp_replacement");
+    next?.release();
+  });
+
   it("expires completed continuation state after the default 90-minute idle TTL", () => {
     vi.useFakeTimers();
     const first = claim({});
@@ -711,6 +750,58 @@ describe("OpenAI Responses continuation", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("evicts by ready-only order even with many claimed (in-flight, never-committed) entries present", () => {
+    // ClawSweeper P1 finding on the original eviction scan: it walked the
+    // WHOLE httpContinuationEntries map (claimed + ready) and skipped
+    // non-ready entries after visiting them, so its cost scaled with total
+    // entries, not the configured ready-entry cap -- claimed entries aren't
+    // capped at all, so a burst of concurrent in-flight requests could grow
+    // that cost unbounded. This doesn't assert the scan cost directly (a
+    // flaky thing to time); it asserts the actual behavior the ready-only
+    // bookkeeping must get right: claimed entries never count toward the
+    // ready cap, are never evicted, and never displace which ready entry is
+    // "oldest" -- exactly what a naive fix that filtered a still-shared
+    // structure differently could still get wrong.
+    const claimedOnly: Array<ReturnType<typeof claim>> = [];
+    for (let i = 0; i < 5000; i++) {
+      claimedOnly.push(claim({ sessionId: `claimed-only-${i}` }));
+    }
+    expect(claimedOnly.every((c) => c !== undefined)).toBe(true);
+
+    for (let i = 0; i < READY_ENTRY_CAPACITY; i++) {
+      const c = claim({ sessionId: `mixed-session-${i}` });
+      c?.commit(continuationState().lastRequest, {
+        id: `mixed-resp-${i}`,
+        output: continuationState().lastResponseItems,
+      });
+    }
+
+    // The overflow commit must evict the oldest READY entry (mixed-session-0),
+    // not anything claimed-only -- claimed entries were never candidates.
+    const overflow = claim({ sessionId: "mixed-session-overflow" });
+    overflow?.commit(continuationState().lastRequest, {
+      id: "mixed-resp-overflow",
+      output: continuationState().lastResponseItems,
+    });
+
+    const evicted = claim({ sessionId: "mixed-session-0", request: nextRequest() });
+    expect(evicted?.request.previous_response_id).toBeUndefined();
+    evicted?.release();
+
+    const survivor = claim({
+      sessionId: `mixed-session-${READY_ENTRY_CAPACITY - 1}`,
+      request: nextRequest(),
+    });
+    expect(survivor?.request.previous_response_id).toBe(`mixed-resp-${READY_ENTRY_CAPACITY - 1}`);
+    survivor?.release();
+
+    // None of the 5000 claimed-only entries were touched by eviction -- each
+    // key is still exclusively claimed (a second claim attempt on the same
+    // key returns undefined, matching the "already claimed" contract).
+    const stillClaimed = claim({ sessionId: "claimed-only-0" });
+    expect(stillClaimed).toBeUndefined();
   });
 
   it("skips caching a single entry that alone exceeds the retained-byte budget", () => {
