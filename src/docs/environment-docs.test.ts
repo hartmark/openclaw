@@ -1,3 +1,4 @@
+// Environment docs tests validate documented environment variable references.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -19,7 +20,7 @@ describe("environment docs", () => {
 
     expect(markdown).toContain("Provider credentials and workspace `.env`");
     expect(markdown).toContain(
-      "OpenClaw ignores provider credential environment variables from workspace `.env` files",
+      "OpenClaw ignores provider credentials and protected runtime controls from workspace `.env`",
     );
     expect(markdown).toContain("~/.openclaw/.env");
     expect(markdown).toContain("$OPENCLAW_STATE_DIR/.env");
@@ -32,7 +33,7 @@ describe("environment docs", () => {
   });
 
   it("keeps the security guide aligned with the workspace dotenv credential boundary", async () => {
-    const markdown = await readDoc("docs/gateway/security/index.md");
+    const markdown = await readDoc("docs/gateway/security/secrets-and-storage.md");
 
     expect(markdown).toContain(
       "Provider credential environment variables are blocked from untrusted workspace `.env` files",

@@ -1,6 +1,6 @@
-import type { ProviderCatalogContext } from "openclaw/plugin-sdk/provider-catalog-shared";
+// Deepinfra provider module implements model/runtime integration.
 import type { ProviderPlugin } from "openclaw/plugin-sdk/provider-model-shared";
-import { buildDeepInfraApiKeyCatalog, buildStaticDeepInfraProvider } from "./provider-catalog.js";
+import { buildStaticDeepInfraProvider } from "./provider-static-catalog.js";
 
 const PROVIDER_ID = "deepinfra";
 
@@ -11,7 +11,11 @@ const deepinfraProviderDiscovery: ProviderPlugin = {
   auth: [],
   catalog: {
     order: "simple",
-    run: (ctx: ProviderCatalogContext) => buildDeepInfraApiKeyCatalog(ctx),
+    // Static inventory stays independent of credential and network discovery.
+    run: async (ctx) => {
+      const { buildDeepInfraApiKeyCatalog } = await import("./provider-catalog.js");
+      return await buildDeepInfraApiKeyCatalog(ctx);
+    },
   },
   staticCatalog: {
     order: "simple",

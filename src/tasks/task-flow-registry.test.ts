@@ -1,22 +1,28 @@
+// Covers managed task-flow creation, lookup, ownership, and state transitions.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { createInMemoryTaskFlowRegistryStore } from "../test-utils/task-registry-store.js";
 import {
-  createFlowRecord as createFlowRecordOrNull,
   createTaskFlowForTask as createTaskFlowForTaskOrNull,
   createManagedTaskFlow as createManagedTaskFlowOrNull,
   deleteTaskFlowRecordById,
+  getTaskFlowRegistryRestoreFailure,
   failFlow,
   getTaskFlowById,
   listTaskFlowRecords,
   requestFlowCancel,
-  resetTaskFlowRegistryForTests,
+  reloadTaskFlowRegistryFromStore,
   resumeFlow,
   setFlowWaiting,
-  syncFlowFromTask,
+  syncFlowFromTaskResult,
   updateFlowRecordByIdExpectedRevision,
 } from "./task-flow-registry.js";
-import { configureTaskFlowRegistryRuntime } from "./task-flow-registry.store.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
+import {
+  configureTaskFlowRegistryRuntime,
+  createFlowRecord as createFlowRecordOrNull,
+  resetTaskFlowRegistryForTests,
+} from "./task-runtime.test-helpers.js";
 
 function createFlowRecord(params: Parameters<typeof createFlowRecordOrNull>[0]): TaskFlowRecord {
   const flow = createFlowRecordOrNull(params);
@@ -46,15 +52,22 @@ function createTaskFlowForTask(
   return flow;
 }
 
-async function withFlowRegistryTempDir<T>(run: (root: string) => Promise<T>): Promise<T> {
+function syncFlowFromTaskForTest(
+  task: Parameters<typeof syncFlowFromTaskResult>[0],
+): TaskFlowRecord | null {
+  const result = syncFlowFromTaskResult(task);
+  return result.ok ? result.flow : null;
+}
+
+async function withFlowRegistryTempDir<T>(run: () => Promise<T>): Promise<T> {
   return await withOpenClawTestState(
     { layout: "state-only", prefix: "openclaw-task-flow-registry-" },
-    async (state) => {
-      resetTaskFlowRegistryForTests();
+    async () => {
+      resetTaskFlowRegistryForTests({ persist: false });
       try {
-        return await run(state.stateDir);
+        return await run();
       } finally {
-        resetTaskFlowRegistryForTests();
+        resetTaskFlowRegistryForTests({ persist: false });
       }
     },
   );
@@ -67,14 +80,11 @@ describe("task-flow-registry", () => {
 
   afterEach(() => {
     vi.useRealTimers();
-    resetTaskFlowRegistryForTests();
+    resetTaskFlowRegistryForTests({ persist: false });
   });
 
   it("creates managed flows and updates them through revision-checked helpers", async () => {
-    await withFlowRegistryTempDir(async (root) => {
-      process.env.OPENCLAW_STATE_DIR = root;
-      resetTaskFlowRegistryForTests();
-
+    await withFlowRegistryTempDir(async () => {
       const created = createManagedTaskFlow({
         ownerKey: "agent:main:main",
         controllerId: "tests/managed-controller",
@@ -182,10 +192,7 @@ describe("task-flow-registry", () => {
   });
 
   it("requires a controller for managed flows and rejects clearing it later", async () => {
-    await withFlowRegistryTempDir(async (root) => {
-      process.env.OPENCLAW_STATE_DIR = root;
-      resetTaskFlowRegistryForTests();
-
+    await withFlowRegistryTempDir(async () => {
       expect(() =>
         createFlowRecord({
           ownerKey: "agent:main:main",
@@ -215,10 +222,10 @@ describe("task-flow-registry", () => {
     const onEvent = vi.fn();
     configureTaskFlowRegistryRuntime({
       store: {
+        ...createInMemoryTaskFlowRegistryStore(),
         loadSnapshot: () => ({
           flows: new Map(),
         }),
-        saveSnapshot: () => {},
       },
       observers: {
         onEvent,
@@ -244,16 +251,87 @@ describe("task-flow-registry", () => {
     expect(events[2]?.flowId).toBe(created.flowId);
   });
 
+  it("keeps restore failures sticky until an explicit reload succeeds", () => {
+    const hiddenFlow: TaskFlowRecord = {
+      flowId: "hidden-flow",
+      syncMode: "managed",
+      ownerKey: "agent:main:main",
+      controllerId: "tests/hidden-flow",
+      revision: 4,
+      status: "running",
+      notifyPolicy: "done_only",
+      goal: "Existing durable flow",
+      createdAt: 10,
+      updatedAt: 20,
+    };
+    const loadSnapshot = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("SQLITE_CORRUPT: task-flow restore failed");
+      })
+      .mockReturnValue({
+        flows: new Map([[hiddenFlow.flowId, hiddenFlow]]),
+      });
+    const upsertFlow = vi.fn();
+    const deleteFlow = vi.fn();
+    configureTaskFlowRegistryRuntime({
+      store: {
+        loadSnapshot,
+        upsertFlow,
+        deleteFlow,
+      },
+    });
+
+    expect(() => listTaskFlowRecords()).toThrow(
+      "Task-flow registry restore failed: SQLITE_CORRUPT: task-flow restore failed",
+    );
+    expect(getTaskFlowRegistryRestoreFailure()).toBe("SQLITE_CORRUPT: task-flow restore failed");
+    expect(() =>
+      createManagedTaskFlowOrNull({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/restore-failure",
+        goal: "Must not persist over hidden flows",
+      }),
+    ).toThrow("Task-flow registry restore failed: SQLITE_CORRUPT: task-flow restore failed");
+    expect(() =>
+      updateFlowRecordByIdExpectedRevision({
+        flowId: hiddenFlow.flowId,
+        expectedRevision: hiddenFlow.revision,
+        patch: { currentStep: "must not overwrite hidden state" },
+      }),
+    ).toThrow("Task-flow registry restore failed: SQLITE_CORRUPT: task-flow restore failed");
+    expect(() => deleteTaskFlowRecordById(hiddenFlow.flowId)).toThrow(
+      "Task-flow registry restore failed: SQLITE_CORRUPT: task-flow restore failed",
+    );
+    expect(loadSnapshot).toHaveBeenCalledTimes(1);
+    expect(upsertFlow).not.toHaveBeenCalled();
+    expect(deleteFlow).not.toHaveBeenCalled();
+
+    reloadTaskFlowRegistryFromStore();
+
+    expect(loadSnapshot).toHaveBeenCalledTimes(2);
+    expect(getTaskFlowRegistryRestoreFailure()).toBeNull();
+    expect(listTaskFlowRecords()).toEqual([expect.objectContaining(hiddenFlow)]);
+    expect(
+      createManagedTaskFlowOrNull({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/restore-recovery",
+        goal: "Create after explicit recovery",
+      }),
+    ).not.toBeNull();
+    expect(upsertFlow).toHaveBeenCalledTimes(1);
+  });
+
   it("does not throw or register memory when flow create persistence fails", () => {
     const upsertFlow = vi.fn((_flow: TaskFlowRecord) => {
       throw new Error("SQLITE_FULL: database or disk is full");
     });
     configureTaskFlowRegistryRuntime({
       store: {
+        ...createInMemoryTaskFlowRegistryStore(),
         loadSnapshot: () => ({
           flows: new Map(),
         }),
-        saveSnapshot: () => {},
         upsertFlow,
       },
     });
@@ -279,10 +357,10 @@ describe("task-flow-registry", () => {
     });
     configureTaskFlowRegistryRuntime({
       store: {
+        ...createInMemoryTaskFlowRegistryStore(),
         loadSnapshot: () => ({
           flows: new Map(),
         }),
-        saveSnapshot: () => {},
         upsertFlow,
       },
     });
@@ -323,7 +401,6 @@ describe("task-flow-registry", () => {
         loadSnapshot: () => ({
           flows: new Map(),
         }),
-        saveSnapshot: () => {},
         upsertFlow: () => {},
         deleteFlow,
       },
@@ -343,6 +420,7 @@ describe("task-flow-registry", () => {
   it("normalizes restored managed flows without a controller id", () => {
     configureTaskFlowRegistryRuntime({
       store: {
+        ...createInMemoryTaskFlowRegistryStore(),
         loadSnapshot: () => ({
           flows: new Map([
             [
@@ -361,7 +439,6 @@ describe("task-flow-registry", () => {
             ],
           ]),
         }),
-        saveSnapshot: () => {},
       },
     });
 
@@ -372,10 +449,7 @@ describe("task-flow-registry", () => {
   });
 
   it("mirrors one-task flow state from tasks and leaves managed flows alone", async () => {
-    await withFlowRegistryTempDir(async (root) => {
-      process.env.OPENCLAW_STATE_DIR = root;
-      resetTaskFlowRegistryForTests();
-
+    await withFlowRegistryTempDir(async () => {
       const mirrored = createTaskFlowForTask({
         task: {
           ownerKey: "agent:main:main",
@@ -389,7 +463,7 @@ describe("task-flow-registry", () => {
         },
       });
 
-      const blocked = syncFlowFromTask({
+      const blocked = syncFlowFromTaskForTest({
         taskId: "task-blocked",
         parentFlowId: mirrored.flowId,
         status: "succeeded",
@@ -412,7 +486,7 @@ describe("task-flow-registry", () => {
       expect(blocked.endedAt).toBe(200);
       expect(blocked.updatedAt).toBe(200);
 
-      const delivered = syncFlowFromTask({
+      const delivered = syncFlowFromTaskForTest({
         taskId: "task-blocked",
         parentFlowId: mirrored.flowId,
         status: "succeeded",
@@ -457,7 +531,7 @@ describe("task-flow-registry", () => {
         status: "waiting",
         waitJson: { kind: "external_event" },
       });
-      const syncedManaged = syncFlowFromTask({
+      const syncedManaged = syncFlowFromTaskForTest({
         taskId: "task-child",
         parentFlowId: managed.flowId,
         status: "running",
@@ -479,10 +553,7 @@ describe("task-flow-registry", () => {
   });
 
   it("preserves explicit json null in state and wait payloads", async () => {
-    await withFlowRegistryTempDir(async (root) => {
-      process.env.OPENCLAW_STATE_DIR = root;
-      resetTaskFlowRegistryForTests();
-
+    await withFlowRegistryTempDir(async () => {
       const created = createManagedTaskFlow({
         ownerKey: "agent:main:main",
         controllerId: "tests/null-state",

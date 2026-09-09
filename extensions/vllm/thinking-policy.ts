@@ -1,8 +1,9 @@
+// Vllm plugin module implements thinking policy behavior.
 import type {
   ProviderDefaultThinkingPolicyContext,
   ProviderThinkingProfile,
 } from "openclaw/plugin-sdk/plugin-entry";
-import { normalizeProviderId } from "openclaw/plugin-sdk/provider-model-shared";
+import { normalizeProviderId } from "openclaw/plugin-sdk/provider-model-metadata";
 
 export type VllmQwenThinkingFormat = "chat-template" | "top-level";
 
@@ -11,9 +12,7 @@ const VLLM_BINARY_THINKING_PROFILE = {
   defaultLevel: "off",
 } satisfies ProviderThinkingProfile;
 
-export function normalizeVllmQwenThinkingFormat(
-  value: unknown,
-): VllmQwenThinkingFormat | undefined {
+function normalizeVllmQwenThinkingFormat(value: unknown): VllmQwenThinkingFormat | undefined {
   if (typeof value !== "string") {
     return undefined;
   }

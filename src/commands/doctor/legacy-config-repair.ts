@@ -1,43 +1,44 @@
+// Update-channel config repair for legacy config files before normal command startup.
 import { readConfigFileSnapshot, replaceConfigFile } from "../../config/config.js";
-import { INCLUDE_KEY } from "../../config/includes.js";
-import { validateConfigObjectWithPlugins } from "../../config/validation.js";
-import { isRecord } from "../../utils.js";
+import type { ConfigWriteOptions } from "../../config/io.js";
+import { configWriteTargetsIncludeBoundary } from "../../config/mutate.js";
+import { validateConfigObjectRawWithPlugins } from "../../config/validation.js";
+import { containsAuthoredInclude } from "./shared/include-migration-ownership.js";
 import { migrateLegacyConfig } from "./shared/legacy-config-migrate.js";
 
 type ConfigSnapshot = Awaited<ReturnType<typeof readConfigFileSnapshot>>;
 
-function containsAuthoredInclude(value: unknown): boolean {
-  if (!isRecord(value)) {
-    return false;
-  }
-  if (Object.hasOwn(value, INCLUDE_KEY)) {
-    return true;
-  }
-  return Object.values(value).some((entry) => containsAuthoredInclude(entry));
-}
-
+/** Migrate a legacy config snapshot during update, unless validation blocks it. */
 export async function repairLegacyConfigForUpdateChannel(params: {
   configSnapshot: ConfigSnapshot;
+  configWriteOptions: ConfigWriteOptions;
   jsonMode: boolean;
 }): Promise<{ snapshot: ConfigSnapshot; repaired: boolean }> {
-  if (containsAuthoredInclude(params.configSnapshot.parsed)) {
-    return { snapshot: params.configSnapshot, repaired: false };
-  }
-
-  const migrated = migrateLegacyConfig(params.configSnapshot.parsed);
+  const hasAuthoredIncludes = containsAuthoredInclude(params.configSnapshot.parsed);
+  const migrated = migrateLegacyConfig(params.configSnapshot.sourceConfig);
   if (!migrated.config) {
     return { snapshot: params.configSnapshot, repaired: false };
   }
 
-  const validated = validateConfigObjectWithPlugins(migrated.config);
+  const validated = validateConfigObjectRawWithPlugins(migrated.config);
   if (!validated.ok) {
     return { snapshot: params.configSnapshot, repaired: false };
   }
 
+  const nextConfig = migrated.sourceConfig ?? migrated.config;
+  if (
+    hasAuthoredIncludes &&
+    !configWriteTargetsIncludeBoundary({ snapshot: params.configSnapshot, nextConfig })
+  ) {
+    return { snapshot: params.configSnapshot, repaired: false };
+  }
+
   await replaceConfigFile({
-    nextConfig: validated.config,
+    sourceConfig: nextConfig,
     baseHash: params.configSnapshot.hash,
     writeOptions: {
+      ...params.configWriteOptions,
+      auditOrigin: "doctor",
       allowConfigSizeDrop: true,
       skipOutputLogs: params.jsonMode,
     },

@@ -1,22 +1,44 @@
 import { formatReasoningMessage } from "openclaw/plugin-sdk/agent-runtime";
-import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { findCodeRegions, isInsideCode } from "openclaw/plugin-sdk/text-chunking";
-import { stripReasoningTagsFromText } from "openclaw/plugin-sdk/text-chunking";
+import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
+import {
+  findCodeRegions,
+  isInsideCode,
+  stripReasoningTagsFromText,
+} from "openclaw/plugin-sdk/text-chunking";
+import type { TelegramReasoningStepState } from "./bot-message-dispatch.types.js";
 
-const REASONING_MESSAGE_RE = /^Thinking\.{0,3}\s*_/u;
-const LEGACY_REASONING_MESSAGE_PREFIX = "Reasoning:\n";
+// A durable reasoning message already marked channel-side: 🧠 + italic body
+// (see markReasoningMessage). Detect it so a re-split passes it through
+// unchanged instead of re-marking.
+const REASONING_MESSAGE_RE = /^🧠\s+_/u;
+// Core's formatReasoningMessage prefixes the italic body with a literal
+// "Thinking" header. Telegram renders durable thoughts with the 🧠 marker
+// (Discord parity), so this header must be rewritten channel-side.
+const CORE_THINKING_HEADER_RE = /^Thinking\.{0,3}\s*\n+/u;
+
+// Rewrite core's "Thinking\n\n_body_" into "🧠 _body_": strip the header word
+// and prefix the first italic line with 🧠. Keeps the italic body intact so
+// Telegram HTML renders it as before.
+function markReasoningMessage(formatted: string): string {
+  const withoutHeader = formatted.replace(CORE_THINKING_HEADER_RE, "");
+  return withoutHeader.replace(/^_/u, "🧠 _");
+}
 const REASONING_TAG_PREFIXES = [
   "<think",
   "<thinking",
   "<thought",
+  "<internal",
   "<antthinking",
+  "<mm:think",
   "</think",
   "</thinking",
   "</thought",
+  "</internal",
   "</antthinking",
+  "</mm:think",
 ];
-const THINKING_TAG_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>/gi;
+const THINKING_TAG_RE =
+  /<\s*(\/?)\s*(?:(?:antml:|mm:)?(?:think(?:ing)?|thought)|antthinking)\b[^<>]*>/gi;
 
 function extractThinkingFromTaggedStreamOutsideCode(text: string): string {
   if (!text) {
@@ -46,14 +68,14 @@ function extractThinkingFromTaggedStreamOutsideCode(text: string): string {
 }
 
 function isPartialReasoningTagPrefix(text: string): boolean {
-  const trimmed = normalizeLowercaseStringOrEmpty(text.trimStart());
+  const trimmed = text.trim().replace(/^<\s*(\/?)\s+/u, "<$1");
   if (!trimmed.startsWith("<")) {
     return false;
   }
   if (trimmed.includes(">")) {
     return false;
   }
-  return REASONING_TAG_PREFIXES.some((prefix) => prefix.startsWith(trimmed));
+  return REASONING_TAG_PREFIXES.some((prefix) => prefix.startsWith(trimmed.toLowerCase()));
 }
 
 type TelegramReasoningSplit = {
@@ -69,6 +91,10 @@ export function splitTelegramReasoningText(
     return {};
   }
 
+  if (isReasoning !== true) {
+    return { answerText: text };
+  }
+
   const trimmed = text.trim();
   if (isPartialReasoningTagPrefix(trimmed)) {
     return {};
@@ -76,38 +102,26 @@ export function splitTelegramReasoningText(
   if (REASONING_MESSAGE_RE.test(trimmed)) {
     return { reasoningText: trimmed };
   }
-  if (
-    trimmed.startsWith(LEGACY_REASONING_MESSAGE_PREFIX) &&
-    trimmed.length > LEGACY_REASONING_MESSAGE_PREFIX.length
-  ) {
-    return { reasoningText: trimmed };
+  // Durable reasoning payloads arrive pre-formatted by core with the "Thinking"
+  // header; rewrite that to the 🧠 marker rather than passing it through.
+  if (CORE_THINKING_HEADER_RE.test(trimmed)) {
+    return { reasoningText: markReasoningMessage(trimmed) };
   }
-
   const taggedReasoning = extractThinkingFromTaggedStreamOutsideCode(text);
   const strippedAnswer = stripReasoningTagsFromText(text, { mode: "strict", trim: "both" });
-
-  if (isReasoning === true) {
-    return { reasoningText: formatReasoningMessage(taggedReasoning || strippedAnswer || text) };
+  const reasoningText = taggedReasoning || strippedAnswer;
+  if (!reasoningText) {
+    return {};
   }
 
-  if (!taggedReasoning && strippedAnswer === text) {
-    return { answerText: text };
-  }
-
-  const reasoningText = taggedReasoning ? formatReasoningMessage(taggedReasoning) : undefined;
-  const answerText = strippedAnswer || undefined;
-  return { reasoningText, answerText };
+  return {
+    reasoningText: markReasoningMessage(formatReasoningMessage(reasoningText)),
+  };
 }
 
-type BufferedFinalAnswer = {
-  payload: ReplyPayload;
-  text: string;
-  bufferedGeneration?: number;
-};
-
-export function createTelegramReasoningStepState() {
+export function createTelegramReasoningStepState(): TelegramReasoningStepState {
   let reasoningStatus: "none" | "hinted" | "delivered" = "none";
-  let bufferedFinalAnswer: BufferedFinalAnswer | undefined;
+  let bufferedFinalAnswer: ReplyPayload | undefined;
 
   const noteReasoningHint = () => {
     if (reasoningStatus === "none") {
@@ -123,18 +137,11 @@ export function createTelegramReasoningStepState() {
     return reasoningStatus === "hinted" && !bufferedFinalAnswer;
   };
 
-  const bufferFinalAnswer = (value: BufferedFinalAnswer) => {
+  const bufferFinalAnswer = (value: ReplyPayload) => {
     bufferedFinalAnswer = value;
   };
 
-  const takeBufferedFinalAnswer = (currentGeneration?: number): BufferedFinalAnswer | undefined => {
-    if (
-      currentGeneration !== undefined &&
-      bufferedFinalAnswer?.bufferedGeneration !== undefined &&
-      bufferedFinalAnswer.bufferedGeneration !== currentGeneration
-    ) {
-      return undefined;
-    }
+  const takeBufferedFinalAnswer = (): ReplyPayload | undefined => {
     const value = bufferedFinalAnswer;
     bufferedFinalAnswer = undefined;
     return value;

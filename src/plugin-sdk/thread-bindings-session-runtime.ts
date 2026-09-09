@@ -1,6 +1,10 @@
+/**
+ * Runtime SDK subpath for thread binding lifecycle and session binding adapters.
+ */
 export { resolveThreadBindingFarewellText } from "../channels/thread-bindings-messages.js";
 export {
   resolveThreadBindingLifecycle,
+  resolveThreadBindingExpiry,
   type ThreadBindingLifecycleRecord,
 } from "../shared/thread-binding-lifecycle.js";
 export {

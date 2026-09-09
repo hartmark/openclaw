@@ -1,7 +1,8 @@
+// Workboard API module exposes the plugin public contract.
 import type {
   PluginDoctorStateMigration,
   PluginDoctorStateMigrationContext,
-} from "openclaw/plugin-sdk/runtime-doctor";
+} from "openclaw/plugin-sdk/runtime-doctor-migrations";
 import type {
   PersistedWorkboardAttachment,
   PersistedWorkboardBoard,
@@ -9,7 +10,6 @@ import type {
   PersistedWorkboardNotificationSubscription,
   WorkboardKeyedStore,
 } from "./src/persistence-types.js";
-import { createWorkboardSqliteStores, resolveWorkboardSqlitePath } from "./src/sqlite-store.js";
 
 const MAX_CARDS = 2000;
 
@@ -204,6 +204,9 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
       if (count === 0) {
         return null;
       }
+      // Empty legacy namespaces need no SQLite runtime. Resolve the target only
+      // when there is state to preview and migrate.
+      const { resolveWorkboardSqlitePath } = await import("./src/sqlite-store.js");
       return {
         preview: [
           `- Workboard: ${count} legacy .28 plugin-state KV ${count === 1 ? "entry" : "entries"} → ${resolveWorkboardSqlitePath(env)}`,
@@ -211,6 +214,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
       };
     },
     async migrateLegacyState(params) {
+      const { createWorkboardSqliteStores } = await import("./src/sqlite-store.js");
       const env = migrationEnv(params);
       const cards = openLegacyStore<PersistedWorkboardCard>({
         context: params.context,

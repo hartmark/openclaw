@@ -1,3 +1,4 @@
+// Openai plugin module implements replay policy behavior.
 import type {
   ProviderReplayPolicy,
   ProviderReplayPolicyContext,
@@ -19,7 +20,9 @@ export function buildOpenAIReplayPolicy(ctx: ProviderReplayPolicyContext): Provi
     applyAssistantFirstOrderingFix: false,
     validateGeminiTurns: false,
     validateAnthropicTurns: false,
-    ...(isResponsesFamily ? { allowSyntheticToolResults: true } : {}),
+    ...(isResponsesFamily
+      ? { allowSyntheticToolResults: true, appendOnlyRuntimeContext: true }
+      : {}),
     ...(ctx.modelApi === "openai-completions"
       ? {
           sanitizeToolCallIds: true,

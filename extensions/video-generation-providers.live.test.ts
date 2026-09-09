@@ -1,3 +1,4 @@
+// Video Generation Providers.Live.Test.Ts tests cover video generation providers plugin behavior.
 import {
   resolveApiKeyForProvider,
   resolveDefaultAgentDir,
@@ -7,15 +8,7 @@ import {
   registerProviderPlugin,
   requireRegisteredProvider,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import {
-  DEFAULT_LIVE_VIDEO_MODELS,
-  canRunBufferBackedImageToVideoLiveLane,
-  canRunBufferBackedVideoToVideoLiveLane,
-  collectProviderApiKeys,
-  encodePngRgba,
-  fillPixel,
-  getShellEnvAppliedKeys,
   isAuthErrorMessage,
   isBillingErrorMessage,
   isLiveProfileKeyModeEnabled,
@@ -25,6 +18,15 @@ import {
   isServerErrorMessage,
   isTimeoutErrorMessage,
   isTruthyEnvValue,
+  readLiveTestConfig,
+} from "openclaw/plugin-sdk/test-live";
+import { collectProviderApiKeys, getShellEnvAppliedKeys } from "openclaw/plugin-sdk/test-live-auth";
+import {
+  DEFAULT_LIVE_VIDEO_MODELS,
+  canRunBufferBackedImageToVideoLiveLane,
+  canRunBufferBackedVideoToVideoLiveLane,
+  encodePngRgba,
+  fillPixel,
   normalizeVideoGenerationDuration,
   parseCsvFilter,
   parseProviderModelMap,
@@ -33,15 +35,15 @@ import {
   resolveConfiguredLiveVideoModels,
   resolveLiveVideoAuthStore,
   resolveLiveVideoResolution,
-} from "openclaw/plugin-sdk/test-env";
+} from "openclaw/plugin-sdk/test-media-generation";
 import type {
   GeneratedVideoAsset,
   VideoGenerationMode,
   VideoGenerationModeCapabilities,
   VideoGenerationProvider,
   VideoGenerationRequest,
-} from "openclaw/plugin-sdk/test-env";
-import { describe, expect, it } from "vitest";
+} from "openclaw/plugin-sdk/test-media-generation";
+import { describe, expect, it, vi } from "vitest";
 import alibabaPlugin from "./alibaba/index.js";
 import byteplusPlugin from "./byteplus/index.js";
 import deepinfraPlugin from "./deepinfra/index.js";
@@ -343,16 +345,42 @@ function logLiveVideoSummary(params: {
   );
 }
 
-function expectLiveVideoCasePassed(params: {
-  attempted: string[];
-  failures: string[];
-  providerId: string;
-  skipped: string[];
-}): void {
+function isRequestedByProviderFilter(providerId: string, filter: Set<string> | null): boolean {
+  return filter?.has(providerId) ?? false;
+}
+
+function expectSelectedVideoProvidersPresent(
+  selectedCases: readonly LiveProviderCase[],
+  activeProviderFilter = providerFilter,
+): void {
+  if (selectedCases.length === 0 && activeProviderFilter && activeProviderFilter.size > 0) {
+    throw new Error(
+      `[live:video-generation] requested provider filter matched no video providers: ${[...activeProviderFilter].toSorted((a, b) => a.localeCompare(b)).join(", ")}`,
+    );
+  }
+}
+
+function expectLiveVideoCasePassed(
+  params: {
+    attempted: string[];
+    failures: string[];
+    providerId: string;
+    skip: (note: string) => void;
+    skipped: string[];
+  },
+  activeProviderFilter = providerFilter,
+): void {
   logLiveVideoSummary(params);
   if (params.attempted.length === 0) {
     expect(params.failures).toStrictEqual([]);
-    console.warn("[live:video-generation] no live video attempt completed; skipping assertions");
+    if (isRequestedByProviderFilter(params.providerId, activeProviderFilter)) {
+      throw new Error(
+        `[live:video-generation] requested provider produced no live attempts: ${params.providerId}; skipped=${params.skipped.join(", ") || "none"}`,
+      );
+    }
+    params.skip(
+      `[live:video-generation] no live video attempt completed for ${params.providerId}; skipped=${params.skipped.join(", ") || "none"}`,
+    );
     return;
   }
   expect(params.failures).toStrictEqual([]);
@@ -375,14 +403,17 @@ function resolveLiveSmokeDurationSeconds(params: {
   );
 }
 
-async function runLiveVideoProviderCase(testCase: LiveProviderCase): Promise<void> {
-  const cfg = withPluginsEnabled(getRuntimeConfig());
+async function runLiveVideoProviderCase(
+  testCase: LiveProviderCase,
+  skip: (note: string) => void,
+): Promise<void> {
+  const cfg = withPluginsEnabled(await readLiveTestConfig());
   const configuredModels = resolveConfiguredLiveVideoModels(cfg);
   const agentDir = resolveDefaultAgentDir(cfg as never);
   const attempted: string[] = [];
   const skipped: string[] = [];
   const failures: string[] = [];
-  const summaryParams = { attempted, failures, providerId: testCase.providerId, skipped };
+  const summaryParams = { attempted, failures, providerId: testCase.providerId, skip, skipped };
 
   maybeLoadShellEnvForVideoProviders([testCase.providerId]);
 
@@ -592,7 +623,8 @@ async function runLiveVideoProviderCase(testCase: LiveProviderCase): Promise<voi
 
 describeLive("video generation provider live", () => {
   if (CASES.length === 0) {
-    it("skips when no video generation providers are selected", () => {
+    it("skips only unfiltered runs when no video generation providers are selected", () => {
+      expectSelectedVideoProvidersPresent(CASES);
       expect(CASES).toHaveLength(0);
     });
   }
@@ -601,10 +633,54 @@ describeLive("video generation provider live", () => {
     // One provider per test keeps cumulative suite runtime from tripping a single timeout cap.
     it(
       `covers declared video-generation modes with shell/profile auth (${testCase.providerId})`,
-      async () => {
-        await runLiveVideoProviderCase(testCase);
+      async ({ skip }) => {
+        await runLiveVideoProviderCase(testCase, skip);
       },
       LIVE_VIDEO_TEST_TIMEOUT_MS,
     );
   }
+});
+
+describe("video generation live provider filter coverage", () => {
+  it("fails filtered suites when the filter matches no providers", () => {
+    expect(() => expectSelectedVideoProvidersPresent([], new Set(["missing"]))).toThrow(
+      /requested provider filter matched no video providers: missing/u,
+    );
+  });
+
+  it("skips unfiltered zero-attempt provider cases", () => {
+    const skip = vi.fn();
+    expect(() =>
+      expectLiveVideoCasePassed(
+        {
+          attempted: [],
+          failures: [],
+          providerId: "local-only",
+          skip,
+          skipped: ["local-only: no usable auth"],
+        },
+        null,
+      ),
+    ).not.toThrow();
+    expect(skip).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("local-only: no usable auth"),
+    );
+  });
+
+  it("fails filtered provider cases when the requested provider is not attempted", () => {
+    const skip = vi.fn();
+    expect(() =>
+      expectLiveVideoCasePassed(
+        {
+          attempted: [],
+          failures: [],
+          providerId: "minimax",
+          skip,
+          skipped: ["minimax: no usable auth"],
+        },
+        new Set(["minimax"]),
+      ),
+    ).toThrow(/requested provider produced no live attempts: minimax/u);
+    expect(skip).not.toHaveBeenCalled();
+  });
 });

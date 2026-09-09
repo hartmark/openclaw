@@ -1,7 +1,11 @@
 // Keep provider onboarding helpers dependency-light so bundled provider plugins
 // do not pull heavyweight runtime graphs at activation time.
 
-import { findNormalizedProviderKey } from "@openclaw/model-catalog-core/provider-id";
+import {
+  findNormalizedProviderKey,
+  normalizeProviderId,
+} from "@openclaw/model-catalog-core/provider-id";
+import { isRecord } from "../../packages/normalization-core/src/record-coerce.js";
 import { resolvePrimaryStringValue } from "../../packages/normalization-core/src/string-coerce.js";
 import { ensureStaticModelAllowlistEntry } from "../agents/model-allowlist-entry.js";
 import { normalizeConfiguredProviderCatalogModelId } from "../agents/model-ref-shared.js";
@@ -23,6 +27,7 @@ export {
   resolveAgentModelPrimaryValue,
 } from "../config/model-input.js";
 
+/** Alias registration accepted by provider onboarding presets. */
 export type AgentModelAliasEntry =
   | string
   | {
@@ -35,12 +40,27 @@ const LEGACY_OPENCODE_ZEN_DEFAULT_MODELS = new Set([
   "opencode-zen/claude-opus-4-5",
 ]);
 
-export const OPENCODE_ZEN_DEFAULT_MODEL = "opencode/claude-opus-4-6";
+/** Current OpenCode Zen default model ref used by onboarding and repair flows. */
+export const OPENCODE_ZEN_DEFAULT_MODEL = "opencode/claude-opus-5";
 
+/** Pair of preset appliers exposed by provider setup modules. */
 export type ProviderOnboardPresetAppliers<TArgs extends unknown[]> = {
   applyProviderConfig: (cfg: OpenClawConfig, ...args: TArgs) => OpenClawConfig;
   applyConfig: (cfg: OpenClawConfig, ...args: TArgs) => OpenClawConfig;
 };
+
+type ProviderPresetModels = ModelDefinitionConfig[] | (() => ModelDefinitionConfig[]);
+
+function resolvePresetModels(models: ProviderPresetModels): ModelDefinitionConfig[] {
+  return typeof models === "function" ? models() : models;
+}
+
+function resolveConnectionModels(
+  cfg: OpenClawConfig,
+  models: ProviderPresetModels,
+): ModelDefinitionConfig[] {
+  return cfg.models?.mode === "replace" ? structuredClone(resolvePresetModels(models)) : [];
+}
 
 function extractAgentDefaultModelFallbacks(model: unknown): string[] | undefined {
   if (!model || typeof model !== "object") {
@@ -53,8 +73,14 @@ function extractAgentDefaultModelFallbacks(model: unknown): string[] | undefined
   return Array.isArray(fallbacks) ? fallbacks.map((value) => String(value)) : undefined;
 }
 
-function hasAgentDefaultModelPrimary(cfg: OpenClawConfig): boolean {
-  return resolvePrimaryStringValue(cfg.agents?.defaults?.model) !== undefined;
+function completeProviderPreset(
+  cfg: OpenClawConfig,
+  next: OpenClawConfig,
+  primaryModelRef: string | undefined,
+): OpenClawConfig {
+  return primaryModelRef && resolvePrimaryStringValue(cfg.agents?.defaults?.model) === undefined
+    ? applyAgentDefaultModelPrimary(next, primaryModelRef)
+    : next;
 }
 
 function normalizeAgentModelAliasEntry(entry: AgentModelAliasEntry): {
@@ -97,6 +123,7 @@ function normalizeProviderModelsForConfig(
     const existingIndex = seenById.get(normalized.id);
     if (existingIndex !== undefined) {
       mutated = true;
+      // Later entries fill gaps only; earlier user/provider settings keep precedence.
       next[existingIndex] = { ...normalized, ...next[existingIndex] };
       continue;
     }
@@ -136,7 +163,9 @@ function resolveProviderModelMergeState(
   providerId: string,
 ): ProviderModelMergeState {
   const providers = { ...cfg.models?.providers } as Record<string, ModelProviderConfig>;
-  const existingProviderKey = findNormalizedProviderKey(providers, providerId);
+  const existingProviderKey = Object.hasOwn(providers, providerId)
+    ? providerId
+    : findNormalizedProviderKey(providers, providerId);
   const existingProvider =
     existingProviderKey !== undefined
       ? (providers[existingProviderKey] as ModelProviderConfig | undefined)
@@ -144,8 +173,13 @@ function resolveProviderModelMergeState(
   const existingModels: ModelDefinitionConfig[] = Array.isArray(existingProvider?.models)
     ? normalizeProviderModelsForConfig(providerId, existingProvider.models)
     : [];
-  if (existingProviderKey && existingProviderKey !== providerId) {
-    delete providers[existingProviderKey];
+  // Collapse case/alias variants into the canonical provider key before writing,
+  // otherwise onboarding can leave two provider blocks for the same backend.
+  const normalizedProviderId = normalizeProviderId(providerId);
+  for (const key of Object.keys(providers)) {
+    if (key !== providerId && normalizeProviderId(key) === normalizedProviderId) {
+      delete providers[key];
+    }
   }
   return {
     providers,
@@ -153,27 +187,6 @@ function resolveProviderModelMergeState(
       ? { ...existingProvider, models: existingModels }
       : existingProvider,
     existingModels,
-  };
-}
-
-function buildProviderConfig(params: {
-  existingProvider: ModelProviderConfig | undefined;
-  api: ModelApi;
-  baseUrl: string;
-  mergedModels: ModelDefinitionConfig[];
-  fallbackModels: ModelDefinitionConfig[];
-}): ModelProviderConfig {
-  const { apiKey: existingApiKey, ...existingProviderRest } = (params.existingProvider ?? {}) as {
-    apiKey?: string;
-  };
-  const normalizedApiKey = typeof existingApiKey === "string" ? existingApiKey.trim() : undefined;
-
-  return {
-    ...existingProviderRest,
-    baseUrl: params.baseUrl,
-    api: params.api,
-    ...(normalizedApiKey ? { apiKey: normalizedApiKey } : {}),
-    models: params.mergedModels.length > 0 ? params.mergedModels : params.fallbackModels,
   };
 }
 
@@ -186,18 +199,19 @@ function applyProviderConfigWithMergedModels(
     api: ModelApi;
     baseUrl: string;
     mergedModels: ModelDefinitionConfig[];
-    fallbackModels: ModelDefinitionConfig[];
   },
 ): OpenClawConfig {
   const mergedModels = normalizeProviderModelsForConfig(params.providerId, params.mergedModels);
-  const fallbackModels = normalizeProviderModelsForConfig(params.providerId, params.fallbackModels);
-  params.providerState.providers[params.providerId] = buildProviderConfig({
-    existingProvider: params.providerState.existingProvider,
-    api: params.api,
+  const { apiKey: existingApiKey, ...existingProviderRest } =
+    params.providerState.existingProvider ?? {};
+  const normalizedApiKey = typeof existingApiKey === "string" ? existingApiKey.trim() : undefined;
+  params.providerState.providers[params.providerId] = {
+    ...existingProviderRest,
     baseUrl: params.baseUrl,
-    mergedModels,
-    fallbackModels,
-  });
+    api: params.api,
+    ...(normalizedApiKey ? { apiKey: normalizedApiKey } : {}),
+    models: mergedModels,
+  };
   return applyOnboardAuthAgentModelsAndProviders(cfg, {
     agentModels: params.agentModels,
     providers: params.providerState.providers,
@@ -235,6 +249,7 @@ function createProviderPresetAppliers<
   };
 }
 
+/** Merge provider alias entries into the agent default model map without clobbering existing aliases. */
 export function withAgentModelAliases(
   existing: Record<string, AgentModelEntryConfig> | undefined,
   aliases: readonly AgentModelAliasEntry[],
@@ -251,6 +266,110 @@ export function withAgentModelAliases(
   return next;
 }
 
+/** Build alias-only onboarding appliers without mutating provider catalog config. */
+export function createAliasOnlyPresetAppliers(params: {
+  modelRef: string;
+  alias: string;
+}): ProviderOnboardPresetAppliers<[]> {
+  const applyProviderConfig = (cfg: OpenClawConfig): OpenClawConfig => {
+    const models = { ...cfg.agents?.defaults?.models };
+    models[params.modelRef] = {
+      ...models[params.modelRef],
+      alias: models[params.modelRef]?.alias ?? params.alias,
+    };
+    return {
+      ...cfg,
+      agents: {
+        ...cfg.agents,
+        defaults: { ...cfg.agents?.defaults, models },
+      },
+    };
+  };
+  return {
+    applyProviderConfig,
+    applyConfig: (cfg) => applyAgentDefaultModelPrimary(applyProviderConfig(cfg), params.modelRef),
+  };
+}
+
+function isMergeableProviderConfig(
+  value: ModelProviderConfig | undefined,
+): value is ModelProviderConfig {
+  return isRecord(value);
+}
+
+function mergeOnboardProviderRequest(
+  existing: ModelProviderConfig["request"],
+  patch: ModelProviderConfig["request"],
+): ModelProviderConfig["request"] {
+  if (!existing) {
+    return patch;
+  }
+  const merged = { ...existing, ...patch };
+  // Keep operator transport policy, but never resurrect nested credentials
+  // that the onboarding owner intentionally omitted from its patch.
+  if (!patch || !("auth" in patch)) {
+    delete merged.auth;
+  }
+  if (!patch || !("headers" in patch)) {
+    delete merged.headers;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function mergeOnboardProviderConfigs(
+  existingProviders: Record<string, ModelProviderConfig> | undefined,
+  patchProviders: Record<string, ModelProviderConfig>,
+): Record<string, ModelProviderConfig> {
+  const merged: Record<string, ModelProviderConfig> = { ...existingProviders };
+  for (const [providerId, providerConfig] of Object.entries(patchProviders)) {
+    const normalizedProviderId = normalizeProviderId(providerId);
+    const patchProviderKey = Object.hasOwn(patchProviders, normalizedProviderId)
+      ? normalizedProviderId
+      : findNormalizedProviderKey(patchProviders, providerId);
+    if (providerId !== patchProviderKey) {
+      continue;
+    }
+    const existingProviderKey = findNormalizedProviderKey(existingProviders ?? {}, providerId);
+    const existingProvider =
+      existingProviders?.[providerId] ??
+      (existingProviderKey ? existingProviders?.[existingProviderKey] : undefined);
+    for (const key of Object.keys(existingProviders ?? {})) {
+      // The patch owns the canonical key; retaining its old case variant would
+      // leave two runtime candidates with conflicting auth and endpoint state.
+      if (key !== providerId && normalizeProviderId(key) === normalizedProviderId) {
+        delete merged[key];
+      }
+    }
+    if (
+      !isMergeableProviderConfig(existingProvider) ||
+      !isMergeableProviderConfig(providerConfig)
+    ) {
+      merged[providerId] = providerConfig;
+      continue;
+    }
+    const nextProvider = { ...existingProvider, ...providerConfig };
+    for (const key of ["apiKey", "auth", "authHeader", "headers"] as const) {
+      if (!(key in providerConfig)) {
+        delete nextProvider[key];
+      }
+    }
+    if (!("request" in providerConfig) || providerConfig.request) {
+      const mergedRequest = mergeOnboardProviderRequest(
+        existingProvider.request,
+        providerConfig.request,
+      );
+      if (mergedRequest) {
+        nextProvider.request = mergedRequest;
+      } else {
+        delete nextProvider.request;
+      }
+    }
+    merged[providerId] = nextProvider;
+  }
+  return merged;
+}
+
+/** Write onboarding-auth model aliases and provider configs into the canonical config sections. */
 export function applyOnboardAuthAgentModelsAndProviders(
   cfg: OpenClawConfig,
   params: {
@@ -262,6 +381,7 @@ export function applyOnboardAuthAgentModelsAndProviders(
     ...cfg.agents?.defaults?.models,
     ...params.agentModels,
   });
+  const mergedProviders = mergeOnboardProviderConfigs(cfg.models?.providers, params.providers);
   return {
     ...cfg,
     agents: {
@@ -272,12 +392,14 @@ export function applyOnboardAuthAgentModelsAndProviders(
       },
     },
     models: {
+      ...cfg.models,
       mode: cfg.models?.mode ?? "merge",
-      providers: params.providers,
+      providers: mergedProviders,
     },
   };
 }
 
+/** Set the agent default primary model while preserving normalized fallbacks and provider models. */
 export function applyAgentDefaultModelPrimary(
   cfg: OpenClawConfig,
   primary: string,
@@ -314,6 +436,7 @@ export function applyAgentDefaultModelPrimary(
   };
 }
 
+/** Move configs without a primary default onto the current OpenCode Zen model. */
 export function applyOpencodeZenModelDefault(cfg: OpenClawConfig): {
   next: OpenClawConfig;
   changed: boolean;
@@ -332,6 +455,7 @@ export function applyOpencodeZenModelDefault(cfg: OpenClawConfig): {
   };
 }
 
+/** Merge a provider config and seed required default models when the provider has no matching model yet. */
 export function applyProviderConfigWithDefaultModels(
   cfg: OpenClawConfig,
   params: {
@@ -362,10 +486,10 @@ export function applyProviderConfigWithDefaultModels(
     api: params.api,
     baseUrl: params.baseUrl,
     mergedModels,
-    fallbackModels: defaultModels,
   });
 }
 
+/** Single-model wrapper around `applyProviderConfigWithDefaultModels`. */
 export function applyProviderConfigWithDefaultModel(
   cfg: OpenClawConfig,
   params: {
@@ -387,6 +511,7 @@ export function applyProviderConfigWithDefaultModel(
   });
 }
 
+/** Apply a single-model provider preset and set the primary model only when the user has none. */
 export function applyProviderConfigWithDefaultModelPreset(
   cfg: OpenClawConfig,
   params: {
@@ -399,21 +524,18 @@ export function applyProviderConfigWithDefaultModelPreset(
     primaryModelRef?: string;
   },
 ): OpenClawConfig {
-  const next = applyProviderConfigWithDefaultModel(cfg, {
-    agentModels: withAgentModelAliases(cfg.agents?.defaults?.models, params.aliases ?? []),
+  return applyProviderConfigWithDefaultModelsPreset(cfg, {
     providerId: params.providerId,
     api: params.api,
     baseUrl: params.baseUrl,
-    defaultModel: params.defaultModel,
+    defaultModels: [params.defaultModel],
     defaultModelId: params.defaultModelId,
+    aliases: params.aliases,
+    primaryModelRef: params.primaryModelRef,
   });
-  return params.primaryModelRef
-    ? hasAgentDefaultModelPrimary(cfg)
-      ? next
-      : applyAgentDefaultModelPrimary(next, params.primaryModelRef)
-    : next;
 }
 
+/** Build setup appliers for presets that resolve to one default provider model. */
 export function createDefaultModelPresetAppliers<TArgs extends unknown[]>(params: {
   resolveParams: (
     cfg: OpenClawConfig,
@@ -431,13 +553,14 @@ export function createDefaultModelPresetAppliers<TArgs extends unknown[]>(params
   });
 }
 
+/** Apply a multi-model provider preset and set the primary model only when the user has none. */
 export function applyProviderConfigWithDefaultModelsPreset(
   cfg: OpenClawConfig,
   params: {
     providerId: string;
     api: ModelApi;
     baseUrl: string;
-    defaultModels: ModelDefinitionConfig[];
+    defaultModels: ProviderPresetModels;
     defaultModelId?: string;
     aliases?: readonly AgentModelAliasEntry[];
     primaryModelRef?: string;
@@ -448,16 +571,13 @@ export function applyProviderConfigWithDefaultModelsPreset(
     providerId: params.providerId,
     api: params.api,
     baseUrl: params.baseUrl,
-    defaultModels: params.defaultModels,
+    defaultModels: resolvePresetModels(params.defaultModels),
     defaultModelId: params.defaultModelId,
   });
-  return params.primaryModelRef
-    ? hasAgentDefaultModelPrimary(cfg)
-      ? next
-      : applyAgentDefaultModelPrimary(next, params.primaryModelRef)
-    : next;
+  return completeProviderPreset(cfg, next, params.primaryModelRef);
 }
 
+/** Build setup appliers for presets that resolve to multiple default provider models. */
 export function createDefaultModelsPresetAppliers<TArgs extends unknown[]>(params: {
   resolveParams: (
     cfg: OpenClawConfig,
@@ -475,6 +595,21 @@ export function createDefaultModelsPresetAppliers<TArgs extends unknown[]>(param
   });
 }
 
+/** Build connection-only setup appliers while retaining the default-model merge rule in replace mode. */
+export function createDefaultModelsConnectionPresetAppliers<TArgs extends unknown[]>(
+  params: Parameters<typeof createDefaultModelsPresetAppliers<TArgs>>[0],
+): ProviderOnboardPresetAppliers<TArgs> {
+  return createProviderPresetAppliers({
+    ...params,
+    applyPreset: (cfg, preset: Parameters<typeof applyProviderConfigWithDefaultModelsPreset>[1]) =>
+      applyProviderConfigWithDefaultModelsPreset(cfg, {
+        ...preset,
+        defaultModels: resolveConnectionModels(cfg, preset.defaultModels),
+      }),
+  });
+}
+
+/** Merge a provider config with a catalog while preserving existing model entries first. */
 export function applyProviderConfigWithModelCatalog(
   cfg: OpenClawConfig,
   params: {
@@ -503,17 +638,17 @@ export function applyProviderConfigWithModelCatalog(
     api: params.api,
     baseUrl: params.baseUrl,
     mergedModels,
-    fallbackModels: catalogModels,
   });
 }
 
+/** Apply a catalog-backed provider preset and set the primary model only when the user has none. */
 export function applyProviderConfigWithModelCatalogPreset(
   cfg: OpenClawConfig,
   params: {
     providerId: string;
     api: ModelApi;
     baseUrl: string;
-    catalogModels: ModelDefinitionConfig[];
+    catalogModels: ProviderPresetModels;
     aliases?: readonly AgentModelAliasEntry[];
     primaryModelRef?: string;
   },
@@ -523,15 +658,12 @@ export function applyProviderConfigWithModelCatalogPreset(
     providerId: params.providerId,
     api: params.api,
     baseUrl: params.baseUrl,
-    catalogModels: params.catalogModels,
+    catalogModels: resolvePresetModels(params.catalogModels),
   });
-  return params.primaryModelRef
-    ? hasAgentDefaultModelPrimary(cfg)
-      ? next
-      : applyAgentDefaultModelPrimary(next, params.primaryModelRef)
-    : next;
+  return completeProviderPreset(cfg, next, params.primaryModelRef);
 }
 
+/** Build setup appliers for presets that resolve to a provider model catalog. */
 export function createModelCatalogPresetAppliers<TArgs extends unknown[]>(params: {
   resolveParams: (
     cfg: OpenClawConfig,
@@ -549,6 +681,25 @@ export function createModelCatalogPresetAppliers<TArgs extends unknown[]>(params
   });
 }
 
+/** Apply connection facts and aliases, seeding the supplied catalog only in explicit replace mode. */
+export function applyProviderConnectionConfig(
+  cfg: OpenClawConfig,
+  params: Parameters<typeof applyProviderConfigWithModelCatalogPreset>[1],
+): OpenClawConfig {
+  return applyProviderConfigWithModelCatalogPreset(cfg, {
+    ...params,
+    catalogModels: resolveConnectionModels(cfg, params.catalogModels),
+  });
+}
+
+/** Build registered setup appliers without changing the catalog-seeding public helper contract. */
+export function createProviderConnectionPresetAppliers<TArgs extends unknown[]>(
+  params: Parameters<typeof createModelCatalogPresetAppliers<TArgs>>[0],
+): ProviderOnboardPresetAppliers<TArgs> {
+  return createProviderPresetAppliers({ ...params, applyPreset: applyProviderConnectionConfig });
+}
+
+/** Ensure static per-model config includes a provider model ref after onboarding. */
 export function ensureModelAllowlistEntry(params: {
   cfg: OpenClawConfig;
   modelRef: string;

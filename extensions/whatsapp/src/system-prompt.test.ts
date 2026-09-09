@@ -1,3 +1,4 @@
+// Whatsapp tests cover system prompt plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
   resolveWhatsAppDirectSystemPrompt,
@@ -156,6 +157,23 @@ describe("resolveWhatsAppSystemPrompt", () => {
             surface,
             createAccountConfig(surface, {
               [surface.targetId]: {},
+              "*": { systemPrompt: "wildcard prompt" },
+            }),
+          ),
+        ),
+      ).toBe("wildcard prompt");
+    },
+  );
+
+  it.each(promptSurfaceCases)(
+    "falls back to wildcard when specific $name systemPrompt is null",
+    (surface) => {
+      expect(
+        surface.resolve(
+          createParams(
+            surface,
+            createAccountConfig(surface, {
+              [surface.targetId]: { systemPrompt: null },
               "*": { systemPrompt: "wildcard prompt" },
             }),
           ),

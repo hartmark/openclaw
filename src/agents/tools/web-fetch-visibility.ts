@@ -1,19 +1,30 @@
+/**
+ * HTML visibility sanitizers for web_fetch.
+ *
+ * Removes hidden or invisible content before readable-text extraction.
+ */
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
 } from "@openclaw/normalization-core/string-coerce";
+import { readTagToken } from "./web-fetch-html-tag.js";
 
-// CSS property values that indicate an element is hidden
-const HIDDEN_STYLE_PATTERNS: Array<[string, RegExp]> = [
-  ["display", /^\s*none\s*$/i],
-  ["visibility", /^\s*hidden\s*$/i],
-  ["opacity", /^\s*0\s*$/],
-  ["font-size", /^\s*0(px|em|rem|pt|%)?\s*$/i],
-  ["text-indent", /^\s*-\d{4,}px\s*$/],
-  ["color", /^\s*transparent\s*$/i],
-  ["color", /^\s*rgba\s*\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0(?:\.0+)?\s*\)\s*$/i],
-  ["color", /^\s*hsla\s*\(\s*[\d.]+\s*,\s*[\d.]+%?\s*,\s*[\d.]+%?\s*,\s*0(?:\.0+)?\s*\)\s*$/i],
-];
+// Compile property matchers once: this list is checked for every styled element.
+const HIDDEN_STYLE_PATTERNS = (
+  [
+    ["display", /^\s*none\s*$/i],
+    ["visibility", /^\s*hidden\s*$/i],
+    ["opacity", /^\s*0\s*$/],
+    ["font-size", /^\s*0(px|em|rem|pt|%)?\s*$/i],
+    ["text-indent", /^\s*-\d{4,}px\s*$/],
+    ["color", /^\s*transparent\s*$/i],
+    ["color", /^\s*rgba\s*\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0(?:\.0+)?\s*\)\s*$/i],
+    ["color", /^\s*hsla\s*\(\s*[\d.]+\s*,\s*[\d.]+%?\s*,\s*[\d.]+%?\s*,\s*0(?:\.0+)?\s*\)\s*$/i],
+  ] satisfies Array<[string, RegExp]>
+).map(([prop, valuePattern]) => {
+  const escapedProp = prop.replace(/-/g, "\\-");
+  return [new RegExp(`(?:^|;)\\s*${escapedProp}\\s*:\\s*([^;]+)`, "i"), valuePattern] as const;
+});
 
 // Class names associated with visually hidden content
 const HIDDEN_CLASS_NAMES = new Set([
@@ -48,32 +59,34 @@ function hasHiddenClass(className: string): boolean {
 }
 
 function isStyleHidden(style: string): boolean {
-  for (const [prop, pattern] of HIDDEN_STYLE_PATTERNS) {
-    const escapedProp = prop.replace(/-/g, "\\-");
-    const match = style.match(new RegExp(`(?:^|;)\\s*${escapedProp}\\s*:\\s*([^;]+)`, "i"));
-    if (match && pattern.test(match[1])) {
+  for (const [propertyPattern, valuePattern] of HIDDEN_STYLE_PATTERNS) {
+    const match = style.match(propertyPattern);
+    const value = match?.at(1);
+    if (value && valuePattern.test(value)) {
       return true;
     }
   }
 
   // clip-path: none is not hidden, but positive percentage inset() clipping hides content.
   const clipPath = style.match(/(?:^|;)\s*clip-path\s*:\s*([^;]+)/i);
-  if (clipPath && !/^\s*none\s*$/i.test(clipPath[1])) {
-    if (/inset\s*\(\s*(?:0*\.\d+|[1-9]\d*(?:\.\d+)?)%/i.test(clipPath[1])) {
+  const clipPathValue = clipPath?.at(1);
+  if (clipPathValue && !/^\s*none\s*$/i.test(clipPathValue)) {
+    if (/inset\s*\(\s*(?:0*\.\d+|[1-9]\d*(?:\.\d+)?)%/i.test(clipPathValue)) {
       return true;
     }
   }
 
   // transform: scale(0)
   const transform = style.match(/(?:^|;)\s*transform\s*:\s*([^;]+)/i);
-  if (transform) {
-    if (/scale\s*\(\s*0\s*\)/i.test(transform[1])) {
+  const transformValue = transform?.at(1);
+  if (transformValue) {
+    if (/scale\s*\(\s*0\s*\)/i.test(transformValue)) {
       return true;
     }
-    if (/translateX\s*\(\s*-\d{4,}px\s*\)/i.test(transform[1])) {
+    if (/translateX\s*\(\s*-\d{4,}px\s*\)/i.test(transformValue)) {
       return true;
     }
-    if (/translateY\s*\(\s*-\d{4,}px\s*\)/i.test(transform[1])) {
+    if (/translateY\s*\(\s*-\d{4,}px\s*\)/i.test(transformValue)) {
       return true;
     }
   }
@@ -84,11 +97,11 @@ function isStyleHidden(style: string): boolean {
   const overflow = style.match(/(?:^|;)\s*overflow\s*:\s*([^;]+)/i);
   if (
     width &&
-    /^\s*0(px)?\s*$/i.test(width[1]) &&
+    /^\s*0(px)?\s*$/i.test(width.at(1) ?? "") &&
     height &&
-    /^\s*0(px)?\s*$/i.test(height[1]) &&
+    /^\s*0(px)?\s*$/i.test(height.at(1) ?? "") &&
     overflow &&
-    /^\s*hidden\s*$/i.test(overflow[1])
+    /^\s*hidden\s*$/i.test(overflow.at(1) ?? "")
   ) {
     return true;
   }
@@ -96,34 +109,33 @@ function isStyleHidden(style: string): boolean {
   // Offscreen positioning: left/top far negative
   const left = style.match(/(?:^|;)\s*left\s*:\s*([^;]+)/i);
   const top = style.match(/(?:^|;)\s*top\s*:\s*([^;]+)/i);
-  if (left && /^\s*-\d{4,}px\s*$/i.test(left[1])) {
+  if (left && /^\s*-\d{4,}px\s*$/i.test(left.at(1) ?? "")) {
     return true;
   }
-  if (top && /^\s*-\d{4,}px\s*$/i.test(top[1])) {
+  if (top && /^\s*-\d{4,}px\s*$/i.test(top.at(1) ?? "")) {
     return true;
   }
 
   return false;
 }
 
-function readAttribute(attrs: string, name: string): string | undefined {
-  const escapedName = name.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
-  const unquotedAttributeValue = "[^\\s\"'=<>`]+";
-  const match = attrs.match(
-    new RegExp(
-      `(?:^|\\s)${escapedName}(?:\\s*=\\s*(?:"([^"]*)"|'([^']*)'|(${unquotedAttributeValue})))?`,
-      "i",
-    ),
+// The fixed visibility attributes share one grammar; each reader compiles it once per process.
+function createAttributeReader(attribute: "aria-hidden" | "class" | "hidden" | "style" | "type") {
+  const pattern = new RegExp(
+    `(?:^|\\s)${attribute}(?:\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>\`]+)))?`,
+    "i",
   );
-  if (!match) {
-    return undefined;
-  }
-  return match[1] ?? match[2] ?? match[3] ?? "";
+  return (attrs: string): string | undefined => {
+    const match = attrs.match(pattern);
+    return match ? (match[1] ?? match[2] ?? match[3] ?? "") : undefined;
+  };
 }
 
-function hasAttribute(attrs: string, name: string): boolean {
-  return readAttribute(attrs, name) !== undefined;
-}
+const readType = createAttributeReader("type");
+const readAriaHidden = createAttributeReader("aria-hidden");
+const readHidden = createAttributeReader("hidden");
+const readClass = createAttributeReader("class");
+const readStyle = createAttributeReader("style");
 
 function shouldRemoveElement(tagNameRaw: string, attrs: string): boolean {
   const tagName = normalizeLowercaseStringOrEmpty(tagNameRaw);
@@ -132,110 +144,29 @@ function shouldRemoveElement(tagNameRaw: string, attrs: string): boolean {
     return true;
   }
 
-  if (
-    tagName === "input" &&
-    normalizeOptionalLowercaseString(readAttribute(attrs, "type")) === "hidden"
-  ) {
+  if (tagName === "input" && normalizeOptionalLowercaseString(readType(attrs)) === "hidden") {
     return true;
   }
 
-  if (normalizeOptionalLowercaseString(readAttribute(attrs, "aria-hidden")) === "true") {
+  if (normalizeOptionalLowercaseString(readAriaHidden(attrs)) === "true") {
     return true;
   }
 
-  if (hasAttribute(attrs, "hidden")) {
+  if (readHidden(attrs) !== undefined) {
     return true;
   }
 
-  const className = readAttribute(attrs, "class") ?? "";
+  const className = readClass(attrs) ?? "";
   if (hasHiddenClass(className)) {
     return true;
   }
 
-  const style = readAttribute(attrs, "style") ?? "";
+  const style = readStyle(attrs) ?? "";
   if (style && isStyleHidden(style)) {
     return true;
   }
 
   return false;
-}
-
-type HtmlTagToken = {
-  tagName: string;
-  attrs: string;
-  closing: boolean;
-  selfClosing: boolean;
-};
-
-function findTagEnd(html: string, start: number): number {
-  let quote: '"' | "'" | undefined;
-  for (let index = start + 1; index < html.length; index += 1) {
-    const char = html[index];
-    if (quote) {
-      if (char === quote) {
-        quote = undefined;
-      }
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === ">") {
-      return index;
-    }
-  }
-  return -1;
-}
-
-function readTagName(source: string, start: number): { tagName: string; end: number } | null {
-  let end = start;
-  while (end < source.length) {
-    const code = source.charCodeAt(end);
-    const isNameChar =
-      (code >= 65 && code <= 90) ||
-      (code >= 97 && code <= 122) ||
-      (code >= 48 && code <= 57) ||
-      source[end] === "-" ||
-      source[end] === "_" ||
-      source[end] === ":";
-    if (!isNameChar) {
-      break;
-    }
-    end += 1;
-  }
-  if (end === start) {
-    return null;
-  }
-  return {
-    tagName: normalizeLowercaseStringOrEmpty(source.slice(start, end)),
-    end,
-  };
-}
-
-function parseHtmlTagToken(token: string): HtmlTagToken | null {
-  let inner = token.slice(1, -1).trim();
-  if (!inner || inner.startsWith("!") || inner.startsWith("?")) {
-    return null;
-  }
-
-  const closing = inner.startsWith("/");
-  if (closing) {
-    inner = inner.slice(1).trimStart();
-  }
-
-  const name = readTagName(inner, 0);
-  if (!name) {
-    return null;
-  }
-
-  const attrs = closing ? "" : inner.slice(name.end);
-  return {
-    tagName: name.tagName,
-    attrs,
-    closing,
-    selfClosing: !closing && attrs.trimEnd().endsWith("/"),
-  };
 }
 
 function popDroppedElement(dropStack: string[], tagName: string): void {
@@ -269,44 +200,44 @@ function removeMarkedElements(html: string): string {
       continue;
     }
 
-    const tagEnd = findTagEnd(html, tagStart);
-    if (tagEnd < 0) {
+    const read = readTagToken(html, tagStart, "visibility");
+    if (!read) {
       if (dropStack.length === 0) {
         output += html.slice(tagStart);
       }
       break;
     }
 
-    const token = html.slice(tagStart, tagEnd + 1);
-    const parsed = parseHtmlTagToken(token);
+    const token = html.slice(tagStart, read.next);
+    const parsed = read.token;
     if (!parsed) {
       if (dropStack.length === 0) {
         output += token;
       }
-      cursor = tagEnd + 1;
+      cursor = read.next;
       continue;
     }
 
     if (dropStack.length > 0) {
       if (parsed.closing) {
-        popDroppedElement(dropStack, parsed.tagName);
-      } else if (!parsed.selfClosing && !HTML_VOID_ELEMENTS.has(parsed.tagName)) {
-        dropStack.push(parsed.tagName);
+        popDroppedElement(dropStack, parsed.name);
+      } else if (!parsed.selfClosing && !HTML_VOID_ELEMENTS.has(parsed.name)) {
+        dropStack.push(parsed.name);
       }
-      cursor = tagEnd + 1;
+      cursor = read.next;
       continue;
     }
 
     if (parsed.closing) {
       output += token;
-    } else if (shouldRemoveElement(parsed.tagName, parsed.attrs)) {
-      if (!parsed.selfClosing && !HTML_VOID_ELEMENTS.has(parsed.tagName)) {
-        dropStack.push(parsed.tagName);
+    } else if (shouldRemoveElement(parsed.name, parsed.attrs)) {
+      if (!parsed.selfClosing && !HTML_VOID_ELEMENTS.has(parsed.name)) {
+        dropStack.push(parsed.name);
       }
     } else {
       output += token;
     }
-    cursor = tagEnd + 1;
+    cursor = read.next;
   }
 
   return output;
@@ -314,12 +245,4 @@ function removeMarkedElements(html: string): string {
 
 export async function sanitizeHtml(html: string): Promise<string> {
   return removeMarkedElements(html);
-}
-
-// Zero-width and invisible Unicode characters used in prompt injection attacks
-const INVISIBLE_UNICODE_RE =
-  /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u206A-\u206F\uFEFF\u{E0000}-\u{E007F}]/gu;
-
-export function stripInvisibleUnicode(text: string): string {
-  return text.replace(INVISIBLE_UNICODE_RE, "");
 }

@@ -1,3 +1,4 @@
+// Provider auth result tests cover status result normalization and display metadata.
 import { describe, expect, it } from "vitest";
 import { MAX_DATE_TIMESTAMP_MS } from "../../packages/normalization-core/src/number-coercion.js";
 import { buildOauthProviderAuthResult } from "./provider-auth-result.js";
@@ -92,6 +93,15 @@ describe("buildOauthProviderAuthResult", () => {
         },
       },
     });
+
+    expect(
+      buildOauthProviderAuthResult({
+        providerId: "google",
+        defaultModel: "google/gemini-3.1-pro-preview",
+        access: "access-token",
+        configPatch: result.configPatch,
+      }).configPatch,
+    ).toBe(result.configPatch);
   });
 
   it("omits OAuth expiry values outside the Date timestamp range", () => {

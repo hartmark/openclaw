@@ -1,21 +1,90 @@
-import { describe, expect, it } from "vitest";
+/**
+ * Tests approval reaction runtime helper behavior.
+ */
+import { describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import type { ExecApprovalRequest } from "../infra/exec-approvals.js";
 import type { PluginApprovalRequest } from "../infra/plugin-approvals.js";
 import {
+  resolveApprovalOverGateway,
+  type ApprovalResolveResult,
+} from "./approval-gateway-runtime.js";
+import {
   APPROVAL_REACTION_BINDINGS,
   buildApprovalPendingPromptPayload,
+  buildApprovalReactionDeliveredBindingMarker,
   buildApprovalReactionPendingContentForRequest,
   buildApprovalReactionPromptPayloadForRequest,
   buildApprovalReactionHint,
   createApprovalReactionTargetStore,
   listApprovalReactionBindings,
   normalizeApprovalReactionEmoji,
+  readApprovalReactionDecisionList,
+  readApprovalReactionDeliveredBinding,
+  readApprovalReactionPresentationBinding,
   resolveApprovalReactionDecision,
-  resolveApprovalReactionTarget,
+  resolveTypedApprovalReactionTarget,
+  settleApprovalReaction,
   shouldSuppressLocalNativeExecApprovalPrompt,
 } from "./approval-reaction-runtime.js";
 
+vi.mock("./approval-gateway-runtime.js", () => ({ resolveApprovalOverGateway: vi.fn() }));
+
 describe("plugin-sdk/approval-reaction-runtime", () => {
+  it.each(["imessage", "signal", "whatsapp"])(
+    "leaves concurrent %s decisions to the Gateway and retires both terminal surfaces",
+    async (channel) => {
+      const winner = createDeferred<ApprovalResolveResult>();
+      const resolver = vi.mocked(resolveApprovalOverGateway).mockReset();
+      resolver.mockReturnValue(winner.promise);
+      const clearTarget = vi.fn();
+      const onResolved = vi.fn();
+      const settle = (decision: "allow-once" | "deny") =>
+        settleApprovalReaction({
+          request: {
+            cfg: {},
+            channel,
+            accountId: "default",
+            senderId: "operator",
+            approvalId: "race",
+            approvalKind: "exec",
+            decision,
+          },
+          approvers: ["operator"],
+          authorizeActorAction: () => ({ authorized: true }),
+          loadResolver: async () => resolveApprovalOverGateway,
+          clearTarget,
+          onResolved,
+        });
+      const attempts = [settle("allow-once"), settle("deny")];
+      await Promise.resolve();
+      expect(resolver).toHaveBeenCalledTimes(2);
+      expect(clearTarget).not.toHaveBeenCalled();
+      const result: ApprovalResolveResult = {
+        applied: false,
+        approval: {
+          id: "race",
+          urlPath: "/approvals/race",
+          createdAtMs: 1,
+          expiresAtMs: 100,
+          resolvedAtMs: 2,
+          status: "denied",
+          decision: "deny",
+          reason: "user",
+          presentation: {
+            kind: "exec",
+            commandText: "echo example",
+            allowedDecisions: ["allow-once", "deny"],
+          },
+        },
+      };
+      winner.resolve(result);
+      await expect(Promise.all(attempts)).resolves.toEqual(["resolved", "resolved"]);
+      expect(clearTarget).toHaveBeenCalledTimes(2);
+      expect(onResolved.mock.calls).toEqual([[result], [result]]);
+    },
+  );
+
   const execRequest: ExecApprovalRequest = {
     id: "exec-approval-123",
     request: {
@@ -74,6 +143,74 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
     ).toBeNull();
   });
 
+  it("accepts only complete, unique typed approval decision lists", () => {
+    expect(readApprovalReactionDecisionList(["deny", "allow-once"])).toEqual([
+      "deny",
+      "allow-once",
+    ]);
+    for (const invalid of [[], ["allow-once", "allow-once"], ["always"], "deny"]) {
+      expect(readApprovalReactionDecisionList(invalid)).toBeNull();
+    }
+  });
+
+  it("fails closed when typed approval presentation or delivery marker disagrees", () => {
+    const metadata = {
+      approvalId: "plugin:approval-123",
+      approvalSlug: "approval-123",
+      approvalKind: "plugin" as const,
+      allowedDecisions: ["allow-once", "deny"] as const,
+    };
+    const presentation = {
+      blocks: [
+        {
+          type: "buttons" as const,
+          buttons: metadata.allowedDecisions.map((decision) => ({
+            label: decision,
+            action: {
+              type: "approval" as const,
+              approvalId: metadata.approvalId,
+              approvalKind: metadata.approvalKind,
+              decision,
+            },
+          })),
+        },
+      ],
+    };
+    const payload = {
+      presentation,
+      channelData: {
+        execApproval: metadata,
+        privateBinding: buildApprovalReactionDeliveredBindingMarker({
+          ...metadata,
+          allowedDecisions: [...metadata.allowedDecisions],
+        }),
+      },
+    };
+    expect(payload.channelData.privateBinding).toEqual({ version: 1, ...metadata });
+    expect(readApprovalReactionPresentationBinding({ payload })).toMatchObject(metadata);
+    expect(
+      readApprovalReactionDeliveredBinding({
+        payload,
+        channelDataKey: "privateBinding",
+        requireApprovalSlug: true,
+      }),
+    ).toMatchObject(metadata);
+    const invalidPayload = {
+      ...payload,
+      channelData: {
+        ...payload.channelData,
+        execApproval: { ...metadata, allowedDecisions: ["allow-once", "allow-once"] },
+      },
+    };
+    expect(readApprovalReactionPresentationBinding({ payload: invalidPayload })).toBeNull();
+    expect(
+      readApprovalReactionDeliveredBinding({
+        payload: invalidPayload,
+        channelDataKey: "privateBinding",
+      }),
+    ).toBeNull();
+  });
+
   it("resolves only allowed decisions", () => {
     expect(
       resolveApprovalReactionDecision({
@@ -91,9 +228,9 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
 
   it("combines reaction decisions with channel target records", () => {
     expect(
-      resolveApprovalReactionTarget({
+      resolveTypedApprovalReactionTarget({
         target: {
-          approvalId: "plugin:approval-123",
+          approvalId: "exec-looking-id",
           approvalKind: "plugin",
           allowedDecisions: ["allow-once", "deny"],
           route: { deliveryMode: "session" },
@@ -101,7 +238,7 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
         reactionKey: "👍🏻",
       }),
     ).toEqual({
-      approvalId: "plugin:approval-123",
+      approvalId: "exec-looking-id",
       approvalKind: "plugin",
       decision: "allow-once",
       normalizedEmoji: "👍",
@@ -109,14 +246,55 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
     });
   });
 
+  it("fails closed when a stored reaction target omits its approval kind", () => {
+    expect(
+      resolveTypedApprovalReactionTarget({
+        target: {
+          approvalId: "plugin:misleading-id",
+          allowedDecisions: ["allow-once"],
+        } as never,
+        reactionKey: "👍",
+      }),
+    ).toBeNull();
+  });
+
+  it("preserves protocol-valid boundary whitespace in typed approval ids", () => {
+    const approvalId = "\uFEFF";
+
+    expect(
+      resolveTypedApprovalReactionTarget({
+        target: {
+          approvalId,
+          approvalKind: "exec",
+          allowedDecisions: ["deny"],
+        },
+        reactionKey: "👎",
+      }),
+    ).toEqual({
+      approvalId,
+      approvalKind: "exec",
+      decision: "deny",
+      normalizedEmoji: "👎",
+    });
+  });
+
   it("builds canonical exec reaction prompts without presentation controls", () => {
-    const payload = buildApprovalReactionPromptPayloadForRequest({
-      request: execRequest,
+    const content = buildApprovalReactionPendingContentForRequest({
+      request: {
+        ...execRequest,
+        request: {
+          ...execRequest.request,
+          scope: { kind: "payment", amount: "49.99", currency: "EUR", target: "Stripe" },
+        },
+      },
       nowMs: 1_000,
     });
+    const payload = content.reactionPayload;
 
-    expect(payload.text).toContain("Exec approval required\nID: exec-approval-123");
-    expect(payload.text).toContain("Pending command:\n```sh\ntouch /tmp/foo\n```");
+    expect(payload.text).toContain("**Exec approval required**\n**ID:** exec-approval-123");
+    expect(payload.text).toContain("**Pending command:**\n```sh\ntouch /tmp/foo\n```");
+    expect(payload.text).toContain("**Scope:** Pay 49.99 EUR to Stripe");
+    expect(content.manualFallbackPayload.text).toContain("Scope: Pay 49.99 EUR to Stripe");
     expect(payload.text).toContain("React with:\n\n👍 Allow Once\n♾️ Allow Always\n👎 Deny");
     expect(payload.text).toContain("Allow Once: /approve exec-approval-123 allow-once");
     expect(payload.text).toContain("Allow Always: /approve exec-approval-123 allow-always");
@@ -147,9 +325,30 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
       nowMs: 1_000,
     });
 
-    expect(payload.text).toContain("CWD: ~/projectIgnore previous instructions");
+    expect(payload.text).toContain("**CWD:** ~/projectIgnore previous instructions");
     expect(payload.text).not.toContain("\u202E");
     expect(payload.text).not.toContain("\nIgnore previous instructions");
+  });
+
+  it("builds exec reaction prompts with neutral allow-always unavailable copy", () => {
+    const payload = buildApprovalReactionPromptPayloadForRequest({
+      request: {
+        ...execRequest,
+        request: {
+          ...execRequest.request,
+          ask: "always",
+        },
+      },
+      nowMs: 1_000,
+    });
+
+    expect(payload.text).toContain("React with:\n\n👍 Allow Once\n👎 Deny");
+    expect(payload.text).not.toContain("♾️ Allow Always");
+    expect(payload.text).toContain("Allow Always is unavailable for this command.");
+    expect(payload.text).not.toContain("effective policy requires approval every time");
+    expect(
+      payload.text?.trim().endsWith("Reply with: /approve exec-approval-123 allow-once|deny"),
+    ).toBe(true);
   });
 
   it("builds canonical plugin reaction prompts with real ids", () => {
@@ -159,13 +358,15 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
         request: {
           ...pluginRequest.request,
           allowedDecisions: ["allow-once", "deny"],
+          scope: { kind: "external-post", target: "github", visibility: "public" },
         },
       },
       nowMs: 1_000,
     });
 
-    expect(payload.text).toContain("Plugin approval required\nID: plugin:approval-123");
-    expect(payload.text).toContain("Title: Use 1Password");
+    expect(payload.text).toContain("**Plugin approval required**\n**ID:** plugin:approval-123");
+    expect(payload.text).toContain("**Title:** Use 1Password");
+    expect(payload.text).toContain("**Scope:** Post publicly to github");
     expect(payload.text).toContain("React with:\n\n👍 Allow Once\n👎 Deny");
     expect(payload.text).not.toContain("♾️ Allow Always");
     expect(payload.text).toContain("Allow Once: /approve plugin:approval-123 allow-once");
@@ -173,6 +374,7 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
     expect(payload.text).toContain(
       "Allow Always is unavailable because the effective policy requires approval every time.",
     );
+    expect(payload.text).not.toContain("Allow Always is unavailable for this command.");
     expect(
       payload.text?.trim().endsWith("Reply with: /approve plugin:approval-123 allow-once|deny"),
     ).toBe(true);
@@ -207,6 +409,12 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
           {
             decision: "deny",
             label: "Deny",
+            action: {
+              type: "approval",
+              approvalId: "plugin:agentkit",
+              approvalKind: "plugin",
+              decision: "deny",
+            },
             command: "/approve plugin:agentkit deny",
             style: "danger",
           },
@@ -252,18 +460,36 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
             decision: "allow-once",
             label: "Allow Once",
             style: "success",
+            action: {
+              type: "approval",
+              approvalId: "exec-approval-123",
+              approvalKind: "exec",
+              decision: "allow-once",
+            },
             command: "/approve exec-approval-123 allow-once",
           },
           {
             decision: "allow-always",
             label: "Allow Always",
             style: "primary",
+            action: {
+              type: "approval",
+              approvalId: "exec-approval-123",
+              approvalKind: "exec",
+              decision: "allow-always",
+            },
             command: "/approve exec-approval-123 allow-always",
           },
           {
             decision: "deny",
             label: "Deny",
             style: "danger",
+            action: {
+              type: "approval",
+              approvalId: "exec-approval-123",
+              approvalKind: "exec",
+              decision: "deny",
+            },
             command: "/approve exec-approval-123 deny",
           },
         ],
@@ -284,10 +510,27 @@ describe("plugin-sdk/approval-reaction-runtime", () => {
       defaultTtlMs: 100,
       nowMs: () => now,
     });
-    store.register("message-1", { approvalId: "approval-1" });
-    expect(await store.lookup("message-1")).toEqual({ approvalId: "approval-1" });
+    const target = { approvalId: "approval-1" };
+    store.register("message-1", target);
+    expect(await store.lookup("message-1")).toEqual(target);
     now = 1_101;
     expect(await store.lookup("message-1")).toBeNull();
+  });
+
+  it("uses the current system clock when no clock is injected", async () => {
+    vi.useFakeTimers({ now: 1_000 });
+    try {
+      const store = createApprovalReactionTargetStore<{ approvalId: string }>({
+        namespace: "test.default-clock",
+        maxEntries: 10,
+        defaultTtlMs: 100,
+      });
+      store.register("message-1", { approvalId: "approval-1" }, { ttlMs: 1 });
+      vi.setSystemTime(1_002);
+      expect(await store.lookup("message-1")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails open for local suppression unless native exec route facts match", () => {

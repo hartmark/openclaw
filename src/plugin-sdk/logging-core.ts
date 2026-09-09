@@ -1,3 +1,6 @@
+/**
+ * Public SDK subpath for logging, diagnostics, and redaction helpers.
+ */
 export { createSubsystemLogger } from "../logging/subsystem.js";
 export {
   getChildLogger,
@@ -17,4 +20,4 @@ export {
   redactSensitiveText,
   redactToolPayloadText,
 } from "../logging/redact.js";
-export { redactIdentifier } from "../logging/redact-identifier.js";
+export { redactIdentifier } from "@openclaw/normalization-core/node-crypto";

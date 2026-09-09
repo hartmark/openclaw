@@ -1,13 +1,37 @@
+// Update status helpers for `openclaw status`.
+// Wraps registry/git update checks and formats compact update rows/hints.
+
 import { formatCliCommand } from "../cli/command-format.js";
+import { formatTimeAgo } from "../infra/format-time/format-relative.js";
 import { resolveOpenClawPackageRoot } from "../infra/openclaw-root.js";
-import { normalizeUpdateChannel, resolveRegistryUpdateChannel } from "../infra/update-channels.js";
+import {
+  normalizeUpdateChannel,
+  resolveEffectiveUpdateChannel,
+  type UpdateChannel,
+} from "../infra/update-channels.js";
 import {
   checkUpdateStatus,
   compareSemverStrings,
   type UpdateCheckResult,
+  type UpdateInstallIdentity,
 } from "../infra/update-check.js";
 import { VERSION } from "../version.js";
 
+/** Chooses a registry tag only after the status check has identified the install. */
+export function resolveStatusRegistryUpdateChannel(
+  params: UpdateInstallIdentity & {
+    configChannel?: UpdateChannel | null;
+  },
+): UpdateChannel {
+  return resolveEffectiveUpdateChannel({
+    configChannel: params.configChannel,
+    currentVersion: VERSION,
+    installKind: params.installKind,
+    git: params.git,
+  }).channel;
+}
+
+/** Runs the update check using the configured update channel and current install root. */
 export async function getUpdateCheckResult(params: {
   timeoutMs: number;
   fetchGit: boolean;
@@ -20,19 +44,30 @@ export async function getUpdateCheckResult(params: {
     argv1: process.argv[1],
     cwd: process.cwd(),
   });
-  return await checkUpdateStatus({
+  const update = await checkUpdateStatus({
     root,
     timeoutMs: params.timeoutMs,
     fetchGit: params.fetchGit,
     includeRegistry: params.includeRegistry,
-    registryChannel: resolveRegistryUpdateChannel({
-      configChannel,
-      currentVersion: VERSION,
-    }),
+    resolveRegistryChannel: ({ installKind, git }) =>
+      resolveStatusRegistryUpdateChannel({
+        configChannel,
+        installKind,
+        git,
+      }),
   });
+  if (update.installKind === "git" && update.git && !params.fetchGit) {
+    const stale = await import("../infra/update-run-ledger.js")
+      .then(({ getLatestUpdateFetchFailure }) => getLatestUpdateFetchFailure())
+      .catch(() => undefined);
+    if (stale) {
+      update.git = { ...update.git, stale, countsCached: true };
+    }
+  }
+  return update;
 }
 
-export type UpdateAvailability = {
+type UpdateAvailability = {
   available: boolean;
   hasGitUpdate: boolean;
   hasRegistryUpdate: boolean;
@@ -40,6 +75,7 @@ export type UpdateAvailability = {
   gitBehind: number | null;
 };
 
+/** Determines whether git and/or registry data indicate an available update. */
 export function resolveUpdateAvailability(update: UpdateCheckResult): UpdateAvailability {
   const latestVersion = update.registry?.latestVersion ?? null;
   const registryCmp = latestVersion ? compareSemverStrings(VERSION, latestVersion) : null;
@@ -59,6 +95,7 @@ export function resolveUpdateAvailability(update: UpdateCheckResult): UpdateAvai
   };
 }
 
+/** Formats the actionable update hint shown in status footers. */
 export function formatUpdateAvailableHint(update: UpdateCheckResult): string | null {
   const availability = resolveUpdateAvailability(update);
   if (!availability.available) {
@@ -67,7 +104,9 @@ export function formatUpdateAvailableHint(update: UpdateCheckResult): string | n
 
   const details: string[] = [];
   if (availability.hasGitUpdate && availability.gitBehind != null) {
-    details.push(`git behind ${availability.gitBehind}`);
+    details.push(
+      `git behind ${availability.gitBehind}${update.git?.countsCached ? " (cached)" : ""}`,
+    );
   }
   if (availability.hasRegistryUpdate && availability.latestVersion) {
     details.push(`npm ${availability.latestVersion}`);
@@ -76,6 +115,7 @@ export function formatUpdateAvailableHint(update: UpdateCheckResult): string | n
   return `Update available${suffix}. Run: ${formatCliCommand("openclaw update")}`;
 }
 
+/** Formats a compact one-line update summary for overview rows. */
 export function formatUpdateOneLiner(update: UpdateCheckResult): string {
   const parts: string[] = [];
 
@@ -90,6 +130,7 @@ export function formatUpdateOneLiner(update: UpdateCheckResult): string {
         if (update.installKind !== "git") {
           parts.push("up to date");
         }
+        // Git installs still show registry latest, but git ahead/behind remains the primary state.
         parts.push(`${registryLabel} ${update.registry.latestVersion}`);
       } else if (cmp != null && cmp < 0) {
         parts.push(
@@ -98,11 +139,31 @@ export function formatUpdateOneLiner(update: UpdateCheckResult): string {
             : `npm update ${update.registry.latestVersion}`,
         );
       } else {
-        parts.push(`${registryLabel} ${update.registry.latestVersion} (local newer)`);
+        parts.push(
+          update.registry.tag === "extended-stable"
+            ? `ahead of extended-stable (${update.registry.latestVersion})`
+            : `${registryLabel} ${update.registry.latestVersion} (local newer)`,
+        );
       }
       return;
     }
     if (update.registry?.error) {
+      if (update.registry.reason === "unsupported_git_channel") {
+        parts.push("extended-stable requires a package install");
+        return;
+      }
+      if (update.registry.reason === "selector_missing") {
+        parts.push("npm extended-stable selector missing");
+        return;
+      }
+      if (update.registry.reason === "selector_query_failed") {
+        parts.push("npm extended-stable query failed");
+        return;
+      }
+      if (update.registry.reason === "exact_package_mismatch") {
+        parts.push("npm extended-stable exact package verification failed");
+        return;
+      }
       parts.push(`${registryLabel} unknown`);
     }
   };
@@ -116,7 +177,15 @@ export function formatUpdateOneLiner(update: UpdateCheckResult): string {
     if (update.git.dirty === true) {
       parts.push("dirty");
     }
-    if (update.git.behind != null && update.git.ahead != null) {
+    if (update.git.stale) {
+      const { failedAtMs, detail } = update.git.stale;
+      parts.push(
+        `update check stale: last update fetch failed ${formatTimeAgo(Math.max(0, Date.now() - failedAtMs))} (${detail})`,
+      );
+      if (update.git.behind != null && update.git.ahead != null) {
+        parts.push(`cached: ahead ${update.git.ahead}, behind ${update.git.behind}`);
+      }
+    } else if (update.git.behind != null && update.git.ahead != null) {
       if (update.git.behind === 0 && update.git.ahead === 0) {
         parts.push("up to date");
       } else if (update.git.behind > 0 && update.git.ahead === 0) {
@@ -142,9 +211,6 @@ export function formatUpdateOneLiner(update: UpdateCheckResult): string {
     }
     if (update.deps.status === "missing") {
       parts.push("deps missing");
-    }
-    if (update.deps.status === "stale") {
-      parts.push("deps stale");
     }
   }
   return `Update: ${parts.join(" · ")}`;

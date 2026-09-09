@@ -1,12 +1,9 @@
-export const PLUGIN_HOST_CLEANUP_TIMEOUT_MS = 5_000;
+import { trackAsyncWork } from "../shared/async-work-scope.js";
 
-export class PluginHostCleanupTimeoutError extends Error {
-  constructor(hookId: string) {
-    super(`plugin host cleanup timed out: ${hookId}`);
-    this.name = "PluginHostCleanupTimeoutError";
-  }
-}
+/** Max time allowed for plugin host cleanup hooks before failing shutdown. */
+const PLUGIN_HOST_CLEANUP_TIMEOUT_MS = 5_000;
 
+/** Runs plugin host cleanup with a bounded timeout and clears the timer afterward. */
 export async function withPluginHostCleanupTimeout<T>(
   hookId: string,
   cleanup: () => T | Promise<T>,
@@ -14,10 +11,10 @@ export async function withPluginHostCleanupTimeout<T>(
   let timeout: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      Promise.resolve().then(cleanup),
+      trackAsyncWork(() => Promise.resolve().then(cleanup)),
       new Promise<never>((_, reject) => {
         timeout = setTimeout(() => {
-          reject(new PluginHostCleanupTimeoutError(hookId));
+          reject(new Error(`plugin host cleanup timed out: ${hookId}`));
         }, PLUGIN_HOST_CLEANUP_TIMEOUT_MS);
         timeout.unref?.();
       }),

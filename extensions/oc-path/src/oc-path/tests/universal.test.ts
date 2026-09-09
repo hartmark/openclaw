@@ -1,3 +1,5 @@
+// OC Path tests cover universal plugin behavior.
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
 import { emitMd } from "../emit.js";
 import { emitJsonc } from "../jsonc/emit.js";
@@ -6,7 +8,8 @@ import { emitJsonl } from "../jsonl/emit.js";
 import { parseJsonl } from "../jsonl/parse.js";
 import { parseOcPath } from "../oc-path.js";
 import { parseMd } from "../parse.js";
-import { detectInsertion, resolveOcPath, setOcPath } from "../universal.js";
+import { REDACTED_SENTINEL } from "../sentinel.js";
+import { resolveOcPath, setOcPath } from "../universal.js";
 import { parseYaml } from "../yaml/parse.js";
 
 function expectLeaf(
@@ -33,35 +36,6 @@ function expectInsertionPoint(match: ReturnType<typeof resolveOcPath>, container
     expect(match.container).toBe(container);
   }
 }
-
-describe("detectInsertion", () => {
-  it("returns null for plain paths", () => {
-    expect(detectInsertion(parseOcPath("oc://X.md/section/item/field"))).toBeNull();
-  });
-
-  it("detects bare `+` end-insertion at section", () => {
-    const info = detectInsertion(parseOcPath("oc://X.md/tools/+"));
-    expect(info?.marker).toBe("+");
-    expect(info?.parentPath.section).toBe("tools");
-    expect(info?.parentPath.item).toBeUndefined();
-  });
-
-  it("detects `+key` keyed insertion", () => {
-    const info = detectInsertion(parseOcPath("oc://config/plugins/+gitlab"));
-    expect(info?.marker).toEqual({ kind: "keyed", key: "gitlab" });
-  });
-
-  it("detects `+nnn` indexed insertion", () => {
-    const info = detectInsertion(parseOcPath("oc://config/items/+2"));
-    expect(info?.marker).toEqual({ kind: "indexed", index: 2 });
-  });
-
-  it("detects file-root insertion", () => {
-    const info = detectInsertion(parseOcPath("oc://session.jsonl/+"));
-    expect(info?.marker).toBe("+");
-    expect(info?.parentPath.section).toBeUndefined();
-  });
-});
 
 describe("resolveOcPath — md AST", () => {
   const md = parseMd("---\nname: github\n---\n\n## Boundaries\n\n- enabled: true\n").ast;
@@ -341,7 +315,10 @@ describe("setOcPath — jsonl leaf", () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       const out = emitJsonl(r.ast as Parameters<typeof emitJsonl>[0]);
-      expect(JSON.parse(out.split("\n")[0])).toEqual({ event: "start", n: 42 });
+      expect(JSON.parse(expectDefined(out.split("\n")[0], "first emitted JSONL line"))).toEqual({
+        event: "start",
+        n: 42,
+      });
     }
   });
 
@@ -351,7 +328,9 @@ describe("setOcPath — jsonl leaf", () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       const out = emitJsonl(r.ast as Parameters<typeof emitJsonl>[0]);
-      expect(JSON.parse(out.split("\n")[0])).toEqual({ event: "replaced" });
+      expect(JSON.parse(expectDefined(out.split("\n")[0], "replaced JSONL line"))).toEqual({
+        event: "replaced",
+      });
     }
   });
 
@@ -366,40 +345,59 @@ describe("setOcPath — jsonl leaf", () => {
 });
 
 describe("setOcPath — md insertion", () => {
-  it("appends item to section with `+`", () => {
-    const md = parseMd("## Tools\n\n- gh: GitHub CLI\n").ast;
-    const r = setOcPath(md, parseOcPath("oc://X.md/tools/+"), "docker: container CLI");
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      const out = emitMd(r.ast as Parameters<typeof emitMd>[0]);
-      expect(out).toContain("- gh: GitHub CLI");
-      expect(out).toContain("- docker: container CLI");
+  it.each([
+    ["oc://X.md/[frontmatter]/+note", "---\nname: x\n---\n"],
+    ["oc://X.md/tools/+", "## Tools\n- keep: stable\n"],
+    ["oc://X.md/+", "## Existing\n"],
+  ])("refuses sentinel-bearing Markdown insertion values at %s", (uri, raw) => {
+    const md = parseMd(raw).ast;
+    const before = structuredClone(md);
+    for (const value of [REDACTED_SENTINEL, `before${REDACTED_SENTINEL}after`]) {
+      expect(() => setOcPath(md, parseOcPath(uri), value)).toThrow(
+        expect.objectContaining({ code: "OC_EMIT_SENTINEL", path: uri }),
+      );
+      expect(md).toEqual(before);
     }
   });
 
-  it("appends new section at file root with `+`", () => {
-    const md = parseMd("## Existing\n").ast;
-    const r = setOcPath(md, parseOcPath("oc://X.md/+"), "New Section");
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      const out = emitMd(r.ast as Parameters<typeof emitMd>[0]);
-      expect(out).toContain("## Existing");
-      expect(out).toContain("## New Section");
-    }
-  });
-
-  it("adds new frontmatter key with +key", () => {
+  it("keeps the insertion-value guard separate from new frontmatter keys", () => {
     const md = parseMd("---\nname: x\n---\n").ast;
-    const r = setOcPath(
+    const result = setOcPath(
       md,
-      parseOcPath("oc://X.md/[frontmatter]/+description"),
-      "a new description",
+      parseOcPath(`oc://X.md/[frontmatter]/+${REDACTED_SENTINEL}`),
+      "safe",
     );
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      const out = emitMd(r.ast as Parameters<typeof emitMd>[0]);
-      expect(out).toContain("description: a new description");
+    expect(result).toMatchObject({
+      ok: true,
+      ast: { raw: `---\nname: x\n${REDACTED_SENTINEL}: safe\n---` },
+    });
+  });
+
+  it.each([
+    [
+      "item",
+      "## Tools\n\n- gh: __OPENCLAW_REDACTED__\n",
+      "oc://X.md/tools/+",
+      "docker: container CLI",
+      "## Tools\n\n- gh: __OPENCLAW_REDACTED__\n- docker: container CLI",
+    ],
+    ["section", "## Existing\n", "oc://X.md/+", "New Section", "## Existing\n\n## New Section"],
+    [
+      "frontmatter key",
+      "---\nname: x\n---\n",
+      "oc://X.md/[frontmatter]/+description",
+      "has: colon",
+      '---\nname: x\ndescription: "has: colon"\n---',
+    ],
+  ])("preserves output and input AST when inserting a %s", (_kind, raw, path, value, expected) => {
+    const md = parseMd(raw).ast;
+    const before = structuredClone(md);
+    const result = setOcPath(md, parseOcPath(path), value);
+    if (!result.ok || result.ast.kind !== "md") {
+      throw new Error("expected a successful Markdown insertion");
     }
+    expect(emitMd(result.ast)).toBe(expected);
+    expect(md).toEqual(before);
   });
 
   it("rejects duplicate frontmatter key on insertion", () => {
@@ -478,6 +476,23 @@ describe("setOcPath — jsonc insertion", () => {
       });
     }
   });
+
+  it("preserves comments, trailing commas, and CRLF", () => {
+    const ast = parseJsonc(
+      '{\r\n  // keep\r\n  "plugins": {\r\n    "github": "tok",\r\n  },\r\n}\r\n',
+    ).ast;
+    const r = setOcPath(ast, parseOcPath("oc://config/plugins/+gitlab"), '"new-tok"');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(emitJsonc(r.ast as Parameters<typeof emitJsonc>[0])).toBe(
+        '{\r\n  // keep\r\n  "plugins": {\r\n    "github": "tok",\r\n    "gitlab": "new-tok",\r\n  },\r\n}\r\n',
+      );
+      expectLeaf(resolveOcPath(r.ast, parseOcPath("oc://config/plugins/gitlab")), {
+        leafType: "string",
+        valueText: "new-tok",
+      });
+    }
+  });
 });
 
 describe("setOcPath — jsonl insertion (session append)", () => {
@@ -489,7 +504,10 @@ describe("setOcPath — jsonl insertion (session append)", () => {
       const out = emitJsonl(r.ast as Parameters<typeof emitJsonl>[0]);
       const lines = out.split("\n").filter((l) => l.length > 0);
       expect(lines).toHaveLength(2);
-      expect(JSON.parse(lines[1])).toEqual({ event: "step", n: 1 });
+      expect(JSON.parse(expectDefined(lines[1], "appended JSONL line"))).toEqual({
+        event: "step",
+        n: 1,
+      });
     }
   });
 
