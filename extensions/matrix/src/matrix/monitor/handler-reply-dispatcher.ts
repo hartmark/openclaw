@@ -557,7 +557,7 @@ export function createMatrixReplyDispatcher(config: {
       toolDeliveryFailureSettled = false;
       runtime.error?.(`matrix ${info.kind} reply failed: ${String(err)}`);
     },
-    onBeforeDeliverCancelled: async (_payload, info) => {
+    onBeforeDeliverCancelled: async (_payload: ReplyPayload, info: { kind: string }) => {
       // A third non-delivery path alongside deliver()'s own success/failure:
       // beforeDeliver can cancel a queued tool payload (return no payload,
       // or a failed custody claim) without ever invoking deliver() or
