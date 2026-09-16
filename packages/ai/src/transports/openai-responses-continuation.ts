@@ -192,6 +192,8 @@ function restoreRawCallIdsInDelta(
     }
   }
   if (rawCallIdByReshaped.size === 0) {
+    // No rewrite needed: `delta` is returned as-is.
+    // SAFETY: callers only read the result (assign to `input`) and never mutate it in place, so the `readonly` -> mutable widening is inert.
     return delta as unknown[];
   }
   return delta.map((item) => {
@@ -255,14 +257,20 @@ export function resolveResponsesContinuationRequest(
   ) {
     return { request, continuationStatus: "history_changed" };
   }
+  const restoredInput = restoreRawCallIdsInDelta(
+    currentInput.slice(baselineLength),
+    continuation.lastResponseItems,
+  );
+  // restoreRawCallIdsInDelta only rewrites `call_id` string fields on items
+  // already sliced from `currentInput` (itself a ResponseInput); it never
+  // adds, removes, or reshapes an item, so the result is still valid input.
+  // SAFETY: shape preserved by restoreRawCallIdsInDelta as documented above.
+  const restoredResponseInput = restoredInput as ResponseInput;
   return {
     request: {
       ...prepared,
       previous_response_id: continuation.lastResponseId,
-      input: restoreRawCallIdsInDelta(
-        currentInput.slice(baselineLength),
-        continuation.lastResponseItems,
-      ) as ResponseInput,
+      input: restoredResponseInput,
     },
     ...(prepared !== request ? { fullRequest: prepared } : {}),
     continuationStatus: "continued",
