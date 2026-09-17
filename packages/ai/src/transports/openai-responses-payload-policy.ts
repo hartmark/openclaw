@@ -149,6 +149,7 @@ function readCompatContinuationIdleMinutes(compat: unknown): number {
   if (!compat || typeof compat !== "object") {
     return DEFAULT_HTTP_CONTINUATION_IDLE_MINUTES;
   }
+  // SAFETY: already checked above that compat is a non-null object; only reads an optional numeric field.
   const value = (compat as Record<string, unknown>).responsesContinuationIdleMinutes;
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.min(value, MAX_HTTP_CONTINUATION_IDLE_MINUTES)
