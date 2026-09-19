@@ -1,9 +1,12 @@
+// Tests environment helper behavior for isolated test homes.
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   captureEnv,
   captureFullEnv,
   createPathResolutionEnv,
+  deleteTestEnvValue,
+  setTestEnvValue,
   withEnv,
   withEnvAsync,
   withPathResolutionEnv,
@@ -11,9 +14,9 @@ import {
 
 function restoreEnvKey(key: string, previous: string | undefined): void {
   if (previous === undefined) {
-    delete process.env[key];
+    deleteTestEnvValue(key);
   } else {
-    process.env[key] = previous;
+    setTestEnvValue(key, previous);
   }
 }
 
@@ -24,8 +27,8 @@ describe("env test utils", () => {
     const snapshot = captureEnv([keyA, keyB]);
     const prevA = process.env[keyA];
     const prevB = process.env[keyB];
-    process.env[keyA] = "mutated";
-    delete process.env[keyB];
+    setTestEnvValue(keyA, "mutated");
+    deleteTestEnvValue(keyB);
 
     snapshot.restore();
 
@@ -33,17 +36,28 @@ describe("env test utils", () => {
     expect(process.env[keyB]).toBe(prevB);
   });
 
-  it("captureFullEnv restores added keys and baseline values", () => {
-    const key = "OPENCLAW_ENV_TEST_ADDED";
-    const prevHome = process.env.HOME;
-    const snapshot = captureFullEnv();
-    process.env[key] = "1";
-    delete process.env.HOME;
+  it.each([
+    ["OPENCLAW_ENV_TEST_ADDED", "HOME"],
+    ["constructor", "toString"],
+    ["toString", "constructor"],
+  ])("captureFullEnv removes added %s and restores baseline %s", (addedKey, baselineKey) => {
+    const original = captureFullEnv();
+    try {
+      deleteTestEnvValue(addedKey);
+      setTestEnvValue(baselineKey, "baseline");
+      const snapshot = captureFullEnv();
+      setTestEnvValue(addedKey, "added");
+      deleteTestEnvValue(baselineKey);
 
-    snapshot.restore();
+      snapshot.restore();
 
-    expect(process.env[key]).toBeUndefined();
-    expect(process.env.HOME).toBe(prevHome);
+      expect(Object.hasOwn(process.env, addedKey)).toBe(false);
+      expect(process.env[baselineKey]).toBe("baseline");
+    } finally {
+      deleteTestEnvValue(addedKey);
+      deleteTestEnvValue(baselineKey);
+      original.restore();
+    }
   });
 
   it("withEnv applies values only inside callback", () => {
@@ -73,7 +87,7 @@ describe("env test utils", () => {
   it("withEnv can delete a key only inside callback", () => {
     const key = "OPENCLAW_ENV_TEST_SYNC_DELETE";
     const prev = process.env[key];
-    process.env[key] = "outer";
+    setTestEnvValue(key, "outer");
 
     const seen = withEnv({ [key]: undefined }, () => process.env[key]);
 
@@ -109,7 +123,7 @@ describe("env test utils", () => {
   it("withEnvAsync can delete a key only inside callback", async () => {
     const key = "OPENCLAW_ENV_TEST_ASYNC_DELETE";
     const prev = process.env[key];
-    process.env[key] = "outer";
+    setTestEnvValue(key, "outer");
 
     const seen = await withEnvAsync({ [key]: undefined }, async () => process.env[key]);
 
@@ -124,9 +138,9 @@ describe("env test utils", () => {
     const previousOpenClawHome = process.env.OPENCLAW_HOME;
     const previousStateDir = process.env.OPENCLAW_STATE_DIR;
     const previousBundledDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
-    process.env.OPENCLAW_HOME = "/srv/openclaw-home";
-    process.env.OPENCLAW_STATE_DIR = "/srv/openclaw-state";
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/srv/openclaw-bundled";
+    setTestEnvValue("OPENCLAW_HOME", "/srv/openclaw-home");
+    setTestEnvValue("OPENCLAW_STATE_DIR", "/srv/openclaw-state");
+    setTestEnvValue("OPENCLAW_BUNDLED_PLUGINS_DIR", "/srv/openclaw-bundled");
 
     try {
       const env = createPathResolutionEnv(homeDir, {
@@ -148,7 +162,7 @@ describe("env test utils", () => {
     const homeDir = path.join(path.sep, "tmp", "openclaw-home");
     const resolvedHomeDir = path.resolve(homeDir);
     const previousOpenClawHome = process.env.OPENCLAW_HOME;
-    process.env.OPENCLAW_HOME = "/srv/openclaw-home";
+    setTestEnvValue("OPENCLAW_HOME", "/srv/openclaw-home");
 
     try {
       const seen = withPathResolutionEnv(

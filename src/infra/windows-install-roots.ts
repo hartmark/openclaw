@@ -1,9 +1,11 @@
+// Resolves Windows system and Program Files install roots.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { resolveDiagnosticProcessEnv } from "./process-env.js";
 
-export const DEFAULT_WINDOWS_SYSTEM_ROOT = "C:\\Windows";
+const DEFAULT_WINDOWS_SYSTEM_ROOT = "C:\\Windows";
 const DEFAULT_PROGRAM_FILES = "C:\\Program Files";
 const DEFAULT_PROGRAM_FILES_X86 = "C:\\Program Files (x86)";
 const WINDOWS_NT_CURRENT_VERSION_KEY = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
@@ -12,12 +14,6 @@ const REG_QUERY_TIMEOUT_MS = 5_000;
 
 type QueryRegistryValue = (key: string, valueName: string) => string | null;
 type IsReadableFile = (filePath: string) => boolean;
-
-type WindowsInstallRootsTestOverrides = {
-  queryRegistryValue?: QueryRegistryValue;
-  isReadableFile?: IsReadableFile;
-};
-
 type WindowsInstallRoots = {
   systemRoot: string;
   programFiles: string;
@@ -25,9 +21,13 @@ type WindowsInstallRoots = {
   programW6432: string | null;
 };
 
-let queryRegistryValueFn: QueryRegistryValue = defaultQueryRegistryValue;
-let isReadableFileFn: IsReadableFile = defaultIsReadableFile;
-let cachedProcessInstallRoots: WindowsInstallRoots | null = null;
+const queryRegistryValueFn: QueryRegistryValue = defaultQueryRegistryValue;
+const isReadableFileFn: IsReadableFile = defaultIsReadableFile;
+let cachedProcessRoots: {
+  env: Record<string, string | undefined>;
+  systemRoot: string;
+  installRoots?: WindowsInstallRoots;
+} | null = null;
 
 function defaultIsReadableFile(filePath: string): boolean {
   try {
@@ -51,7 +51,7 @@ function trimTrailingSeparators(value: string): string {
  * Windows install roots should be local absolute directories, not drive-relative
  * paths, UNC shares, or PATH-like lists that could widen trust unexpectedly.
  */
-export function normalizeWindowsInstallRoot(raw: string | undefined): string | null {
+function normalizeWindowsInstallRoot(raw: string | undefined): string | null {
   if (typeof raw !== "string") {
     return null;
   }
@@ -126,6 +126,7 @@ function runRegQuery(
     args.push("/reg:64");
   }
   return execFileSync(regExe, args, {
+    env: resolveDiagnosticProcessEnv(),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
     timeout: REG_QUERY_TIMEOUT_MS,
@@ -153,12 +154,8 @@ function defaultQueryRegistryValue(key: string, valueName: string): string | nul
   return null;
 }
 
-function getRegistryInstallRoots(): Partial<WindowsInstallRoots> {
+function getRegistryProgramFilesRoots(): Partial<WindowsInstallRoots> {
   return {
-    systemRoot:
-      normalizeWindowsInstallRoot(
-        queryRegistryValueFn(WINDOWS_NT_CURRENT_VERSION_KEY, "SystemRoot") ?? undefined,
-      ) ?? undefined,
     programFiles:
       normalizeWindowsInstallRoot(
         queryRegistryValueFn(WINDOWS_CURRENT_VERSION_KEY, "ProgramFilesDir") ?? undefined,
@@ -176,20 +173,15 @@ function getRegistryInstallRoots(): Partial<WindowsInstallRoots> {
 
 function buildWindowsInstallRoots(
   env: Record<string, string | undefined>,
-  useRegistryRoots: boolean,
+  registryRoots: Partial<WindowsInstallRoots> = {},
 ): WindowsInstallRoots {
-  const registryRoots = useRegistryRoots ? getRegistryInstallRoots() : {};
   const envProgramW6432 = normalizeWindowsInstallRoot(
     getEnvValueCaseInsensitive(env, "ProgramW6432"),
   );
   const programW6432 = registryRoots.programW6432 ?? envProgramW6432 ?? null;
 
   return {
-    systemRoot:
-      registryRoots.systemRoot ??
-      normalizeWindowsInstallRoot(getEnvValueCaseInsensitive(env, "SystemRoot")) ??
-      normalizeWindowsInstallRoot(getEnvValueCaseInsensitive(env, "WINDIR")) ??
-      DEFAULT_WINDOWS_SYSTEM_ROOT,
+    systemRoot: registryRoots.systemRoot ?? resolveSystemRootFromEnv(env),
     programFiles:
       registryRoots.programFiles ??
       normalizeWindowsInstallRoot(getEnvValueCaseInsensitive(env, "ProgramFiles")) ??
@@ -203,14 +195,58 @@ function buildWindowsInstallRoots(
   };
 }
 
+function resolveSystemRootFromEnv(env: Record<string, string | undefined>): string {
+  return (
+    normalizeWindowsInstallRoot(getEnvValueCaseInsensitive(env, "SystemRoot")) ??
+    normalizeWindowsInstallRoot(getEnvValueCaseInsensitive(env, "WINDIR")) ??
+    DEFAULT_WINDOWS_SYSTEM_ROOT
+  );
+}
+
+function getProcessRoots() {
+  if (!cachedProcessRoots) {
+    const env: Record<string, string | undefined> = {};
+    for (const key of [
+      "SystemRoot",
+      "WINDIR",
+      "ProgramFiles",
+      "ProgramFiles(x86)",
+      "ProgramW6432",
+    ]) {
+      env[key] = getEnvValueCaseInsensitive(process.env, key);
+    }
+    cachedProcessRoots = {
+      env,
+      systemRoot:
+        normalizeWindowsInstallRoot(
+          queryRegistryValueFn(WINDOWS_NT_CURRENT_VERSION_KEY, "SystemRoot") ?? undefined,
+        ) ?? resolveSystemRootFromEnv(env),
+    };
+  }
+  return cachedProcessRoots;
+}
+
+function getWindowsSystemRoot(env: Record<string, string | undefined>): string {
+  if (env !== process.env) {
+    return resolveSystemRootFromEnv(env);
+  }
+  const roots = getProcessRoots();
+  return roots.installRoots?.systemRoot ?? roots.systemRoot;
+}
+
 export function getWindowsInstallRoots(
   env: Record<string, string | undefined> = process.env,
 ): WindowsInstallRoots {
   if (env === process.env) {
-    cachedProcessInstallRoots ??= buildWindowsInstallRoots(env, true);
-    return cachedProcessInstallRoots;
+    const roots = getProcessRoots();
+    // Defer Program Files registry probes, but retain the first lookup's env fallbacks.
+    roots.installRoots ??= buildWindowsInstallRoots(roots.env, {
+      ...getRegistryProgramFilesRoots(),
+      systemRoot: roots.systemRoot,
+    });
+    return roots.installRoots;
   }
-  return buildWindowsInstallRoots(env, false);
+  return buildWindowsInstallRoots(env);
 }
 
 export function getWindowsProgramFilesRoots(
@@ -233,15 +269,44 @@ export function getWindowsProgramFilesRoots(
   return result;
 }
 
-export function resetWindowsInstallRootsForTests(
-  overrides: WindowsInstallRootsTestOverrides = {},
-): void {
-  queryRegistryValueFn = overrides.queryRegistryValue ?? defaultQueryRegistryValue;
-  isReadableFileFn = overrides.isReadableFile ?? defaultIsReadableFile;
-  cachedProcessInstallRoots = null;
+export function getWindowsCmdExePath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return getWindowsSystem32ExePath("cmd.exe", env);
 }
 
-export const privateTestApi = {
-  getWindowsRegExeCandidates,
-  locateWindowsRegExe,
-};
+/** Queries one Windows registry string value via reg.exe; null when absent or unreadable. */
+export function queryWindowsRegistryValue(key: string, valueName: string): string | null {
+  return queryRegistryValueFn(key, valueName);
+}
+
+export function getWindowsSystem32ExePath(
+  executableName: string,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  if (
+    path.win32.basename(executableName) !== executableName ||
+    !/^[A-Za-z0-9_.-]+\.exe$/u.test(executableName)
+  ) {
+    throw new Error(`Invalid Windows System32 executable name: ${executableName}`);
+  }
+  return path.win32.join(getWindowsSystemRoot(env), "System32", executableName);
+}
+
+export function getWindowsPowerShellExePath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return path.win32.join(
+    getWindowsSystemRoot(env),
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+}
+
+export function getWindowsWmicExePath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return path.win32.join(getWindowsSystemRoot(env), "System32", "wbem", "wmic.exe");
+}

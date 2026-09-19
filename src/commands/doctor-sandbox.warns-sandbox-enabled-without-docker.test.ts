@@ -1,17 +1,24 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// Doctor sandbox tests cover warnings when sandbox mode is enabled without Docker availability.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
+import { resolveOpenClawPackageRootSync } from "../infra/openclaw-root.js";
 import type { RuntimeEnv } from "../runtime.js";
 import type { DoctorPrompter } from "./doctor-prompter.js";
 import type { DoctorRepairMode } from "./doctor-repair-mode.js";
 
 const runExec = vi.fn();
+const runCommandWithTimeout = vi.fn<typeof import("../process/exec.js").runCommandWithTimeout>();
 const note = vi.fn();
 const inspectLegacySandboxRegistryFiles = vi.fn();
 const migrateLegacySandboxRegistryFiles = vi.fn();
+const validateSandboxContainerEngineTarget = vi.fn();
 
 vi.mock("../process/exec.js", () => ({
   runExec,
-  runCommandWithTimeout: vi.fn(),
+  runCommandWithTimeout,
 }));
 
 vi.mock("../agents/sandbox.js", () => ({
@@ -21,7 +28,21 @@ vi.mock("../agents/sandbox.js", () => ({
   resolveSandboxScope: vi.fn(() => "shared"),
 }));
 
-vi.mock("../agents/sandbox/registry.js", () => ({
+vi.mock("../agents/sandbox/docker.js", () => ({
+  DOCKER_SANDBOX_ENGINE: {
+    id: "docker",
+    command: "docker",
+    displayName: "Docker",
+  },
+  PODMAN_SANDBOX_ENGINE: {
+    id: "podman",
+    command: "podman",
+    displayName: "Podman",
+  },
+  validateSandboxContainerEngineTarget,
+}));
+
+vi.mock("./doctor-sandbox-legacy-registry.js", () => ({
   inspectLegacySandboxRegistryFiles,
   migrateLegacySandboxRegistryFiles,
 }));
@@ -30,8 +51,12 @@ vi.mock("../../packages/terminal-core/src/note.js", () => ({
   note,
 }));
 
-const { maybeRepairSandboxImages, maybeRepairSandboxRegistryFiles } =
-  await import("./doctor-sandbox.js");
+const {
+  legacySandboxRegistryInspectionToHealthFinding,
+  legacySandboxRegistryInspectionToRepairEffect,
+  maybeRepairSandboxImages,
+  maybeRepairSandboxRegistryFiles,
+} = await import("./doctor-sandbox.js");
 
 describe("maybeRepairSandboxImages", () => {
   const mockRuntime: RuntimeEnv = {
@@ -53,6 +78,7 @@ describe("maybeRepairSandboxImages", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    validateSandboxContainerEngineTarget.mockResolvedValue(undefined);
     inspectLegacySandboxRegistryFiles.mockResolvedValue([]);
     migrateLegacySandboxRegistryFiles.mockResolvedValue([]);
   });
@@ -107,15 +133,19 @@ describe("maybeRepairSandboxImages", () => {
   it("warns when sandbox mode is enabled but Docker is not available", async () => {
     await runSandboxRepair({ mode: "non-main", dockerAvailable: false });
 
-    // The warning should clearly indicate sandbox is enabled but won't work
-    expect(note).toHaveBeenCalled();
     const noteCall = firstNoteCall();
-    const message = noteCall[0] as string;
-
-    // The message should warn that sandbox mode won't function, not just "skipping checks"
-    expect(message).toMatch(/sandbox.*mode.*enabled|sandbox.*won.*work|docker.*required/i);
-    // Should NOT just say "skipping sandbox image checks" - that's too mild
-    expect(message).not.toBe("Docker not available; skipping sandbox image checks.");
+    expect(noteCall).toEqual([
+      [
+        'Sandbox mode is enabled (mode: "non-main") but Docker is not available.',
+        "Docker is required for sandbox mode to function.",
+        "Isolated sessions (automations, sub-agents) will fail without Docker.",
+        "",
+        "Options:",
+        "- Install Docker and restart the gateway",
+        "- Disable sandbox mode: openclaw config set agents.defaults.sandbox.mode off",
+      ].join("\n"),
+      "Sandbox",
+    ]);
   });
 
   it("warns when sandbox mode is 'all' but Docker is not available", async () => {
@@ -145,6 +175,28 @@ describe("maybeRepairSandboxImages", () => {
         typeof call[0] === "string" && call[0].toLowerCase().includes("docker not available"),
     );
     expect(dockerUnavailableWarning).toBeUndefined();
+  });
+
+  it("validates the explicit Podman target before checking images", async () => {
+    const cfg = createSandboxConfig("all");
+    cfg.agents!.defaults!.sandbox!.backend = "podman";
+    runExec.mockResolvedValue({ stdout: "", stderr: "" });
+    validateSandboxContainerEngineTarget.mockRejectedValue(
+      Object.assign(new Error("unsupported remote Podman connection"), {
+        code: "INVALID_CONFIG",
+      }),
+    );
+
+    await expect(maybeRepairSandboxImages(cfg, mockRuntime, mockPrompter)).rejects.toThrow(
+      "unsupported remote Podman connection",
+    );
+
+    expect(runExec).toHaveBeenCalledWith("podman", ["info"], { timeoutMs: 5_000 });
+    expect(validateSandboxContainerEngineTarget).toHaveBeenCalledWith({
+      id: "podman",
+      command: "podman",
+      displayName: "Podman",
+    });
   });
 
   it("warns when Codex bwrap namespaces are blocked on a sandboxed Linux host", async () => {
@@ -238,6 +290,151 @@ describe("maybeRepairSandboxImages", () => {
       ),
     ).toBe(false);
   });
+  describe("sandbox setup script execution", () => {
+    const created: string[] = [];
+    const scriptRel = path.join("scripts", "sandbox-setup.sh");
+
+    beforeEach(() => {
+      runExec.mockImplementation(async (command: string, args: string[]) => {
+        if (command === "docker" && args[0] === "image") {
+          throw Object.assign(new Error("missing image"), { stderr: "No such image" });
+        }
+        if ((command === "docker" && args[0] === "version") || command === "unshare") {
+          return { stdout: "", stderr: "" };
+        }
+        throw new Error(`Unexpected sandbox probe: ${command} ${args.join(" ")}`);
+      });
+      runCommandWithTimeout.mockResolvedValue({
+        stdout: "",
+        stderr: "",
+        code: 0,
+        signal: null,
+        killed: false,
+        termination: "exit",
+      });
+      vi.mocked(mockPrompter.confirmRuntimeRepair).mockResolvedValue(true);
+    });
+
+    afterEach(() => {
+      runExec.mockReset();
+      runCommandWithTimeout.mockReset();
+      vi.mocked(mockPrompter.confirmRuntimeRepair).mockReset().mockResolvedValue(false);
+      for (const dir of created.splice(0)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    function mkTmp(prefix: string): string {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+      created.push(dir);
+      // Resolve macOS /var → /private/var so expectations match realpath output.
+      return fs.realpathSync(dir);
+    }
+
+    function mkRepo(prefix: string): string {
+      const repo = mkTmp(prefix);
+      fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+      fs.writeFileSync(path.join(repo, scriptRel), "#!/bin/sh\n");
+      fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "openclaw" }));
+      return repo;
+    }
+
+    type ScriptScenario = {
+      name: string;
+      setup: () => { argv1: string; cwd: string; expectedRoot: string | null; firstRoot?: string };
+    };
+
+    it.each<ScriptScenario>([
+      {
+        name: "follows a symlinked launcher to find scripts/ in the real repo",
+        setup: () => {
+          const repo = mkRepo("ocsbx-repo-");
+          const entry = path.join(repo, "openclaw.mjs");
+          fs.writeFileSync(entry, "");
+          const binDir = mkTmp("ocsbx-bin-");
+          const launcher = path.join(binDir, "openclaw");
+          fs.symlinkSync(entry, launcher);
+          return { argv1: launcher, cwd: binDir, expectedRoot: repo };
+        },
+      },
+      {
+        name: "still resolves a script relative to a non-symlinked launcher dir",
+        setup: () => {
+          const repo = mkRepo("ocsbx-direct-");
+          const entry = path.join(repo, "openclaw.mjs");
+          fs.writeFileSync(entry, "");
+          return { argv1: entry, cwd: os.tmpdir(), expectedRoot: repo };
+        },
+      },
+      {
+        name: "does not execute when the script is unreachable from cwd or the launcher",
+        setup: () => {
+          // Keep an enclosing checkout above TMPDIR outside package discovery.
+          const binDir = path.join(mkTmp("ocsbx-none-"), "node_modules", ".bin");
+          fs.mkdirSync(binDir, { recursive: true });
+          const launcher = path.join(binDir, "openclaw");
+          fs.writeFileSync(launcher, "");
+          return { argv1: launcher, cwd: binDir, expectedRoot: null };
+        },
+      },
+      {
+        name: "falls back to cwd when the launcher path does not resolve to a repo",
+        setup: () => {
+          const repo = mkRepo("ocsbx-missing-argv1-");
+          return { argv1: "/nonexistent-ocsbx/bin/openclaw", cwd: repo, expectedRoot: repo };
+        },
+      },
+      {
+        name: "keeps searching cwd after a first-root lookup finds a package without the script",
+        setup: () => {
+          const installed = mkTmp("ocsbx-installed-");
+          fs.writeFileSync(
+            path.join(installed, "package.json"),
+            JSON.stringify({ name: "openclaw" }),
+          );
+          const entry = path.join(installed, "openclaw.mjs");
+          fs.writeFileSync(entry, "");
+          // An installed package can omit scripts while source cwd still has them.
+          const repo = mkRepo("ocsbx-source-");
+          return { argv1: entry, cwd: repo, expectedRoot: repo, firstRoot: installed };
+        },
+      },
+    ])("$name", async ({ setup }) => {
+      const { argv1, cwd, expectedRoot, firstRoot } = setup();
+      if (firstRoot !== undefined) {
+        expect(resolveOpenClawPackageRootSync({ argv1, cwd })).toBe(firstRoot);
+      }
+      const originalArgv = process.argv;
+      const argv = [...originalArgv];
+      argv[1] = argv1;
+      const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+      try {
+        process.argv = argv;
+        await maybeRepairSandboxImages(createSandboxConfig("all"), mockRuntime, mockPrompter);
+      } finally {
+        process.argv = originalArgv;
+        cwdSpy.mockRestore();
+      }
+      if (expectedRoot === null) {
+        expect(runCommandWithTimeout).not.toHaveBeenCalled();
+        expect(note).toHaveBeenCalledWith(
+          "Unable to locate scripts/sandbox-setup.sh. Run it from the repo root.",
+          "Sandbox",
+        );
+        expect(mockRuntime.log).not.toHaveBeenCalled();
+      } else {
+        expect(runCommandWithTimeout).toHaveBeenCalledExactlyOnceWith(
+          ["bash", path.join(expectedRoot, scriptRel)],
+          { timeoutMs: 20 * 60 * 1000, cwd: expectedRoot },
+        );
+        expect(vi.mocked(mockRuntime.log).mock.calls).toEqual([
+          ["Running scripts/sandbox-setup.sh..."],
+          ["Completed scripts/sandbox-setup.sh."],
+        ]);
+      }
+      expect(mockRuntime.error).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("maybeRepairSandboxRegistryFiles", () => {
@@ -255,8 +452,8 @@ describe("maybeRepairSandboxRegistryFiles", () => {
     inspectLegacySandboxRegistryFiles.mockResolvedValue([
       {
         kind: "containers",
-        registryPath: "/tmp/openclaw/sandbox/containers.json",
-        shardedDir: "/tmp/openclaw/sandbox/containers",
+        path: "/tmp/openclaw/sandbox/containers.json",
+        source: "monolithic",
         exists: true,
         valid: true,
         entries: 2,
@@ -269,8 +466,8 @@ describe("maybeRepairSandboxRegistryFiles", () => {
     expect(note).toHaveBeenCalledWith(
       [
         "Legacy sandbox registry files detected.",
-        "- containers: /tmp/openclaw/sandbox/containers.json (2 entries)",
-        "Run openclaw doctor --fix to migrate them to sharded registry files.",
+        "- containers monolithic: /tmp/openclaw/sandbox/containers.json (2 entries)",
+        "Run openclaw doctor --fix to migrate them to SQLite.",
       ].join("\n"),
       "Sandbox",
     );
@@ -280,8 +477,8 @@ describe("maybeRepairSandboxRegistryFiles", () => {
     inspectLegacySandboxRegistryFiles.mockResolvedValue([
       {
         kind: "containers",
-        registryPath: "/tmp/openclaw/sandbox/containers.json",
-        shardedDir: "/tmp/openclaw/sandbox/containers",
+        path: "/tmp/openclaw/sandbox/containers.json",
+        source: "monolithic",
         exists: true,
         valid: true,
         entries: 2,
@@ -290,8 +487,6 @@ describe("maybeRepairSandboxRegistryFiles", () => {
     migrateLegacySandboxRegistryFiles.mockResolvedValue([
       {
         kind: "containers",
-        registryPath: "/tmp/openclaw/sandbox/containers.json",
-        shardedDir: "/tmp/openclaw/sandbox/containers",
         status: "migrated",
         entries: 2,
       },
@@ -304,8 +499,88 @@ describe("maybeRepairSandboxRegistryFiles", () => {
 
     expect(migrateLegacySandboxRegistryFiles).toHaveBeenCalledTimes(1);
     expect(note).toHaveBeenCalledWith(
-      "- Migrated containers registry from /tmp/openclaw/sandbox/containers.json into 2 shards.",
+      "- Migrated containers registry into 2 SQLite rows.",
       "Doctor changes",
+    );
+  });
+
+  it("maps legacy registry files to structured findings and dry-run effects", () => {
+    const monolithicFile = {
+      kind: "containers",
+      path: "/tmp/openclaw/sandbox/containers.json",
+      source: "monolithic",
+      exists: true,
+      valid: true,
+      entries: 2,
+    } as const;
+    const shardedFile = {
+      ...monolithicFile,
+      path: "/tmp/openclaw/sandbox/containers",
+      source: "sharded",
+    } as const;
+
+    expect(legacySandboxRegistryInspectionToHealthFinding(monolithicFile)).toEqual(
+      expect.objectContaining({
+        checkId: "core/doctor/sandbox/registry-files",
+        severity: "warning",
+        path: "/tmp/openclaw/sandbox/containers.json",
+        fixHint: expect.stringContaining("openclaw doctor --fix"),
+      }),
+    );
+    expect(legacySandboxRegistryInspectionToRepairEffect(monolithicFile)).toEqual({
+      kind: "state",
+      action: "would-migrate-legacy-sandbox-registry",
+      target: "/tmp/openclaw/sandbox/containers.json",
+      dryRunSafe: false,
+    });
+    expect(legacySandboxRegistryInspectionToHealthFinding(shardedFile)).toEqual(
+      expect.objectContaining({
+        path: "/tmp/openclaw/sandbox/containers",
+        message: expect.stringContaining(
+          "- containers sharded: /tmp/openclaw/sandbox/containers (2 entries)",
+        ),
+      }),
+    );
+    expect(legacySandboxRegistryInspectionToRepairEffect(shardedFile)).toEqual(
+      expect.objectContaining({
+        target: "/tmp/openclaw/sandbox/containers",
+      }),
+    );
+  });
+
+  it("maps invalid legacy registry files to quarantine effects", () => {
+    expect(
+      legacySandboxRegistryInspectionToRepairEffect({
+        kind: "browsers",
+        path: "/tmp/openclaw/sandbox/browsers.json",
+        source: "monolithic",
+        exists: true,
+        valid: false,
+        entries: 0,
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        action: "would-quarantine-legacy-sandbox-registry",
+        target: "/tmp/openclaw/sandbox/browsers.json",
+      }),
+    );
+  });
+
+  it("maps empty legacy registry files to removal effects", () => {
+    expect(
+      legacySandboxRegistryInspectionToRepairEffect({
+        kind: "containers",
+        path: "/tmp/openclaw/sandbox/containers.json",
+        source: "monolithic",
+        exists: true,
+        valid: true,
+        entries: 0,
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        action: "would-remove-empty-legacy-sandbox-registry",
+        target: "/tmp/openclaw/sandbox/containers.json",
+      }),
     );
   });
 });

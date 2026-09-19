@@ -1,11 +1,33 @@
-export {
+import { normalizeOptionalString, type FastMode } from "@openclaw/normalization-core/string-coerce";
+import { Type, type Static } from "typebox";
+import type { SessionRow } from "../../../packages/gateway-protocol/src/schema/sessions-row.js";
+import {
+  SessionCreatedActorSchema,
+  SessionRowSchema,
+} from "../../../packages/gateway-protocol/src/schema/sessions-row.js";
+import { getRuntimeConfig } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { parseRawSessionConversationRef } from "../../sessions/session-key-utils.js";
+import type { FastModeSource } from "../../shared/fast-mode.js";
+import { stringEnum } from "../schema/typebox.js";
+/**
+ * Shared session-tool data shapes and classification helpers.
+ *
+ * Keeps list/send/status tools aligned on rows, visibility context, and compact kind/channel labels.
+ */
+import {
   createAgentToAgentPolicy,
-  createSessionVisibilityGuard,
-  createSessionVisibilityRowChecker,
   resolveEffectiveSessionToolsVisibility,
   resolveSandboxedSessionToolContext,
 } from "./sessions-access.js";
-import { resolveSandboxedSessionToolContext } from "./sessions-access.js";
+export {
+  createSessionVisibilityRowChecker,
+  formatSessionToolAccessDenial,
+  recordSessionToolActionFact,
+  resolveEffectiveSessionToolsVisibility,
+  resolveSandboxedSessionToolContext,
+  resolveSessionToolAccess,
+} from "./sessions-access.js";
 export {
   resolveCurrentSessionClientAlias,
   resolveDisplaySessionKey,
@@ -13,57 +35,105 @@ export {
   resolveMainSessionAlias,
   resolveSessionReference,
   resolveVisibleSessionReference,
+  isExpectedSessionLookupMiss,
   shouldResolveSessionIdInput,
 } from "./sessions-resolution.js";
-export {
-  extractAssistantText,
-  sanitizeTextContent,
-  stripToolMessages,
-} from "./chat-history-text.js";
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { getRuntimeConfig } from "../../config/config.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
 
-export type SessionKind = "main" | "group" | "cron" | "hook" | "node" | "other";
+/** Coarse session kind used by session list/status tools. */
+export const SESSION_LIST_KINDS = ["main", "group", "cron", "hook", "node", "other"] as const;
+type SessionKind = (typeof SESSION_LIST_KINDS)[number];
 
-export type SessionListDeliveryContext = {
+const SESSION_KIND_BY_CLASSIFICATION: Readonly<Record<string, SessionKind>> = {
+  main: "main",
+  global: "main",
+  group: "group",
+  channel: "group",
+  cron: "cron",
+  hook: "hook",
+  node: "node",
+};
+
+/** Delivery target metadata attached to session rows. */
+type SessionListDeliveryContext = {
   channel?: string;
   to?: string;
   accountId?: string;
   threadId?: string | number;
 };
 
-export type SessionRunStatus = "running" | "done" | "failed" | "killed" | "timeout";
+const SessionInventoryActorSchema = Type.Omit(SessionCreatedActorSchema, ["avatarUrl"]);
 
-export type SessionListRow = {
-  key: string;
-  agentId?: string;
-  kind: SessionKind;
-  channel: string;
+/** Focused model-facing row contract derived from the Gateway protocol projection. */
+export const SessionListRowSchema = Type.Object(
+  {
+    ...Type.Pick(SessionRowSchema, [
+      "key",
+      "sessionId",
+      "label",
+      "worktree",
+      "repositoryWorkspaceId",
+      "repository",
+      "execCwd",
+      "spawnedCwd",
+      "spawnedWorkspaceDir",
+      "projectId",
+      "workspaceDir",
+      "displayName",
+      "derivedTitle",
+      "lastMessagePreview",
+      "parentSessionKey",
+      "model",
+      "contextTokens",
+      "totalTokens",
+      "status",
+      "childSessions",
+    ]).properties,
+    agentId: Type.String(),
+    kind: stringEnum(SESSION_LIST_KINDS),
+    channel: Type.String(),
+    archived: Type.Boolean(),
+    pinned: Type.Boolean(),
+    createdActor: Type.Optional(SessionInventoryActorSchema),
+    owner: Type.Optional(
+      Type.Object({ actor: SessionInventoryActorSchema }, { additionalProperties: false }),
+    ),
+    group: Type.Optional(
+      Type.String({
+        description: 'Custom sidebar group membership; unrelated to kind "group" (group chats).',
+      }),
+    ),
+    updatedAt: Type.Optional(Type.Number()),
+    stateVersion: Type.Optional(Type.Number()),
+    abortedLastRun: Type.Optional(Type.Boolean()),
+    messages: Type.Optional(Type.Array(Type.Unknown())),
+  },
+  { additionalProperties: false },
+);
+
+/** Full Gateway session row consumed by session orchestration internals. */
+export type GatewaySessionListRow = Omit<
+  SessionRow,
+  "classification" | "contextTokens" | "totalTokens"
+> & {
+  classification: NonNullable<SessionRow["classification"]>;
+  contextTokens?: number | null;
+  totalTokens?: number | null;
   origin?: {
     provider?: string;
     accountId?: string;
   };
-  spawnedBy?: string;
-  label?: string;
-  displayName?: string;
-  derivedTitle?: string;
-  lastMessagePreview?: string;
-  parentSessionKey?: string;
+  category?: string;
   deliveryContext?: SessionListDeliveryContext;
-  updatedAt?: number | null;
-  sessionId?: string;
-  model?: string;
-  contextTokens?: number | null;
-  totalTokens?: number | null;
-  estimatedCostUsd?: number;
-  status?: SessionRunStatus;
+  stateVersion?: number;
   startedAt?: number;
   endedAt?: number;
   runtimeMs?: number;
   childSessions?: string[];
   thinkingLevel?: string;
-  fastMode?: boolean;
+  fastMode?: FastMode;
+  effectiveFastMode?: FastMode;
+  effectiveFastModeSource?: FastModeSource;
+  fastAutoOnSeconds?: number;
   verboseLevel?: string;
   reasoningLevel?: string;
   elevatedLevel?: string;
@@ -79,50 +149,48 @@ export type SessionListRow = {
   messages?: unknown[];
 };
 
+/** Focused model-facing row returned by sessions_list. */
+export type SessionListRow = Static<typeof SessionListRowSchema>;
+
+/** Resolves config plus sandbox visibility context for a session tool call. */
 export function resolveSessionToolContext(opts?: {
+  agentId?: string;
   agentSessionKey?: string;
+  sessionReadScopeKey?: string;
+  requesterAgentIdOverride?: string;
   sandboxed?: boolean;
   config?: OpenClawConfig;
 }) {
   const cfg = opts?.config ?? getRuntimeConfig();
   return {
     cfg,
+    a2aPolicy: createAgentToAgentPolicy(cfg),
+    // Only read-tool constructors accept this host-bound scope. The temporary
+    // auxiliary run keeps its execution identity but can read just the observed session.
+    sessionVisibility: opts?.sessionReadScopeKey
+      ? ("self" as const)
+      : resolveEffectiveSessionToolsVisibility({ cfg, sandboxed: opts?.sandboxed === true }),
     ...resolveSandboxedSessionToolContext({
       cfg,
-      agentSessionKey: opts?.agentSessionKey,
+      agentSessionKey: opts?.sessionReadScopeKey ?? opts?.agentSessionKey,
+      requesterAgentId: opts?.requesterAgentIdOverride ?? opts?.agentId,
       sandboxed: opts?.sandboxed,
     }),
   };
 }
 
-export function classifySessionKind(params: {
-  key: string;
-  gatewayKind?: string | null;
-  alias: string;
-  mainKey: string;
+/** Projects the Gateway's authoritative classification into the tool's coarse kinds. */
+export function classifySessionListKind(params: {
+  classification: NonNullable<GatewaySessionListRow["classification"]>;
+  peerKind?: GatewaySessionListRow["peerKind"];
 }): SessionKind {
-  const key = params.key;
-  if (key === params.alias || key === params.mainKey) {
-    return "main";
+  if (params.classification === "thread") {
+    return params.peerKind === "group" || params.peerKind === "channel" ? "group" : "other";
   }
-  if (key.startsWith("cron:")) {
-    return "cron";
-  }
-  if (key.startsWith("hook:")) {
-    return "hook";
-  }
-  if (key.startsWith("node-") || key.startsWith("node:")) {
-    return "node";
-  }
-  if (params.gatewayKind === "group") {
-    return "group";
-  }
-  if (key.includes(":group:") || key.includes(":channel:")) {
-    return "group";
-  }
-  return "other";
+  return SESSION_KIND_BY_CLASSIFICATION[params.classification] ?? "other";
 }
 
+/** Derives the best channel label for a session row. */
 export function deriveChannel(params: {
   key: string;
   kind: SessionKind;
@@ -140,9 +208,5 @@ export function deriveChannel(params: {
   if (lastChannel) {
     return lastChannel;
   }
-  const parts = params.key.split(":").filter(Boolean);
-  if (parts.length >= 3 && (parts[1] === "group" || parts[1] === "channel")) {
-    return parts[0];
-  }
-  return "unknown";
+  return parseRawSessionConversationRef(params.key)?.channel ?? "unknown";
 }

@@ -1,19 +1,16 @@
-export type EmbeddedRunStageTiming = {
-  name: string;
-  durationMs: number;
-  elapsedMs: number;
-};
+import { isMainThread, threadId } from "node:worker_threads";
+import {
+  createStageTimingTracker,
+  formatStageTimings,
+  type StageTimingSummary,
+} from "../../../shared/stage-timing.js";
 
-export type EmbeddedRunStageSummary = {
-  totalMs: number;
-  stages: EmbeddedRunStageTiming[];
-};
+type EmbeddedRunStageSummary = StageTimingSummary;
 
-export type EmbeddedRunStageTracker = {
-  mark: (name: string) => void;
-  snapshot: () => EmbeddedRunStageSummary;
-};
+/** Lightweight monotonic-ish stage tracker used for embedded run startup diagnostics. */
+type EmbeddedRunStageTracker = ReturnType<typeof createStageTimingTracker>;
 
+/** Canonical stage names for dispatch-time embedded attempt diagnostics. */
 export const EMBEDDED_RUN_ATTEMPT_DISPATCH_STAGE = {
   workspace: "attempt-workspace",
   prompt: "attempt-prompt",
@@ -24,35 +21,18 @@ export const EMBEDDED_RUN_ATTEMPT_DISPATCH_STAGE = {
 const EMBEDDED_RUN_STAGE_WARN_TOTAL_MS = 10_000;
 const EMBEDDED_RUN_STAGE_WARN_STAGE_MS = 5_000;
 
+/**
+ * Creates an append-only stage tracker. `mark` records time since the previous
+ * mark. Explicit spans do not advance that checkpoint; snapshots do not mutate
+ * the recorded stage list.
+ */
 export function createEmbeddedRunStageTracker(options?: {
   now?: () => number;
 }): EmbeddedRunStageTracker {
-  const now = options?.now ?? Date.now;
-  const startedAt = now();
-  let previousAt = startedAt;
-  const stages: EmbeddedRunStageTiming[] = [];
-
-  const toMs = (value: number) => Math.max(0, Math.round(value));
-
-  return {
-    mark(name) {
-      const currentAt = now();
-      stages.push({
-        name,
-        durationMs: toMs(currentAt - previousAt),
-        elapsedMs: toMs(currentAt - startedAt),
-      });
-      previousAt = currentAt;
-    },
-    snapshot() {
-      return {
-        totalMs: toMs(now() - startedAt),
-        stages: stages.slice(),
-      };
-    },
-  };
+  return createStageTimingTracker(options?.now ?? Date.now);
 }
 
+/** Returns true when either total runtime or any single stage exceeds warning thresholds. */
 export function shouldWarnEmbeddedRunStageSummary(
   summary: EmbeddedRunStageSummary,
   options?: {
@@ -68,15 +48,45 @@ export function shouldWarnEmbeddedRunStageSummary(
   );
 }
 
+/**
+ * Builds the shared "emit stage summary" closure used by run startup and
+ * attempt prep: warn when thresholds trip, trace otherwise, stay silent when
+ * neither applies.
+ */
+export function createEmbeddedRunStageSummaryEmitter(options: {
+  label: string;
+  log: {
+    isEnabled: (level: "trace") => boolean;
+    warn: (message: string) => void;
+    trace: (message: string) => void;
+  };
+  runId: string;
+  sessionId?: string;
+  tracker: EmbeddedRunStageTracker;
+}): (phase: string) => void {
+  return (phase) => {
+    const summary = options.tracker.snapshot();
+    const shouldWarn = shouldWarnEmbeddedRunStageSummary(summary);
+    if (!shouldWarn && !options.log.isEnabled("trace")) {
+      return;
+    }
+    const message = formatEmbeddedRunStageSummary(
+      `[trace:embedded-run] ${options.label}: runId=${options.runId} sessionId=${options.sessionId} phase=${phase}`,
+      summary,
+    );
+    if (shouldWarn) {
+      options.log.warn(message);
+    } else {
+      options.log.trace(message);
+    }
+  };
+}
+
+/** Formats stage timing into compact log text for startup/attempt diagnostics. */
 export function formatEmbeddedRunStageSummary(
   prefix: string,
   summary: EmbeddedRunStageSummary,
 ): string {
-  const stages =
-    summary.stages.length > 0
-      ? summary.stages
-          .map((stage) => `${stage.name}:${stage.durationMs}ms@${stage.elapsedMs}ms`)
-          .join(",")
-      : "none";
-  return `${prefix} totalMs=${summary.totalMs} stages=${stages}`;
+  const stages = formatStageTimings(summary.stages);
+  return `${prefix} pid=${process.pid} threadId=${threadId} isMainThread=${isMainThread} totalMs=${summary.totalMs} stages=${stages}`;
 }

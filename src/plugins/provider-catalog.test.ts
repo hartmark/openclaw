@@ -1,3 +1,4 @@
+// Covers provider catalog entries derived from plugin metadata.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import type { ModelProviderConfig } from "../config/types.models.js";
@@ -58,6 +59,38 @@ function expectPairedCatalogProviders(
     providers: expected,
   });
 }
+
+describe("findCatalogTemplate", () => {
+  it("keeps template priority and the first matching catalog entry", () => {
+    const fallback = { provider: "demo", id: "fallback" };
+    const preferred = { provider: " DEMO ", id: " Preferred " };
+    const duplicate = { provider: "demo", id: "preferred" };
+    const entries = [fallback, { provider: "other", id: "preferred" }, preferred, duplicate];
+
+    expect(
+      findCatalogTemplate({
+        entries,
+        providerId: "demo",
+        templateIds: ["missing", "PREFERRED", "fallback"],
+      }),
+    ).toBe(preferred);
+  });
+
+  const sparseTemplateIds: string[] = [];
+  sparseTemplateIds.length = 1;
+
+  it.each([
+    { name: "empty", templateIds: [], matches: false },
+    { name: "sparse", templateIds: sparseTemplateIds, matches: false },
+    { name: "missing", templateIds: ["missing"], matches: false },
+    { name: "explicitly blank", templateIds: [""], matches: true },
+  ])("preserves $name template selection", ({ templateIds, matches }) => {
+    const entry = { provider: "demo", id: "" };
+    expect(findCatalogTemplate({ entries: [entry], providerId: "demo", templateIds })).toBe(
+      matches ? entry : undefined,
+    );
+  });
+});
 
 function createSingleCatalogProvider(overrides: Partial<ModelProviderConfig> & { apiKey: string }) {
   return {

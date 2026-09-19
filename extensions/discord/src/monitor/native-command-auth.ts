@@ -4,6 +4,7 @@ import { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/dangerous-na
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/runtime-group-policy";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveDiscordAccountAllowFrom, resolveDiscordAccountDmPolicy } from "../accounts.js";
+import { resolveDiscordCommandOwnerAllowFrom } from "../command-owners.js";
 import type { AutocompleteInteraction, Guild } from "../internal/discord.js";
 import {
   normalizeDiscordAllowList,
@@ -20,7 +21,7 @@ import type { DiscordConfig } from "./native-command.types.js";
 import { resolveDiscordNativeInteractionChannelContext } from "./native-interaction-channel-context.js";
 import { resolveDiscordSenderIdentity } from "./sender-identity.js";
 
-export function resolveDiscordNativeCommandAllowlistAccess(params: {
+function resolveDiscordNativeCommandAllowlistAccess(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
   sender: { id: string; name?: string; tag?: string };
@@ -113,36 +114,6 @@ export function resolveDiscordNativeCommandChannelAccessContext(params: {
   return { commandsAllowFromAccess, guildInfo, channelConfig } as const;
 }
 
-export function resolveDiscordCommandOwnerAllowFrom(cfg: OpenClawConfig): string[] | undefined {
-  const raw = cfg.commands?.ownerAllowFrom;
-  if (!Array.isArray(raw) || raw.length === 0) {
-    return undefined;
-  }
-  const entries: string[] = [];
-  for (const entry of raw) {
-    const trimmed = normalizeOptionalString(String(entry ?? "")) ?? "";
-    if (!trimmed) {
-      continue;
-    }
-    const separatorIndex = trimmed.indexOf(":");
-    if (separatorIndex > 0) {
-      const prefix = trimmed.slice(0, separatorIndex).toLowerCase();
-      if (prefix === "discord") {
-        const remainder = normalizeOptionalString(trimmed.slice(separatorIndex + 1)) ?? "";
-        if (remainder) {
-          entries.push(remainder);
-        }
-        continue;
-      }
-      if (prefix !== "user" && prefix !== "pk") {
-        continue;
-      }
-    }
-    entries.push(trimmed);
-  }
-  return entries.length > 0 ? entries : undefined;
-}
-
 export async function resolveDiscordGuildNativeCommandAuthorized(params: {
   cfg: OpenClawConfig;
   accountId: string;
@@ -233,6 +204,7 @@ export function resolveDiscordNativeGroupDmAccess(params: {
 }
 
 export async function resolveDiscordNativeAutocompleteAuthorized(params: {
+  isPolicyCurrent?: () => boolean;
   interaction: AutocompleteInteraction;
   cfg: OpenClawConfig;
   discordConfig: DiscordConfig;
@@ -259,13 +231,16 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
     channel: interaction.channel,
     client: interaction.client,
     hasGuild: Boolean(interaction.guild),
-    channelIdFallback: "",
+    channelIdFallback: interaction.rawData.channel_id ?? "",
   });
+  if (params.isPolicyCurrent?.() === false) {
+    return false;
+  }
   const memberRoleIds = Array.isArray(interaction.rawData.member?.roles)
     ? interaction.rawData.member.roles.map((roleId: string) => roleId)
     : [];
   const allowNameMatching = isDangerousNameMatchingEnabled(discordConfig);
-  const useAccessGroups = cfg.commands?.useAccessGroups !== false;
+  const useAccessGroups = true;
   const configuredDmAllowFrom =
     resolveDiscordAccountAllowFrom({
       cfg,
@@ -336,7 +311,7 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
       cfg,
       rest: interaction.client.rest,
     });
-    if (dmAccess.senderAccess.decision !== "allow") {
+    if (params.isPolicyCurrent?.() === false || dmAccess.senderAccess.decision !== "allow") {
       return false;
     }
   }
@@ -369,7 +344,7 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
     }
   }
   if (!isDirectMessage) {
-    return resolveDiscordGuildNativeCommandAuthorized({
+    const authorized = await resolveDiscordGuildNativeCommandAuthorized({
       cfg,
       accountId,
       discordConfig,
@@ -383,6 +358,7 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
       ownerAllowListConfigured: ownerAllowList != null,
       ownerAllowed: ownerOk,
     });
+    return authorized && params.isPolicyCurrent?.() !== false;
   }
-  return true;
+  return params.isPolicyCurrent?.() !== false;
 }

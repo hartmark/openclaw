@@ -1,3 +1,4 @@
+// Shared option/contribution contracts for setup, onboarding, and doctor flow UIs.
 type FlowDocsLink = {
   path: string;
   label?: string;
@@ -20,9 +21,11 @@ export type FlowOption<Value extends string = string> = {
   group?: FlowOptionGroup;
   docs?: FlowDocsLink;
   assistantPriority?: number;
-  assistantVisibility?: "visible" | "manual-only";
+  assistantVisibility?: "visible" | "manual-only" | "detected-only";
+  modelTarget?: "utility";
 };
 
+/** Generic contribution envelope used by plugin/core setup surfaces. */
 export type FlowContribution<Value extends string = string> = {
   id: string;
   kind: FlowContributionKind;
@@ -31,6 +34,7 @@ export type FlowContribution<Value extends string = string> = {
   source?: string;
 };
 
+/** Sorts UI flow contributions deterministically by visible label, then value. */
 export function sortFlowContributionsByLabel<T extends FlowContribution>(
   contributions: readonly T[],
 ): T[] {

@@ -1,15 +1,32 @@
+// Matrix tests cover thread context plugin behavior.
 import { describe, expect, it, vi } from "vitest";
-import { createPollStartEvent } from "./test-events.js";
 import {
-  createMatrixThreadContextResolver,
-  summarizeMatrixThreadStarterEvent,
-} from "./thread-context.js";
+  bundledReplacementContentCases,
+  createBundledReplacementEvent,
+  createPollStartEvent,
+  invalidBundledReplacementCases,
+} from "./test-events.js";
+import { createMatrixThreadContextResolver } from "./thread-context.js";
 import type { MatrixRawEvent } from "./types.js";
 
+async function resolveThreadSummary(event: MatrixRawEvent): Promise<string | undefined> {
+  const resolveThreadContext = createMatrixThreadContextResolver({
+    client: { getEvent: vi.fn(async () => event) } as never,
+    getMemberDisplayName: vi.fn(async () => "Alice"),
+    logVerboseMessage: () => {},
+  });
+  return (
+    await resolveThreadContext({
+      roomId: "!room:example.org",
+      threadRootId: event.event_id ?? "$root",
+    })
+  ).summary;
+}
+
 describe("matrix thread context", () => {
-  it("summarizes thread starter events from body text", () => {
+  it("summarizes thread starter events from body text", async () => {
     expect(
-      summarizeMatrixThreadStarterEvent({
+      await resolveThreadSummary({
         event_id: "$root",
         sender: "@alice:example.org",
         type: "m.room.message",
@@ -22,9 +39,52 @@ describe("matrix thread context", () => {
     ).toBe("Thread starter body");
   });
 
-  it("marks media-only thread starter events instead of returning bare filenames", () => {
+  it.each(bundledReplacementContentCases)(
+    "uses the latest bundled $name when summarizing an edited thread root",
+    async ({ options, expected }) => {
+      expect(await resolveThreadSummary(createBundledReplacementEvent("$root", options))).toBe(
+        expected,
+      );
+    },
+  );
+
+  it.each(invalidBundledReplacementCases)(
+    "does not summarize a bundled thread-root replacement from $name",
+    async ({ options }) => {
+      expect(await resolveThreadSummary(createBundledReplacementEvent("$root", options))).toBe(
+        "original text",
+      );
+    },
+  );
+
+  it("does not revive a bundled replacement from a redacted thread root", async () => {
     expect(
-      summarizeMatrixThreadStarterEvent({
+      await resolveThreadSummary(
+        createBundledReplacementEvent("$root", { content: {}, redacted: true }),
+      ),
+    ).toBe("Matrix m.room.message event");
+  });
+
+  it("truncates long thread starter bodies on code-point boundaries", async () => {
+    const summary = await resolveThreadSummary({
+      event_id: "$root",
+      sender: "@alice:example.org",
+      type: "m.room.message",
+      origin_server_ts: Date.now(),
+      content: {
+        msgtype: "m.text",
+        // 496 "a" + astral emoji (surrogate pair at units 496-497) + tail.
+        // A raw slice(0, 497) would cut the pair and leave a lone high surrogate.
+        body: `${"a".repeat(496)}\u{1F600}bcd`,
+      },
+    } as MatrixRawEvent);
+    expect(summary).toBe(`${"a".repeat(496)}...`);
+    expect(summary && /[\uD800-\uDFFF]/.test(summary)).toBe(false);
+  });
+
+  it("marks media-only thread starter events instead of returning bare filenames", async () => {
+    expect(
+      await resolveThreadSummary({
         event_id: "$root",
         sender: "@alice:example.org",
         type: "m.room.message",
@@ -78,6 +138,42 @@ describe("matrix thread context", () => {
     expect(getMemberDisplayName).toHaveBeenCalledTimes(1);
   });
 
+  it("evicts the oldest thread context despite a cache hit when exceeding 256 entries", async () => {
+    const getEvent = vi.fn(async (_roomId: string, eventId: string) => ({
+      event_id: eventId,
+      sender: "@alice:example.org",
+      type: "m.room.message",
+      origin_server_ts: Date.now(),
+      content: { msgtype: "m.text", body: `msg-${eventId}` },
+    }));
+    const resolveThreadContext = createMatrixThreadContextResolver({
+      client: { getEvent } as never,
+      getMemberDisplayName: vi.fn(async () => "Alice"),
+      logVerboseMessage: () => {},
+    });
+    const roomId = "!room:example.org";
+    const oldest = await resolveThreadContext({ roomId, threadRootId: "$event-0" });
+    const nextOldest = await resolveThreadContext({ roomId, threadRootId: "$event-1" });
+    for (let i = 2; i < 256; i += 1) {
+      await resolveThreadContext({ roomId, threadRootId: `$event-${i}` });
+    }
+    expect(await resolveThreadContext({ roomId, threadRootId: "$event-0" })).toBe(oldest);
+    expect(getEvent).toHaveBeenCalledTimes(256);
+
+    await resolveThreadContext({ roomId, threadRootId: "$event-256" });
+
+    // Check the survivor before refetching the victim triggers another eviction.
+    expect(await resolveThreadContext({ roomId, threadRootId: "$event-1" })).toBe(nextOldest);
+    expect(getEvent).toHaveBeenCalledTimes(257);
+    expect(await resolveThreadContext({ roomId, threadRootId: "$event-0" })).not.toBe(oldest);
+    expect(getEvent).toHaveBeenCalledTimes(258);
+    for (let i = 0; i <= 256; i += 1) {
+      expect(getEvent.mock.calls.filter(([, eventId]) => eventId === `$event-${i}`)).toHaveLength(
+        i === 0 ? 2 : 1,
+      );
+    }
+  });
+
   it("does not cache thread starter fetch failures", async () => {
     const getEvent = vi
       .fn()
@@ -126,8 +222,8 @@ describe("matrix thread context", () => {
     expect(getMemberDisplayName).toHaveBeenCalledTimes(1);
   });
 
-  it("summarizes poll start thread roots from poll content", () => {
-    expect(summarizeMatrixThreadStarterEvent(createPollStartEvent("$root"))).toBe(
+  it("summarizes poll start thread roots from poll content", async () => {
+    expect(await resolveThreadSummary(createPollStartEvent("$root"))).toBe(
       "[Poll]\nLunch?\n\n1. Pizza\n2. Sushi",
     );
   });

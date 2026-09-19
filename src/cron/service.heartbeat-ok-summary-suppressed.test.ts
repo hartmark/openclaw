@@ -1,3 +1,4 @@
+// Heartbeat summary tests cover suppression of successful heartbeat summaries.
 import { describe, expect, it, vi } from "vitest";
 import { CronService } from "./service.js";
 import { setupCronServiceSuite, writeCronStoreSnapshot } from "./service.test-harness.js";
@@ -40,7 +41,6 @@ function createCronServiceForSummary(params: {
     log: logger,
     enqueueSystemEvent: params.enqueueSystemEvent,
     requestHeartbeat: params.requestHeartbeat,
-    runHeartbeatOnce: vi.fn(),
     runIsolatedAgentJob: vi.fn(async () => ({
       status: "ok" as const,
       summary: params.summary,

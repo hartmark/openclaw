@@ -1,5 +1,6 @@
+// Msteams tests cover mentions plugin behavior.
 import { describe, expect, it } from "vitest";
-import { buildMentionEntities, formatMentionText, parseMentions } from "./mentions.js";
+import { parseMentions } from "./mentions.js";
 
 function requireFirstEntity(result: ReturnType<typeof parseMentions>) {
   const entity = result.entities[0];
@@ -14,29 +15,12 @@ function requireOnlyEntity(result: ReturnType<typeof parseMentions>) {
   return requireFirstEntity(result);
 }
 
-const mentionFreeTextCases = [
-  {
-    name: "parseMentions",
-    assert: () => {
-      const result = parseMentions("Hello world!");
-
-      expect(result.text).toBe("Hello world!");
-      expect(result.entities).toHaveLength(0);
-    },
-  },
-  {
-    name: "formatMentionText",
-    assert: () => {
-      const mentions = [{ id: "28:xxx", name: "John" }];
-
-      expect(formatMentionText("Hello world", mentions)).toBe("Hello world");
-    },
-  },
-];
-
 describe("mention-free text contract", () => {
-  it.each(mentionFreeTextCases)("$name handles text without mentions", ({ assert }) => {
-    assert();
+  it("parseMentions handles text without mentions", () => {
+    const result = parseMentions("Hello world!");
+
+    expect(result.text).toBe("Hello world!");
+    expect(result.entities).toHaveLength(0);
   });
 });
 
@@ -85,11 +69,23 @@ describe("parseMentions", () => {
     expect(result.entities).toHaveLength(0);
   });
 
-  it("handles mention with spaces in name", () => {
-    const result = parseMentions("@[John Peter Smith](28:a1b2c3)");
+  it.each([
+    { label: "spaces", source: "John Peter Smith", name: "John Peter Smith" },
+    {
+      label: "literal backslash",
+      source: String.raw`DOMAIN\Alice`,
+      name: String.raw`DOMAIN\Alice`,
+    },
+    {
+      label: "escaped brackets and backslash",
+      source: String.raw`DOMAIN\\Alice \[Ops\]`,
+      name: String.raw`DOMAIN\Alice [Ops]`,
+    },
+  ])("handles a mention name with $label", ({ source, name }) => {
+    const result = parseMentions(`@[${source}](28:a1b2c3)`);
 
-    expect(result.text).toBe("<at>John Peter Smith</at>");
-    expect(requireFirstEntity(result).mentioned.name).toBe("John Peter Smith");
+    expect(result.text).toBe(`<at>${name}</at>`);
+    expect(requireOnlyEntity(result).mentioned.name).toBe(name);
   });
 
   it("trims whitespace from id and name", () => {
@@ -172,83 +168,5 @@ describe("parseMentions", () => {
     expect(result.entities).toHaveLength(0);
     // Original text preserved
     expect(result.text).toBe("See @[docs](https://example.com) for details");
-  });
-});
-
-describe("buildMentionEntities", () => {
-  it("builds entities from mention info", () => {
-    const mentions = [
-      { id: "28:aaa", name: "Alice" },
-      { id: "28:bbb", name: "Bob" },
-    ];
-
-    const entities = buildMentionEntities(mentions);
-
-    expect(entities).toHaveLength(2);
-    expect(entities[0]).toEqual({
-      type: "mention",
-      text: "<at>Alice</at>",
-      mentioned: {
-        id: "28:aaa",
-        name: "Alice",
-      },
-    });
-    expect(entities[1]).toEqual({
-      type: "mention",
-      text: "<at>Bob</at>",
-      mentioned: {
-        id: "28:bbb",
-        name: "Bob",
-      },
-    });
-  });
-
-  it("handles empty list", () => {
-    const entities = buildMentionEntities([]);
-    expect(entities).toHaveLength(0);
-  });
-});
-
-describe("formatMentionText", () => {
-  it("formats text with single mention", () => {
-    const text = "Hello @John!";
-    const mentions = [{ id: "28:xxx", name: "John" }];
-
-    const result = formatMentionText(text, mentions);
-
-    expect(result).toBe("Hello <at>John</at>!");
-  });
-
-  it("formats text with multiple mentions", () => {
-    const text = "Hey @Alice and @Bob";
-    const mentions = [
-      { id: "28:aaa", name: "Alice" },
-      { id: "28:bbb", name: "Bob" },
-    ];
-
-    const result = formatMentionText(text, mentions);
-
-    expect(result).toBe("Hey <at>Alice</at> and <at>Bob</at>");
-  });
-
-  it("handles case-insensitive matching", () => {
-    const text = "Hey @alice and @ALICE";
-    const mentions = [{ id: "28:aaa", name: "Alice" }];
-
-    const result = formatMentionText(text, mentions);
-
-    expect(result).toBe("Hey <at>Alice</at> and <at>Alice</at>");
-  });
-
-  it("escapes regex metacharacters in names", () => {
-    const text = "Hey @John(Test) and @Alice.Smith";
-    const mentions = [
-      { id: "28:xxx", name: "John(Test)" },
-      { id: "28:yyy", name: "Alice.Smith" },
-    ];
-
-    const result = formatMentionText(text, mentions);
-
-    expect(result).toBe("Hey <at>John(Test)</at> and <at>Alice.Smith</at>");
   });
 });

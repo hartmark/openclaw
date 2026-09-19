@@ -1,6 +1,26 @@
+/**
+ * Cookie and Web Storage helpers for Playwright-backed browser tools.
+ */
 import { readStringValue } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { ensurePageState, getPageForTargetId } from "./pw-session.js";
+import {
+  assertInteractionCurrent,
+  type InteractionTargetOptions,
+} from "./pw-tools-core.interactions.navigation.js";
 
+type PlaywrightCookieInput = {
+  name: string;
+  value: string;
+  url?: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: "Lax" | "None" | "Strict";
+};
+
+/** Returns cookies visible to the target browser context. */
 export async function cookiesGetViaPlaywright(opts: {
   cdpUrl: string;
   targetId?: string;
@@ -11,21 +31,12 @@ export async function cookiesGetViaPlaywright(opts: {
   return { cookies };
 }
 
-export async function cookiesSetViaPlaywright(opts: {
-  cdpUrl: string;
-  targetId?: string;
-  cookie: {
-    name: string;
-    value: string;
-    url?: string;
-    domain?: string;
-    path?: string;
-    expires?: number;
-    httpOnly?: boolean;
-    secure?: boolean;
-    sameSite?: "Lax" | "None" | "Strict";
-  };
-}): Promise<void> {
+/** Adds or replaces a cookie in the target browser context. */
+export async function cookiesSetViaPlaywright(
+  opts: InteractionTargetOptions & {
+    cookie: PlaywrightCookieInput;
+  },
+): Promise<void> {
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
   const cookie = opts.cookie;
@@ -41,20 +52,72 @@ export async function cookiesSetViaPlaywright(opts: {
   if (!hasUrl && !hasDomainPath) {
     throw new Error("cookie requires url, or domain+path");
   }
+  if (opts.assertCurrent) {
+    await assertInteractionCurrent(opts);
+  }
   await page.context().addCookies([cookie]);
 }
 
-export async function cookiesClearViaPlaywright(opts: {
-  cdpUrl: string;
-  targetId?: string;
-}): Promise<void> {
+/**
+ * Add cookies in bounded batches on one browser context. On a batch error, retry
+ * that batch cookie-by-cookie so one cookie Playwright rejects neither drops the
+ * whole batch nor aborts the import. Returns the count actually added so callers
+ * can report rejects instead of leaving an ambiguous partial write.
+ */
+export async function cookiesSetManyViaPlaywright(
+  opts: InteractionTargetOptions & {
+    cookies: PlaywrightCookieInput[];
+    signal?: AbortSignal;
+  },
+): Promise<{ added: number }> {
+  opts.signal?.throwIfAborted();
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
+  const context = page.context();
+  let added = 0;
+  for (let index = 0; index < opts.cookies.length; index += 500) {
+    opts.signal?.throwIfAborted();
+    const batch = opts.cookies.slice(index, index + 500);
+    if (opts.assertCurrent) {
+      await assertInteractionCurrent(opts);
+      opts.signal?.throwIfAborted();
+    }
+    try {
+      await context.addCookies(batch);
+      added += batch.length;
+    } catch {
+      for (const cookie of batch) {
+        opts.signal?.throwIfAborted();
+        if (opts.assertCurrent) {
+          await assertInteractionCurrent(opts);
+          opts.signal?.throwIfAborted();
+        }
+        try {
+          await context.addCookies([cookie]);
+          added += 1;
+        } catch {
+          // Individual cookie rejected by Playwright/Chrome; counted as not added.
+        }
+      }
+    }
+  }
+  opts.signal?.throwIfAborted();
+  return { added };
+}
+
+/** Clears cookies in the target browser context. */
+export async function cookiesClearViaPlaywright(opts: InteractionTargetOptions): Promise<void> {
+  const page = await getPageForTargetId(opts);
+  ensurePageState(page);
+  if (opts.assertCurrent) {
+    await assertInteractionCurrent(opts);
+  }
   await page.context().clearCookies();
 }
 
 type StorageKind = "local" | "session";
 
+/** Reads localStorage or sessionStorage values from the target page. */
 export async function storageGetViaPlaywright(opts: {
   cdpUrl: string;
   targetId?: string;
@@ -90,18 +153,22 @@ export async function storageGetViaPlaywright(opts: {
   return { values: values ?? {} };
 }
 
-export async function storageSetViaPlaywright(opts: {
-  cdpUrl: string;
-  targetId?: string;
-  kind: StorageKind;
-  key: string;
-  value: string;
-}): Promise<void> {
+/** Writes one localStorage or sessionStorage value on the target page. */
+export async function storageSetViaPlaywright(
+  opts: InteractionTargetOptions & {
+    kind: StorageKind;
+    key: string;
+    value: string;
+  },
+): Promise<void> {
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
   const key = opts.key;
   if (!key) {
     throw new Error("key is required");
+  }
+  if (opts.assertCurrent) {
+    await assertInteractionCurrent(opts);
   }
   await page.evaluate(
     ({ kind, key: k, value }) => {
@@ -112,13 +179,17 @@ export async function storageSetViaPlaywright(opts: {
   );
 }
 
-export async function storageClearViaPlaywright(opts: {
-  cdpUrl: string;
-  targetId?: string;
-  kind: StorageKind;
-}): Promise<void> {
+/** Clears localStorage or sessionStorage on the target page. */
+export async function storageClearViaPlaywright(
+  opts: InteractionTargetOptions & {
+    kind: StorageKind;
+  },
+): Promise<void> {
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
+  if (opts.assertCurrent) {
+    await assertInteractionCurrent(opts);
+  }
   await page.evaluate(
     ({ kind }) => {
       const store = kind === "session" ? window.sessionStorage : window.localStorage;

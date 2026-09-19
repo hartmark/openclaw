@@ -1,11 +1,18 @@
-import { spawn } from "node:child_process";
+/**
+ * Login-shell environment snapshot capture.
+ *
+ * Caches safe shell-derived environment variables while filtering secrets and stale snapshots.
+ */
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
+import { withTempWorkspace } from "../infra/private-temp-workspace.js";
+import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 import { killProcessTree } from "../process/kill-tree.js";
+import { spawnProcess } from "../process/spawn-utils.js";
 
 const SNAPSHOT_VERSION = 1;
 const SNAPSHOT_REFRESH_MS = 5 * 60 * 1000;
@@ -58,7 +65,8 @@ type ShellSnapshot = {
   path: string;
 };
 
-export type ShellSnapshotWrapOptions = {
+type ShellSnapshotWrapOptions = {
+  enabled?: boolean;
   command: string;
   shell: string;
   shellArgs: string[];
@@ -76,6 +84,7 @@ export async function maybeWrapCommandWithShellSnapshot(
   opts: ShellSnapshotWrapOptions,
 ): Promise<string> {
   if (
+    opts.enabled === false ||
     process.platform === "win32" ||
     isExecShellSnapshotDisabled(process.env) ||
     !isSupportedSnapshotShell(opts.shell, opts.shellArgs)
@@ -97,14 +106,7 @@ export async function maybeWrapCommandWithShellSnapshot(
   }
 }
 
-export function resetShellSnapshotCacheForTests(): void {
-  snapshotCache.clear();
-  cleanupPromise = null;
-}
-
-export function resolveShellSnapshotDir(
-  env: Record<string, string | undefined> = process.env,
-): string {
+function resolveShellSnapshotDir(env: Record<string, string | undefined> = process.env): string {
   return path.join(resolveStateDir(env as NodeJS.ProcessEnv), "cache", "shell-snapshots");
 }
 
@@ -178,8 +180,21 @@ function buildStartupSignature(shell: string): Array<[string, number, number] | 
   });
 }
 
+function readNonBlankPathEnv(value: string | undefined): string | undefined {
+  return value?.trim() ? value : undefined;
+}
+
 function getTrustedShellHome(): string {
-  return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
+  const configuredHome =
+    readNonBlankPathEnv(process.env.HOME) ?? readNonBlankPathEnv(process.env.USERPROFILE);
+  if (configuredHome) {
+    return configuredHome;
+  }
+  const accountHome = readNonBlankPathEnv(os.userInfo().homedir);
+  if (!accountHome) {
+    throw new Error("Unable to resolve the current user's home directory");
+  }
+  return accountHome;
 }
 
 async function createShellSnapshot(
@@ -241,7 +256,7 @@ async function validateSnapshot(
     shellArgs: opts.shellArgs,
     cwd: opts.cwd,
     env: buildTrustedSnapshotCaptureEnv(opts.env),
-    command: `. ${shQuote(snapshotPath)} >/dev/null 2>&1; :`,
+    command: `. ${shQuote(snapshotPath)} >/dev/null 2>&1`,
     timeoutMs: 2_000,
   });
   return result.status === 0;
@@ -249,39 +264,41 @@ async function validateSnapshot(
 
 async function captureShellSnapshot(opts: ShellSnapshotWrapOptions): Promise<string | null> {
   const shellName = path.basename(opts.shell);
-  const captureOutputDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-shell-snapshot-"));
-  await fs.chmod(captureOutputDir, 0o700);
-  const captureOutputPath = path.join(captureOutputDir, "snapshot.out");
-  const captureOutputFile = await fs.open(captureOutputPath, "wx", 0o600);
-  await captureOutputFile.close();
-  const captureCommand = [
-    "{",
-    buildStartupSourceScript(shellName),
-    `printf '\\n%s\\n' ${shQuote(CAPTURE_MARKER)}`,
-    buildAliasCaptureScript(shellName),
-    "(typeset -f 2>/dev/null || declare -f 2>/dev/null || true)",
-    `printf '\\n%s\\n' ${shQuote(ENV_MARKER)}`,
-    `${shQuote(process.execPath)} -e ${shQuote(ENV_CAPTURE_NODE_SCRIPT)}`,
-    `} > ${shQuote(captureOutputPath)}`,
-  ].join("\n");
+  return await withTempWorkspace(
+    {
+      rootDir: resolvePreferredOpenClawTmpDir(),
+      prefix: "openclaw-shell-snapshot-",
+      dirMode: 0o700,
+      mode: 0o600,
+    },
+    async (workspace) => {
+      const captureOutputPath = await workspace.writeText("snapshot.out", "");
+      const captureCommand = [
+        "{",
+        buildStartupSourceScript(shellName),
+        `printf '\\n%s\\n' ${shQuote(CAPTURE_MARKER)}`,
+        buildAliasCaptureScript(shellName),
+        "(typeset -f 2>/dev/null || declare -f 2>/dev/null || true)",
+        `printf '\\n%s\\n' ${shQuote(ENV_MARKER)}`,
+        `${shQuote(process.execPath)} -e ${shQuote(ENV_CAPTURE_NODE_SCRIPT)}`,
+        `} > ${shQuote(captureOutputPath)}`,
+      ].join("\n");
 
-  try {
-    const result = await runShell({
-      shell: opts.shell,
-      shellArgs: buildCaptureShellArgs(shellName, opts.shellArgs),
-      cwd: opts.cwd,
-      env: buildTrustedSnapshotCaptureEnv(opts.env),
-      command: captureCommand,
-      timeoutMs: 5_000,
-    });
-    if (result.status !== 0) {
-      return null;
-    }
-    const stdout = await fs.readFile(captureOutputPath, "utf8");
-    return buildSnapshotFile(stdout);
-  } finally {
-    await fs.rm(captureOutputDir, { force: true, recursive: true });
-  }
+      const result = await runShell({
+        shell: opts.shell,
+        shellArgs: buildCaptureShellArgs(shellName, opts.shellArgs),
+        cwd: opts.cwd,
+        env: buildTrustedSnapshotCaptureEnv(opts.env),
+        command: captureCommand,
+        timeoutMs: 5_000,
+      });
+      if (result.status !== 0) {
+        return null;
+      }
+      const stdout = await fs.readFile(captureOutputPath, "utf8");
+      return buildSnapshotFile(stdout);
+    },
+  );
 }
 
 function buildCaptureShellArgs(shellName: string, shellArgs: string[]): string[] {
@@ -308,6 +325,7 @@ function buildTrustedSnapshotCaptureEnv(
   runtimeEnv: Record<string, string | undefined>,
 ): Record<string, string | undefined> {
   const env = buildSnapshotCaptureEnv(process.env);
+  env.HOME = getTrustedShellHome();
   // OPENCLAW_SHELL is injected by the exec runtime, so startup files can keep
   // their documented exec-specific branches without trusting model input.
   if (runtimeEnv.OPENCLAW_SHELL === "exec") {
@@ -435,16 +453,15 @@ async function runShell(opts: {
   cwd: string;
   env: Record<string, string | undefined>;
   timeoutMs: number;
-}): Promise<{ status: number | null; stdout: string }> {
+}): Promise<{ status: number | null }> {
   return await new Promise((resolve) => {
-    const child = spawn(opts.shell, [...opts.shellArgs, opts.command], {
+    const child = spawnProcess(opts.shell, [...opts.shellArgs, opts.command], {
       cwd: opts.cwd,
       detached: process.platform !== "win32",
       env: opts.env,
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: "ignore",
       windowsHide: true,
     });
-    let stdout = "";
     let settled = false;
     const finish = (status: number | null) => {
       if (settled) {
@@ -452,18 +469,23 @@ async function runShell(opts: {
       }
       settled = true;
       clearTimeout(timeout);
-      killProcessTree(child.pid ?? 0, { graceMs: 0 });
-      child.stdout.destroy();
-      resolve({ status, stdout });
+      if (child.pid) {
+        killProcessTree(child.pid, { graceMs: 0, detached: true });
+      } else {
+        // Broker admission can outlive the capture deadline; cancel the pending child too.
+        child.kill("SIGKILL");
+      }
+      resolve({ status });
     };
+    child.once("spawn", () => {
+      if (settled && child.pid) {
+        killProcessTree(child.pid, { graceMs: 0, detached: true });
+      }
+    });
     const timeout = setTimeout(() => {
-      killProcessTree(child.pid ?? 0, { graceMs: 250 });
+      killProcessTree(child.pid ?? 0, { graceMs: 250, detached: true });
       finish(null);
     }, opts.timeoutMs);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
     child.on("error", () => {
       finish(null);
     });

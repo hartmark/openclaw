@@ -1,20 +1,26 @@
+// Resolves event-triggered work to the correct session key and target.
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { SessionScope } from "../config/types.base.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolveChannelAccountEntry } from "../routing/account-lookup.js";
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import {
   buildAgentMainSessionKey,
   normalizeAgentId,
   parseAgentSessionKey,
   parseThreadSessionSuffix,
+  resolveEventSessionKey,
+  scopedHeartbeatWakeOptions,
 } from "../routing/session-key.js";
-import { resolveEventSessionKey, scopedHeartbeatWakeOptions } from "../routing/session-key.js";
 import { resolvePinnedMainDmOwnerFromAllowlist } from "../security/dm-policy-shared.js";
 import { deriveSessionChatTypeFromKey } from "../sessions/session-chat-type-shared.js";
 
+// Event session routing maps cron/heartbeat wakeups back to the right main,
+// direct, or global session key while honoring DM allowlists and route policy.
 type UnknownRecord = Record<string, unknown>;
 
+/** Routing policy derived from config and the source session for an event. */
 export type EventSessionRoutingPolicy = {
   mainKey?: string;
   sessionScope?: SessionScope;
@@ -51,17 +57,12 @@ function readAccountConfig(value: unknown): UnknownRecord | undefined {
   return isRecord(value) && isRecord(value.config) ? value.config : undefined;
 }
 
-function firstConfiguredAllowFrom(
-  ...candidates: Array<Array<string | number> | undefined>
-): Array<string | number> | undefined {
-  return candidates.find((candidate) => candidate !== undefined);
-}
-
 function normalizeEntry(value: string): string | undefined {
   return normalizeLowercaseStringOrEmpty(value) || undefined;
 }
 
-export function parseDirectAgentSessionTarget(
+/** Parse an agent direct-session key into channel/account/peer routing parts. */
+function parseDirectAgentSessionTarget(
   sessionKey: string | undefined | null,
 ): DirectSessionTarget | null {
   const { baseSessionKey } = parseThreadSessionSuffix(sessionKey);
@@ -87,9 +88,10 @@ export function parseDirectAgentSessionTarget(
   };
 }
 
-export function resolveEventSessionAllowFrom(params: {
+/** Resolve the configured DM allowlist that applies to an event session. */
+function resolveEventSessionAllowFrom(params: {
   cfg?: OpenClawConfig;
-  sessionKey?: string | null;
+  target: DirectSessionTarget | null;
   channel?: string | null;
   accountId?: string | null;
 }): Array<string | number> | undefined {
@@ -97,8 +99,7 @@ export function resolveEventSessionAllowFrom(params: {
   if (!cfg?.channels) {
     return undefined;
   }
-  const target = parseDirectAgentSessionTarget(params.sessionKey);
-  const channelKey = normalizeLowercaseStringOrEmpty(params.channel ?? target?.channel);
+  const channelKey = normalizeLowercaseStringOrEmpty(params.channel ?? params.target?.channel);
   if (!channelKey) {
     return undefined;
   }
@@ -106,17 +107,19 @@ export function resolveEventSessionAllowFrom(params: {
   if (!isRecord(channelConfig)) {
     return undefined;
   }
-  const accountId = normalizeLowercaseStringOrEmpty(params.accountId ?? target?.accountId);
+  const accountId = normalizeLowercaseStringOrEmpty(params.accountId ?? params.target?.accountId);
   const accountConfig =
-    accountId && isRecord(channelConfig.accounts) ? channelConfig.accounts[accountId] : undefined;
+    accountId && isRecord(channelConfig.accounts)
+      ? resolveChannelAccountEntry(channelConfig.accounts, accountId, channelKey, (id) => id)
+      : undefined;
   const accountNestedConfig = readAccountConfig(accountConfig);
-  return firstConfiguredAllowFrom(
-    readDmAllowFrom(accountConfig),
-    readDmAllowFrom(accountNestedConfig),
-    readAllowFrom(accountConfig),
-    readAllowFrom(accountNestedConfig),
-    readDmAllowFrom(channelConfig),
-    readAllowFrom(channelConfig),
+  return (
+    readDmAllowFrom(accountConfig) ??
+    readDmAllowFrom(accountNestedConfig) ??
+    readAllowFrom(accountConfig) ??
+    readAllowFrom(accountNestedConfig) ??
+    readDmAllowFrom(channelConfig) ??
+    readAllowFrom(channelConfig)
   );
 }
 
@@ -137,6 +140,8 @@ function shouldPreserveDirectSessionKeyFromRoute(params: {
     });
     const { baseSessionKey } = parseThreadSessionSuffix(params.sessionKey);
     const normalizedRouteSessionKey = normalizeLowercaseStringOrEmpty(route.sessionKey);
+    // If the configured route already chose this direct session, keep it rather
+    // than collapsing to main-session scope.
     return (
       route.lastRoutePolicy === "session" &&
       (normalizedRouteSessionKey === normalizeLowercaseStringOrEmpty(params.sessionKey) ||
@@ -148,6 +153,7 @@ function shouldPreserveDirectSessionKeyFromRoute(params: {
   }
 }
 
+/** Build the routing policy used by event wakeups and scoped heartbeat options. */
 export function resolveEventSessionRoutingPolicy(params: {
   cfg?: OpenClawConfig;
   sessionKey?: string | null;
@@ -164,7 +170,7 @@ export function resolveEventSessionRoutingPolicy(params: {
     params.allowFrom ??
     resolveEventSessionAllowFrom({
       cfg: params.cfg,
-      sessionKey: params.sessionKey,
+      target,
       channel,
       accountId,
     });
@@ -185,6 +191,7 @@ export function resolveEventSessionRoutingPolicy(params: {
   };
 }
 
+/** Resolve a direct DM event session to the configured main session when allowed. */
 export function resolveMainScopedEventSessionKey(params: {
   cfg?: OpenClawConfig;
   sessionKey: string;
@@ -195,9 +202,8 @@ export function resolveMainScopedEventSessionKey(params: {
   if (!sessionKey || params.policy?.preserveSessionKey === true) {
     return null;
   }
-  const parsed = parseAgentSessionKey(sessionKey);
   const target = parseDirectAgentSessionTarget(sessionKey);
-  if (!parsed || !target) {
+  if (!target) {
     return null;
   }
   const resolvedAgentId = normalizeAgentId(params.agentId ?? target.agentId);
@@ -237,6 +243,7 @@ export function resolveMainScopedEventSessionKey(params: {
   });
 }
 
+/** Apply event routing policy to a raw session key. */
 export function resolveEventSessionKeyForPolicy(
   sessionKey: string,
   policy?: EventSessionRoutingPolicy,
@@ -248,6 +255,7 @@ export function resolveEventSessionKeyForPolicy(
   return resolveMainScopedEventSessionKey({ sessionKey, policy }) ?? sessionKey;
 }
 
+/** Apply event routing policy while preserving wake option typing. */
 export function scopedHeartbeatWakeOptionsForPolicy<T extends object>(
   sessionKey: string,
   wakeOptions: T,

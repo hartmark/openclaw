@@ -1,16 +1,23 @@
-import type { PathMetadata } from "./package-manager.js";
-
+/**
+ * Source metadata helpers for session resources.
+ *
+ * Tracks where prompts, skills, and extension-provided assets came from for diagnostics and UI.
+ */
 export type SourceScope = "user" | "project" | "temporary";
 export type SourceOrigin = "package" | "top-level";
 
-export interface SourceInfo {
-  path: string;
+export interface PathMetadata {
   source: string;
   scope: SourceScope;
   origin: SourceOrigin;
   baseDir?: string;
 }
 
+export interface SourceInfo extends PathMetadata {
+  path: string;
+}
+
+/** Converts package-manager path metadata into the session source-info shape. */
 export function createSourceInfo(path: string, metadata: PathMetadata): SourceInfo {
   return {
     path,
@@ -21,6 +28,7 @@ export function createSourceInfo(path: string, metadata: PathMetadata): SourceIn
   };
 }
 
+/** Builds source metadata for generated or synthetic session entries. */
 export function createSyntheticSourceInfo(
   path: string,
   options: {

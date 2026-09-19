@@ -1,4 +1,4 @@
-import { firstDefined } from "openclaw/plugin-sdk/allow-from";
+export { firstDefined } from "openclaw/plugin-sdk/allow-from";
 
 export type NormalizedAllowFrom = {
   entries: string[];
@@ -26,5 +26,3 @@ export const normalizeAllowFrom = (list?: Array<string | number>): NormalizedAll
     hasEntries: entries.length > 0,
   };
 };
-
-export { firstDefined };

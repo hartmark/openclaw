@@ -1,53 +1,89 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { access } from "node:fs/promises";
 import module from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-
-const MIN_NODE_MAJOR = 22;
-const MIN_NODE_MINOR = 19;
-const MIN_NODE_VERSION = `${MIN_NODE_MAJOR}.${MIN_NODE_MINOR}`;
-
-const parseNodeVersion = (rawVersion) => {
-  const [majorRaw = "0", minorRaw = "0"] = rawVersion.split(".");
-  return {
-    major: Number(majorRaw),
-    minor: Number(minorRaw),
-  };
-};
-
-const isSupportedNodeVersion = (version) =>
-  version.major > MIN_NODE_MAJOR ||
-  (version.major === MIN_NODE_MAJOR && version.minor >= MIN_NODE_MINOR);
-
-const ensureSupportedNodeVersion = () => {
-  if (isSupportedNodeVersion(parseNodeVersion(process.versions.node))) {
-    return;
-  }
-
-  process.stderr.write(
-    `openclaw: Node.js v${MIN_NODE_VERSION}+ is required (current: v${process.versions.node}).\n` +
-      "If you use nvm, run:\n" +
-      `  nvm install ${MIN_NODE_MAJOR}\n` +
-      `  nvm use ${MIN_NODE_MAJOR}\n` +
-      `  nvm alias default ${MIN_NODE_MAJOR}\n`,
-  );
-  process.exit(1);
-};
-
-ensureSupportedNodeVersion();
-
-if (tryOutputLauncherVersion(process.argv)) {
-  process.exit(0);
-}
+import { isNodeHostLauncherChild, runNodeHostLauncher } from "./node-host-launcher.mjs";
+import {
+  consumeLauncherRootOptionToken,
+  isForegroundGmailRunInvocation,
+  isNativeHookRelayInvocation,
+  recoverNodeRuntime,
+  runRespawnedChild,
+} from "./node-runtime-recovery.mjs";
+import {
+  canRunOpenClawNodeDiagnostics,
+  classifyUnsupportedNodeCommand,
+  formatUnsupportedNodeDiagnosticWarning,
+} from "./node-version.mjs";
 
 const isSourceCheckoutLauncher = () =>
   existsSync(new URL("./.git", import.meta.url)) ||
   existsSync(new URL("./src/entry.ts", import.meta.url));
+
+const { detectCurrentSqliteCapabilities, nodeRuntimeFailure, nodeRuntimeNote } =
+  await import("./node-sqlite.mjs");
+
+const RECOMMENDED_NODE_MAJOR = 26;
+const SUPPORTED_NODE_RANGE = ">=24.16.0 <25, or >=26.1.0";
+const COMPILE_CACHE_DISABLED_RESPAWNED_ENV = "OPENCLAW_COMPILE_CACHE_DISABLED_RESPAWNED";
+
+const ensureSupportedRuntimeVersion = async () => {
+  if (process.versions.bun) {
+    // Bun >=1.4 (Rust rewrite) ships node:sqlite; feature-probe instead of
+    // rejecting Bun outright so capable Bun builds can run OpenClaw.
+    let hasNodeSqlite;
+    try {
+      hasNodeSqlite = Boolean(process.getBuiltinModule?.("node:sqlite"));
+    } catch {
+      hasNodeSqlite = false;
+    }
+    if (hasNodeSqlite) {
+      return false;
+    }
+    process.stderr.write(
+      "openclaw: this Bun runtime is unsupported because it does not provide node:sqlite.\n" +
+        `Use Node.js ${SUPPORTED_NODE_RANGE}; Bun remains supported for installs and package scripts.\n`,
+    );
+    return process.exit(1);
+  }
+  const probe = await detectCurrentSqliteCapabilities();
+  const failure = nodeRuntimeFailure(process.versions.node, probe);
+  if (!failure) {
+    const note = nodeRuntimeNote(process.versions.node, probe);
+    if (note) {
+      process.stderr.write(`${note}\n`);
+    }
+    return false;
+  }
+  const unsupportedCommand = classifyUnsupportedNodeCommand(process.argv);
+  const canRunDiagnostics = canRunOpenClawNodeDiagnostics(process.versions.node, probe.available);
+  const diagnosticExemption = unsupportedCommand === "diagnostic" && canRunDiagnostics;
+  await recoverNodeRuntime({
+    allowInstall: !diagnosticExemption,
+  });
+  if (!diagnosticExemption) {
+    process.stderr.write(`openclaw: ${failure}\n`);
+  }
+  if (diagnosticExemption) {
+    return false;
+  }
+  process.stderr.write(
+    "If you use nvm, run:\n" +
+      `  nvm install ${RECOMMENDED_NODE_MAJOR}\n` +
+      `  nvm use ${RECOMMENDED_NODE_MAJOR}\n` +
+      `  nvm alias default ${RECOMMENDED_NODE_MAJOR}\n`,
+  );
+  if (unsupportedCommand === "update" && canRunDiagnostics) {
+    // A later CLI startup respawn must not repeat this invocation's recovery offer.
+    process.env.OPENCLAW_NODE_UPDATE_RESPAWNED = "1";
+    return false;
+  }
+  return process.exit(1);
+};
 
 const isNodeCompileCacheDisabled = () => process.env.NODE_DISABLE_COMPILE_CACHE !== undefined;
 const isNodeCompileCacheRequested = () =>
@@ -88,116 +124,11 @@ const resolvePackagedCompileCacheDirectory = () => {
   );
 };
 
-const respawnSignals =
-  process.platform === "win32"
-    ? ["SIGTERM", "SIGINT", "SIGBREAK"]
-    : ["SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"];
-const respawnSignalExitGraceMs = 1_000;
-const respawnSignalForceKillGraceMs = 1_000;
-const respawnSignalHardExitGraceMs = 1_000;
-
-const runRespawnedChild = (command, args, env) => {
-  const child = spawn(command, args, {
-    stdio: "inherit",
-    env,
-  });
-  const listeners = new Map();
-  // This intentionally overlaps with src/entry.compile-cache.ts; keep the
-  // respawn supervision behavior in sync until the launcher can share TS code.
-  // Give the child a moment to honor forwarded signals, then exit the wrapper so
-  // a child that ignores SIGTERM cannot keep the launcher alive indefinitely.
-  let signalExitTimer = null;
-  let signalForceKillTimer = null;
-  let signalHardExitTimer = null;
-  const detach = () => {
-    for (const [signal, listener] of listeners) {
-      process.off(signal, listener);
-    }
-    listeners.clear();
-    if (signalExitTimer) {
-      clearTimeout(signalExitTimer);
-      signalExitTimer = null;
-    }
-    if (signalForceKillTimer) {
-      clearTimeout(signalForceKillTimer);
-      signalForceKillTimer = null;
-    }
-    if (signalHardExitTimer) {
-      clearTimeout(signalHardExitTimer);
-      signalHardExitTimer = null;
-    }
-  };
-  const forceKillChild = () => {
-    try {
-      child.kill(process.platform === "win32" ? "SIGTERM" : "SIGKILL");
-    } catch {
-      // Best-effort shutdown fallback.
-    }
-  };
-  const requestChildTermination = () => {
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      // Best-effort shutdown fallback.
-    }
-    signalForceKillTimer = setTimeout(() => {
-      forceKillChild();
-      signalHardExitTimer = setTimeout(() => {
-        process.exit(1);
-      }, respawnSignalHardExitGraceMs);
-      signalHardExitTimer.unref?.();
-    }, respawnSignalForceKillGraceMs);
-    signalForceKillTimer.unref?.();
-  };
-  const scheduleParentExit = () => {
-    if (signalExitTimer) {
-      return;
-    }
-    signalExitTimer = setTimeout(() => {
-      requestChildTermination();
-    }, respawnSignalExitGraceMs);
-    signalExitTimer.unref?.();
-  };
-  for (const signal of respawnSignals) {
-    const listener = () => {
-      try {
-        child.kill(signal);
-      } catch {
-        // Best-effort signal forwarding.
-      }
-      scheduleParentExit();
-    };
-    try {
-      process.on(signal, listener);
-      listeners.set(signal, listener);
-    } catch {
-      // Unsupported signal on this platform.
-    }
-  }
-  child.once("exit", (code, signal) => {
-    detach();
-    if (signal) {
-      process.exit(1);
-    }
-    process.exit(code ?? 1);
-  });
-  child.once("error", (error) => {
-    detach();
-    process.stderr.write(
-      `[openclaw] Failed to respawn launcher: ${
-        error instanceof Error ? (error.stack ?? error.message) : String(error)
-      }\n`,
-    );
-    process.exit(1);
-  });
-  return true;
-};
-
 const respawnWithoutCompileCacheIfNeeded = () => {
   if (!isSourceCheckoutLauncher()) {
     return false;
   }
-  if (process.env.OPENCLAW_SOURCE_COMPILE_CACHE_RESPAWNED === "1") {
+  if (process.env[COMPILE_CACHE_DISABLED_RESPAWNED_ENV] === "1") {
     return false;
   }
   if (!module.getCompileCacheDir?.() && !isNodeCompileCacheRequested()) {
@@ -206,7 +137,7 @@ const respawnWithoutCompileCacheIfNeeded = () => {
   const env = {
     ...process.env,
     NODE_DISABLE_COMPILE_CACHE: "1",
-    OPENCLAW_SOURCE_COMPILE_CACHE_RESPAWNED: "1",
+    [COMPILE_CACHE_DISABLED_RESPAWNED_ENV]: "1",
   };
   delete env.NODE_COMPILE_CACHE;
   return runRespawnedChild(
@@ -238,27 +169,11 @@ const respawnWithPackagedCompileCacheIfNeeded = () => {
   };
   return runRespawnedChild(
     process.execPath,
-    [...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+    // pnpm's lexical hash link owns the install; its realpath is only shared package content.
+    [...process.execArgv, process.argv[1], ...process.argv.slice(2)],
     env,
   );
 };
-
-const waitingForCompileCacheRespawn =
-  respawnWithoutCompileCacheIfNeeded() || respawnWithPackagedCompileCacheIfNeeded();
-
-// https://nodejs.org/api/module.html#module-compile-cache
-if (
-  !waitingForCompileCacheRespawn &&
-  module.enableCompileCache &&
-  !isNodeCompileCacheDisabled() &&
-  !isSourceCheckoutLauncher()
-) {
-  try {
-    module.enableCompileCache(resolvePackagedCompileCacheDirectory());
-  } catch {
-    // Ignore errors
-  }
-}
 
 const getErrorMessage = (err) =>
   err && typeof err === "object" && "message" in err && typeof err.message === "string"
@@ -275,7 +190,9 @@ const isDirectModuleNotFoundError = (err, specifier) => {
     message.includes(`Cannot find module "${specifier}"`);
   const launcherPath = fileURLToPath(import.meta.url);
   const bunLauncherImporterMiss =
-    message.includes(` from '${launcherPath}'`) || message.includes(` from "${launcherPath}"`);
+    message.includes(` from '${launcherPath}'`) ||
+    message.includes(` from "${launcherPath}"`) ||
+    message.includes(` imported from ${launcherPath}`);
 
   const expectedUrl = new URL(specifier, import.meta.url);
   const expectedPath = fileURLToPath(expectedUrl);
@@ -353,18 +270,75 @@ const buildMissingEntryErrorMessage = async () => {
 const isBareRootHelpInvocation = (argv) =>
   argv.length === 3 && (argv[2] === "--help" || argv[2] === "-h");
 
+const LAUNCHER_HELP_FLAGS = new Set(["-h", "--help"]);
+const LAUNCHER_PRECOMPUTED_COMMAND_HELP = {
+  browser: { command: "browser", metadataKey: "browserHelpText" },
+  secrets: { command: "secrets", metadataKey: "secretsHelpText" },
+  nodes: { command: "nodes", metadataKey: "nodesHelpText" },
+};
+const LAUNCHER_PRECOMPUTED_SUBCOMMAND_HELP = new Set([
+  "config",
+  "doctor",
+  "gateway",
+  "models",
+  "plugins",
+  "sessions",
+  "tasks",
+]);
+
+const hasLauncherContainerTarget = (argv) => {
+  if (normalizeLauncherMetadataValue(process.env.OPENCLAW_CONTAINER)) {
+    return true;
+  }
+  const args = argv.slice(2);
+  for (const arg of args) {
+    if (!arg || arg === "--") {
+      return false;
+    }
+    if (arg === "--container" || arg.startsWith("--container=")) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const resolvePrecomputedCommandHelpByName = (commandName) => {
+  if (Object.hasOwn(LAUNCHER_PRECOMPUTED_COMMAND_HELP, commandName)) {
+    return LAUNCHER_PRECOMPUTED_COMMAND_HELP[commandName];
+  }
+  if (LAUNCHER_PRECOMPUTED_SUBCOMMAND_HELP.has(commandName)) {
+    return {
+      command: commandName,
+      metadataKey: "subcommandHelpText",
+      subcommandKey: commandName,
+    };
+  }
+  return null;
+};
+
 const resolvePrecomputedCommandHelp = (argv) => {
-  if (argv.length !== 4 || (argv[3] !== "--help" && argv[3] !== "-h")) {
-    return null;
-  }
-  if (argv[2] === "browser") {
-    return { command: "browser", metadataKey: "browserHelpText" };
-  }
-  if (argv[2] === "secrets") {
-    return { command: "secrets", metadataKey: "secretsHelpText" };
-  }
-  if (argv[2] === "nodes") {
-    return { command: "nodes", metadataKey: "nodesHelpText" };
+  const args = argv.slice(2);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!arg || arg === "--") {
+      return null;
+    }
+    // The runtime entry owns profile validation and config projection before cached help.
+    if (arg === "--dev" || arg === "--profile" || arg.startsWith("--profile=")) {
+      return null;
+    }
+    const consumed = consumeLauncherRootOptionToken(args, index);
+    if (consumed > 0) {
+      index += consumed - 1;
+      continue;
+    }
+    const commandHelp = resolvePrecomputedCommandHelpByName(arg);
+    const helpFlags = args.slice(index + 1);
+    return commandHelp &&
+      helpFlags.length > 0 &&
+      helpFlags.every((flag) => LAUNCHER_HELP_FLAGS.has(flag))
+      ? commandHelp
+      : null;
   }
   return null;
 };
@@ -386,7 +360,7 @@ const resolveLauncherHomeDir = () => {
   const explicit = normalizeLauncherHomeValue(process.env.OPENCLAW_HOME);
   const rawHome =
     explicit && (explicit === "~" || explicit.startsWith("~/") || explicit.startsWith("~\\"))
-      ? explicit.replace(/^~(?=$|[\\/])/, resolveLauncherOsHomeDir())
+      ? explicit.replace(/^~(?=$|[\\/])/, () => resolveLauncherOsHomeDir())
       : (explicit ?? resolveLauncherOsHomeDir());
   return path.resolve(rawHome);
 };
@@ -438,11 +412,11 @@ const shouldDeferRootHelpToRuntimeEntry = () => {
   return false;
 };
 
-const loadPrecomputedHelpText = (key) => {
+const loadPrecomputedHelpText = (key, subkey) => {
   try {
     const raw = readFileSync(new URL("./dist/cli-startup-metadata.json", import.meta.url), "utf8");
     const parsed = JSON.parse(raw);
-    const value = parsed?.[key];
+    const value = subkey ? parsed?.[key]?.[subkey] : parsed?.[key];
     return typeof value === "string" && value.length > 0 ? value : null;
   } catch {
     return null;
@@ -484,15 +458,18 @@ function readLauncherJson(relativePath) {
 }
 
 function resolveLauncherVersion() {
-  const packageJson = readLauncherJson("./package.json");
-  const packageVersion = normalizeLauncherMetadataValue(packageJson?.version);
-  if (packageVersion) {
-    return packageVersion;
-  }
+  // Report what is built, not what the source says: resolveLauncherCommit already
+  // prefers dist provenance, so reading package.json first pairs a source version
+  // with a built commit and hides a checkout that pulled without rebuilding.
   const buildInfo = readLauncherJson("./dist/build-info.json");
   const buildVersion = normalizeLauncherMetadataValue(buildInfo?.version);
   if (buildVersion) {
     return buildVersion;
+  }
+  const packageJson = readLauncherJson("./package.json");
+  const packageVersion = normalizeLauncherMetadataValue(packageJson?.version);
+  if (packageVersion) {
+    return packageVersion;
   }
   return normalizeLauncherMetadataValue(process.env.OPENCLAW_BUNDLED_VERSION) ?? "0.0.0";
 }
@@ -503,8 +480,8 @@ function resolveLauncherCommit() {
     return envCommit;
   }
   return (
-    readLauncherGitCommit() ??
     formatLauncherCommit(readLauncherJson("./dist/build-info.json")?.commit) ??
+    readLauncherGitCommit() ??
     formatLauncherCommit(readLauncherJson("./package.json")?.gitHead) ??
     formatLauncherCommit(readLauncherJson("./package.json")?.githead)
   );
@@ -602,7 +579,7 @@ const tryOutputBareRootHelp = async () => {
   if (!isBareRootHelpInvocation(process.argv)) {
     return false;
   }
-  if (shouldDeferRootHelpToRuntimeEntry()) {
+  if (hasLauncherContainerTarget(process.argv) || shouldDeferRootHelpToRuntimeEntry()) {
     return false;
   }
   const precomputed = loadPrecomputedHelpText("rootHelpText");
@@ -632,10 +609,13 @@ const tryOutputPrecomputedCommandHelp = () => {
   if (!commandHelp) {
     return false;
   }
+  if (hasLauncherContainerTarget(process.argv)) {
+    return false;
+  }
   if (commandHelp.command === "nodes" && shouldDeferRootHelpToRuntimeEntry()) {
     return false;
   }
-  const precomputed = loadPrecomputedHelpText(commandHelp.metadataKey);
+  const precomputed = loadPrecomputedHelpText(commandHelp.metadataKey, commandHelp.subcommandKey);
   if (!precomputed) {
     return false;
   }
@@ -643,9 +623,77 @@ const tryOutputPrecomputedCommandHelp = () => {
   return true;
 };
 
+// Resolve Node before loading pending package lifecycle code or any built runtime modules.
+const waitingForNodeUpdateRespawn = await ensureSupportedRuntimeVersion();
+if (
+  !waitingForNodeUpdateRespawn &&
+  (await runNodeHostLauncher({
+    entryPath: fileURLToPath(import.meta.url),
+    packageRoot: fileURLToPath(new URL("./", import.meta.url)),
+  }))
+) {
+  process.exit(process.exitCode ?? 0);
+}
+const currentNodeRuntimeFailure = process.versions.bun
+  ? null
+  : nodeRuntimeFailure(process.versions.node, await detectCurrentSqliteCapabilities());
+
+if (!waitingForNodeUpdateRespawn) {
+  // Diagnostics must not replay package lifecycle scripts under an unsupported Node.
+  if (
+    !currentNodeRuntimeFailure &&
+    !isSourceCheckoutLauncher() &&
+    (existsSync(new URL("./.openclaw-lifecycle-pending", import.meta.url)) ||
+      existsSync(new URL("./dist/openclaw-install-guard", import.meta.url)))
+  ) {
+    try {
+      const { completePendingPackageLifecycle } = await import("./dist/infra/package-lifecycle.js");
+      await completePendingPackageLifecycle({
+        packageRoot: fileURLToPath(new URL("./", import.meta.url)),
+      });
+    } catch (error) {
+      process.stderr.write(
+        `openclaw: package lifecycle is incomplete. Reinstall with package scripts enabled, then retry. ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      process.exit(1);
+    }
+  }
+  if (tryOutputLauncherVersion(process.argv)) {
+    if (currentNodeRuntimeFailure) {
+      process.stderr.write(`${formatUnsupportedNodeDiagnosticWarning(process.versions.node)}\n`);
+    }
+    process.exit(0);
+  }
+}
+
+// Codex owns the relay timeout by PID. Keep the launcher as that exact process
+// so a timeout cannot strand a compile-cache respawn child.
+const waitingForCompileCacheRespawn =
+  waitingForNodeUpdateRespawn ||
+  (!isNodeHostLauncherChild() &&
+    !isForegroundGmailRunInvocation(process.argv) &&
+    !(process.platform !== "win32" && isNativeHookRelayInvocation(process.argv)) &&
+    (respawnWithoutCompileCacheIfNeeded() || respawnWithPackagedCompileCacheIfNeeded()));
+
+// https://nodejs.org/api/module.html#module-compile-cache
+if (
+  !waitingForCompileCacheRespawn &&
+  module.enableCompileCache &&
+  !isNodeCompileCacheDisabled() &&
+  !isSourceCheckoutLauncher()
+) {
+  try {
+    module.enableCompileCache(resolvePackagedCompileCacheDirectory());
+  } catch {
+    // Ignore errors
+  }
+}
+
 if (!waitingForCompileCacheRespawn) {
   if (!isHelpFastPathDisabled() && (await tryOutputBareRootHelp())) {
-    // OK
+    if (currentNodeRuntimeFailure) {
+      process.stderr.write(`${formatUnsupportedNodeDiagnosticWarning(process.versions.node)}\n`);
+    }
   } else if (!isHelpFastPathDisabled() && tryOutputPrecomputedCommandHelp()) {
     // OK
   } else {

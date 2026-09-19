@@ -1,7 +1,10 @@
+import { retryAsync } from "@openclaw/retry";
+import type { SsrFPolicy } from "./openclaw-runtime-network.js";
 import { postJson } from "./post-json.js";
-import { retryAsync } from "./retry-utils.js";
-import type { SsrFPolicy } from "./ssrf-policy.js";
 
+// JSON POST helper for batch APIs with provider-style transient retry.
+
+/** POST JSON and retry provider 429/5xx failures with bounded backoff. */
 export async function postJsonWithRetry<T>(params: {
   url: string;
   headers: Record<string, string>;
@@ -21,7 +24,6 @@ export async function postJsonWithRetry<T>(params: {
         fetchImpl: params.fetchImpl,
         body: params.body,
         errorPrefix: params.errorPrefix,
-        attachStatus: true,
         parse: async (payload) => payload as T,
       });
     },

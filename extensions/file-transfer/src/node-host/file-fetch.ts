@@ -1,22 +1,35 @@
+// File Transfer plugin module implements file fetch behavior.
 import crypto from "node:crypto";
 import path from "node:path";
+import { readFileHandleBounded } from "openclaw/plugin-sdk/file-access-runtime";
 import { detectMime } from "openclaw/plugin-sdk/media-mime";
-import { root } from "openclaw/plugin-sdk/security-runtime";
+import { FsSafeError, root } from "openclaw/plugin-sdk/security-runtime";
+import {
+  fileIdentity,
+  matchesFileIdentity,
+  readPathBinding,
+  type PathBinding,
+} from "../shared/path-binding.js";
 import {
   classifyFsSafeReadError,
   readAbsolutePath,
+  rejectCanonicalPathChange,
   resolveCanonicalReadPath,
 } from "./path-errors.js";
 
-export const FILE_FETCH_HARD_MAX_BYTES = 16 * 1024 * 1024;
-export const FILE_FETCH_DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
+const FILE_FETCH_HARD_MAX_BYTES = 16 * 1024 * 1024;
+const FILE_FETCH_DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
 const TEXT_SNIFF_MAX_BYTES = 8192;
 
 type FileFetchParams = {
   path?: unknown;
+  /** Optional canonical root: follow parent aliases within it, never the final file. */
+  rootPath?: unknown;
   maxBytes?: unknown;
   followSymlinks?: unknown;
   preflightOnly?: unknown;
+  expectedCanonicalPath?: unknown;
+  expectedBinding?: unknown;
 };
 
 type FileFetchOk = {
@@ -27,6 +40,7 @@ type FileFetchOk = {
   base64: string;
   sha256: string;
   preflightOnly?: boolean;
+  binding: PathBinding;
 };
 
 type FileFetchErrCode =
@@ -37,6 +51,7 @@ type FileFetchErrCode =
   | "FILE_TOO_LARGE"
   | "PATH_TRAVERSAL"
   | "SYMLINK_REDIRECT"
+  | "CANONICAL_PATH_CHANGED"
   | "READ_ERROR";
 
 type FileFetchErr = {
@@ -56,6 +71,9 @@ function clampMaxBytes(input: unknown): number {
 }
 
 function classifyFsError(err: unknown): FileFetchErrCode {
+  if (err instanceof FsSafeError && err.code === "too-large") {
+    return "FILE_TOO_LARGE";
+  }
   const safeCode = classifyFsSafeReadError(err);
   if (safeCode) {
     return safeCode;
@@ -119,9 +137,15 @@ export async function handleFileFetch(params: FileFetchParams): Promise<FileFetc
   const followSymlinks = params.followSymlinks === true;
   const preflightOnly = params.preflightOnly === true;
 
+  const requestedRoot =
+    params.rootPath === undefined ? undefined : readAbsolutePath(params.rootPath);
+  if (requestedRoot !== undefined && typeof requestedRoot !== "string") {
+    return requestedRoot;
+  }
+
   const canonical = await resolveCanonicalReadPath({
-    requestedPath,
-    followSymlinks,
+    requestedPath: requestedRoot ?? requestedPath,
+    followSymlinks: requestedRoot === undefined && followSymlinks,
     classifyError: classifyFsError,
     notFoundMessage: "file not found",
   });
@@ -131,8 +155,15 @@ export async function handleFileFetch(params: FileFetchParams): Promise<FileFetc
 
   let opened: Awaited<ReturnType<Awaited<ReturnType<typeof root>>["open"]>>;
   try {
-    const parentRoot = await root(path.dirname(canonical));
-    opened = await parentRoot.open(path.basename(canonical));
+    if (requestedRoot !== undefined) {
+      const readRoot = await root(canonical);
+      opened = await readRoot.open(path.relative(canonical, requestedPath), {
+        symlinks: followSymlinks ? "follow-parents-within-root" : "reject",
+      });
+    } else {
+      const parentRoot = await root(path.dirname(canonical));
+      opened = await parentRoot.open(path.basename(canonical));
+    }
   } catch (err) {
     const code = classifyFsError(err);
     return {
@@ -144,7 +175,28 @@ export async function handleFileFetch(params: FileFetchParams): Promise<FileFetc
   }
 
   try {
+    const canonicalPathChange = rejectCanonicalPathChange(
+      params.expectedCanonicalPath,
+      opened.realPath,
+    );
+    if (canonicalPathChange) {
+      return canonicalPathChange;
+    }
     const stats = opened.stat;
+    const identityStats = await opened.handle.stat({ bigint: true });
+    const identity = fileIdentity(identityStats);
+    const expectedBinding = readPathBinding(params.expectedBinding);
+    if (
+      (params.expectedBinding !== undefined && expectedBinding?.kind !== "existing") ||
+      (expectedBinding?.kind === "existing" && !matchesFileIdentity(identityStats, expectedBinding))
+    ) {
+      return {
+        ok: false,
+        code: "CANONICAL_PATH_CHANGED",
+        message: "filesystem identity differs from the authorized target",
+        canonicalPath: opened.realPath,
+      };
+    }
     if (stats.size > maxBytes) {
       return {
         ok: false,
@@ -163,18 +215,11 @@ export async function handleFileFetch(params: FileFetchParams): Promise<FileFetc
         base64: "",
         sha256: "",
         preflightOnly: true,
+        binding: { kind: "existing", ...identity },
       };
     }
 
-    const buffer = await opened.handle.readFile();
-    if (buffer.byteLength > maxBytes) {
-      return {
-        ok: false,
-        code: "FILE_TOO_LARGE",
-        message: `read ${buffer.byteLength} bytes exceeds limit ${maxBytes}`,
-        canonicalPath: opened.realPath,
-      };
-    }
+    const buffer = await readFileHandleBounded(opened.handle, maxBytes);
 
     const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
     const base64 = buffer.toString("base64");
@@ -187,6 +232,7 @@ export async function handleFileFetch(params: FileFetchParams): Promise<FileFetc
       mimeType,
       base64,
       sha256,
+      binding: { kind: "existing", ...identity },
     };
   } catch (err) {
     const code = classifyFsError(err);

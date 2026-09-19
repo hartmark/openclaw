@@ -1,11 +1,8 @@
-import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
+import { runExec } from "openclaw/plugin-sdk/process-runtime";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
-
-const execFileAsync = promisify(execFile);
 
 type ObsidianCliProbe = {
   available: boolean;
@@ -19,15 +16,23 @@ type ObsidianCliResult = {
   stderr: string;
 };
 
+// User-triggered CLI helpers must not pin the gateway when Obsidian stops responding.
+const OBSIDIAN_CLI_TIMEOUT_MS = 10_000;
+
 type ObsidianCliDeps = {
-  exec?: typeof execFileAsync;
+  exec?: (
+    command: string,
+    args: string[],
+    options: { logOutput: false; timeoutMs: number },
+  ) => Promise<{ stdout: string; stderr: string }>;
   resolveCommand?: (command: string) => Promise<string | null>;
 };
 
 async function isExecutableFile(inputPath: string): Promise<boolean> {
   try {
     await fs.access(inputPath, process.platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK);
-    return true;
+    // X_OK also succeeds for searchable directories; follow symlinks to check the target type.
+    return (await fs.stat(inputPath)).isFile();
   } catch {
     return false;
   }
@@ -41,10 +46,6 @@ async function resolveCommandOnPath(command: string): Promise<string | null> {
       ? (process.env.PATHEXT?.split(";").filter(Boolean) ?? [".EXE", ".CMD", ".BAT"])
       : [""];
 
-  if (command.includes(path.sep)) {
-    return (await isExecutableFile(command)) ? command : null;
-  }
-
   for (const dir of pathEntries) {
     for (const extension of windowsExts) {
       const candidate = path.join(dir, extension ? `${command}${extension}` : command);
@@ -55,10 +56,6 @@ async function resolveCommandOnPath(command: string): Promise<string | null> {
   }
 
   return null;
-}
-
-function buildVaultPrefix(config: ResolvedMemoryWikiConfig): string[] {
-  return config.obsidian.vaultName ? [`vault=${config.obsidian.vaultName}`] : [];
 }
 
 export async function probeObsidianCli(
@@ -78,14 +75,21 @@ async function runObsidianCli(params: {
   args?: string[];
   deps?: ObsidianCliDeps;
 }): Promise<ObsidianCliResult> {
-  const resolveCommand = params.deps?.resolveCommand ?? resolveCommandOnPath;
-  const exec = params.deps?.exec ?? execFileAsync;
-  const probe = await probeObsidianCli({ resolveCommand });
+  const probe = await probeObsidianCli(params.deps);
   if (!probe.command) {
     throw new Error("Obsidian CLI is not available on PATH.");
   }
-  const argv = [...buildVaultPrefix(params.config), params.subcommand, ...(params.args ?? [])];
-  const { stdout, stderr } = await exec(probe.command, argv, { encoding: "utf8" });
+  const { vaultName } = params.config.obsidian;
+  const argv = [
+    ...(vaultName ? [`vault=${vaultName}`] : []),
+    params.subcommand,
+    ...(params.args ?? []),
+  ];
+  const exec = params.deps?.exec ?? runExec;
+  const { stdout, stderr } = await exec(probe.command, argv, {
+    logOutput: false,
+    timeoutMs: OBSIDIAN_CLI_TIMEOUT_MS,
+  });
   return {
     command: probe.command,
     argv,

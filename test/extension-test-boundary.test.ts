@@ -1,7 +1,9 @@
+// Extension test boundary tests enforce extension test layout rules.
 import fs from "node:fs";
 import path from "node:path";
 import { BUNDLED_PLUGIN_PATH_PREFIX } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
+import { getChangedPathFacts } from "../scripts/lib/changed-path-facts.mjs";
 import { GUARDED_EXTENSION_PUBLIC_SURFACE_BASENAMES } from "../src/plugin-sdk/test-helpers/public-artifacts.js";
 import { expectNoReaddirSyncDuring } from "../src/test-utils/fs-scan-assertions.js";
 import { listGitTrackedFiles, toRepoRelativePath } from "../src/test-utils/repo-files.js";
@@ -93,11 +95,11 @@ function findExtensionImports(source: string): string[] {
   return [
     ...source.matchAll(/from\s+["']((?:\.\.\/)+extensions\/[^"']+)["']/g),
     ...source.matchAll(/import\(\s*["']((?:\.\.\/)+extensions\/[^"']+)["']\s*\)/g),
-  ].map((match) => match[1]);
+  ].flatMap((match) => (match[1] === undefined ? [] : [match[1]]));
 }
 
 function isAllowedExtensionPublicImport(specifier: string): boolean {
-  return /(?:^|\/)extensions\/[^/]+\/(?:api|index|runtime-api|setup-entry|login-qr-api)\.js$/u.test(
+  return /(?:^|\/)extensions\/[^/]+\/(?:api|index|runtime-api|setup-entry|login-qr-api|test-api)\.js$/u.test(
     specifier,
   );
 }
@@ -106,7 +108,7 @@ function findPluginSdkImports(source: string): string[] {
   return [
     ...source.matchAll(/from\s+["']((?:\.\.\/)+plugin-sdk\/[^"']+)["']/g),
     ...source.matchAll(/import\(\s*["']((?:\.\.\/)+plugin-sdk\/[^"']+)["']\s*\)/g),
-  ].map((match) => match[1]);
+  ].flatMap((match) => (match[1] === undefined ? [] : [match[1]]));
 }
 
 function findBundledPluginPublicSurfaceImports(source: string): string[] {
@@ -123,11 +125,20 @@ function findRelativeSrcImports(source: string): string[] {
     ...source.matchAll(/from\s+["']((?:\.\.?\/)+src\/[^"']+)["']/g),
     ...source.matchAll(/import\(\s*["']((?:\.\.?\/)+src\/[^"']+)["']\s*\)/g),
     ...source.matchAll(/vi\.(?:mock|doMock)\s*\(\s*["']((?:\.\.?\/)+src\/[^"']+)["']/g),
-  ].map((match) => match[1]);
+  ].flatMap((match) => (match[1] === undefined ? [] : [match[1]]));
 }
 
 function getImportBasename(importPath: string): string {
   return importPath.split("/").at(-1) ?? importPath;
+}
+
+function readImportBindingName(binding: string): string {
+  return (
+    binding
+      .trim()
+      .replace(/^type\s+/u, "")
+      .split(/\s+as\s+/u)[0] ?? ""
+  );
 }
 
 function collectBundledPluginIds(): Set<string> {
@@ -252,32 +263,16 @@ describe("non-extension test boundaries", () => {
     expect(imports).toStrictEqual([]);
   });
 
-  it("keeps bundled plugin public-surface imports out of core source", () => {
+  it("keeps bundled plugin public-surface imports out of core production source", () => {
     const files = walkCode(path.join(repoRoot, "src")).filter(
-      (file) => !file.startsWith(CHANNEL_CONTRACT_TEST_HELPERS_PREFIX),
+      (file) =>
+        !getChangedPathFacts(file).isTestOnly &&
+        !file.startsWith(CHANNEL_CONTRACT_TEST_HELPERS_PREFIX),
     );
 
     const offenders = files.filter((file) => {
       const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
       return findBundledPluginPublicSurfaceImports(source).length > 0;
-    });
-
-    expect(offenders).toStrictEqual([]);
-  });
-
-  it("keeps bundled plugin sync test-api loaders out of core tests", () => {
-    const files = [
-      ...walkCode(path.join(repoRoot, "src")),
-      ...walkCode(path.join(repoRoot, "test")),
-    ]
-      .filter((file) => !file.startsWith(BUNDLED_PLUGIN_PATH_PREFIX))
-      .filter((file) => !file.startsWith(CHANNEL_CONTRACT_TEST_HELPERS_PREFIX))
-      .filter((file) => !file.startsWith("test/helpers/"))
-      .filter((file) => file !== "test/extension-test-boundary.test.ts");
-
-    const offenders = files.filter((file) => {
-      const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
-      return source.includes("loadBundledPluginTestApiSync(");
     });
 
     expect(offenders).toStrictEqual([]);
@@ -323,9 +318,8 @@ describe("non-extension test boundaries", () => {
     expect(offenders).toStrictEqual([]);
   });
 
-  it("keeps extension tests off legacy broad testing barrels and repo helper bridges", () => {
+  it("keeps extension tests off the legacy test alias and repo helper bridges", () => {
     const bannedPatterns = [
-      /["']openclaw\/plugin-sdk\/testing["']/u,
       /["']openclaw\/plugin-sdk\/test-utils["']/u,
       /["'](?:\.\.\/)+(?:test\/helpers\/channels\/)[^"']+["']/u,
       /["'](?:\.\.\/)+(?:src\/channels\/plugins\/contracts\/test-helpers\/)[^"']+["']/u,
@@ -357,12 +351,39 @@ describe("non-extension test boundaries", () => {
     expect(offenders).toStrictEqual([]);
   });
 
-  it("keeps bundled extension sources off deprecated channel config schema aliases", () => {
+  it("keeps bundled extension sources on the canonical channel config schema facade", () => {
     const files = walkCode(path.join(repoRoot, "extensions"));
+    // The legacy/primitives shells stay export-compatible for third-party
+    // plugins only; bundled code imports channel-config-schema, plus the
+    // bundled facade strictly for retained bundled provider schemas.
+    const bannedSpecifiers = [
+      "openclaw/plugin-sdk/channel-config-schema-legacy",
+      "openclaw/plugin-sdk/channel-config-primitives",
+    ];
+    const bundledProviderSchemaNames = new Set([
+      "GoogleChatConfigSchema",
+      "IMessageConfigSchema",
+      "TelegramConfigSchema",
+      "WhatsAppConfigSchema",
+    ]);
+    const bundledFacadeBindingPattern =
+      /\b(?:import|export)\s+(?:type\s+)?\{(?<bindings>[^}]*)\}\s*from\s*["']openclaw\/plugin-sdk\/bundled-channel-config-schema["']/gu;
 
-    const offenders = files.filter((file) => {
+    const offenders = files.flatMap((file) => {
       const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
-      return source.includes("openclaw/plugin-sdk/channel-config-schema-legacy");
+      const fileOffenders = bannedSpecifiers
+        .filter((specifier) => source.includes(specifier))
+        .map((specifier) => `${file}: ${specifier}`);
+      for (const match of source.matchAll(bundledFacadeBindingPattern)) {
+        const genericBindings = (match.groups?.bindings ?? "")
+          .split(",")
+          .map(readImportBindingName)
+          .filter((name) => name.length > 0 && !bundledProviderSchemaNames.has(name));
+        fileOffenders.push(
+          ...genericBindings.map((name) => `${file}: bundled-channel-config-schema#${name}`),
+        );
+      }
+      return fileOffenders;
     });
 
     expect(offenders).toStrictEqual([]);

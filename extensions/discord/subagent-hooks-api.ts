@@ -1,23 +1,21 @@
+// Discord API module exposes the plugin public contract.
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-entry-contract";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 
-type DiscordSubagentHooksModule = typeof import("./src/subagent-hooks.js");
-
-let discordSubagentHooksPromise: Promise<DiscordSubagentHooksModule> | null = null;
-
-function loadDiscordSubagentHooksModule() {
-  discordSubagentHooksPromise ??= import("./src/subagent-hooks.js");
-  return discordSubagentHooksPromise;
-}
-
+const loadDiscordSubagentHooksModule = createLazyRuntimeModule(
+  () => import("./src/subagent-hooks.js"),
+);
 // Subagent hooks live behind a dedicated barrel so the bundled entry can
 // register one stable hook wiring path while keeping the handler module lazy.
 export function registerDiscordSubagentHooks(api: OpenClawPluginApi): void {
   api.on("subagent_ended", async (event) => {
-    const { handleDiscordSubagentEnded } = await loadDiscordSubagentHooksModule();
+    const { ensureBindingsLoadedAsync, handleDiscordSubagentEnded } =
+      await loadDiscordSubagentHooksModule();
+    await ensureBindingsLoadedAsync();
     handleDiscordSubagentEnded(event);
   });
   api.on("subagent_delivery_target", async (event) => {
-    const { handleDiscordSubagentDeliveryTarget } = await loadDiscordSubagentHooksModule();
-    return handleDiscordSubagentDeliveryTarget(event);
+    const { handleDiscordSubagentDeliveryTargetAsync } = await loadDiscordSubagentHooksModule();
+    return await handleDiscordSubagentDeliveryTargetAsync(event);
   });
 }

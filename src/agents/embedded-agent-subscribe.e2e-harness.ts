@@ -1,6 +1,10 @@
+/**
+ * E2E harness helpers for subscribed embedded-agent event streams.
+ */
 import { expect } from "vitest";
 import type { AssistantMessage } from "../llm/types.js";
 import { subscribeEmbeddedAgentSession } from "./embedded-agent-subscribe.js";
+import { makeAgentAssistantMessage } from "./test-helpers/agent-message-fixtures.js";
 
 type SubscribeEmbeddedAgentSession = typeof subscribeEmbeddedAgentSession;
 type SubscribeEmbeddedAgentSessionParams = Parameters<SubscribeEmbeddedAgentSession>[0];
@@ -14,6 +18,7 @@ export const THINKING_TAG_CASES = [
   { tag: "thought", open: "<thought>", close: "</thought>" },
   { tag: "antthinking", open: "<antthinking>", close: "</antthinking>" },
   { tag: "antml:thinking", open: "<antml:thinking>", close: "</antml:thinking>" },
+  { tag: "mm:think", open: "<mm:think>", close: "</mm:think>" },
 ] as const;
 
 export function createStubSessionHarness(): {
@@ -174,15 +179,16 @@ export function emitAssistantLifecycleErrorAndEnd(params: {
   provider?: string;
   model?: string;
 }): void {
-  const assistantMessage = {
-    role: "assistant",
+  const assistantMessage = makeAgentAssistantMessage({
+    content: [],
     stopReason: "error",
     errorMessage: params.errorMessage,
     ...(params.provider ? { provider: params.provider } : {}),
     ...(params.model ? { model: params.model } : {}),
-  } as AssistantMessage;
-  params.emit({ type: "message_update", message: assistantMessage });
-  params.emit({ type: "agent_end" });
+  });
+  params.emit({ type: "message_start", message: assistantMessage });
+  params.emit({ type: "message_end", message: assistantMessage });
+  params.emit({ type: "agent_end", messages: [assistantMessage], willRetry: false });
 }
 
 export function createReasoningFinalAnswerMessage(): AssistantMessage {
@@ -230,4 +236,27 @@ export function expectSingleAgentEventText(calls: Array<unknown[]>, text: string
   expect(payloads).toHaveLength(1);
   expect(payloads[0]?.text).toBe(text);
   expect(payloads[0]?.delta).toBe(text);
+}
+
+export function emitToolRun(params: {
+  emit: (evt: unknown) => void;
+  toolName: string;
+  toolCallId: string;
+  args?: Record<string, unknown>;
+  isError: boolean;
+  result: unknown;
+}): void {
+  params.emit({
+    type: "tool_execution_start",
+    toolName: params.toolName,
+    toolCallId: params.toolCallId,
+    args: params.args,
+  });
+  params.emit({
+    type: "tool_execution_end",
+    toolName: params.toolName,
+    toolCallId: params.toolCallId,
+    isError: params.isError,
+    result: params.result,
+  });
 }

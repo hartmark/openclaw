@@ -1,3 +1,4 @@
+// Tests Claude provider usage fetch normalization and error handling.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createProviderUsageFetch,
@@ -48,6 +49,33 @@ function makeOrgAResponse() {
   return makeResponse(200, [{ uuid: "org-a" }]);
 }
 
+function makeOversizedJsonResponse(status: number): {
+  response: Response;
+  state: { canceled: boolean; enqueuedBytes: number };
+} {
+  const state = { canceled: false, enqueuedBytes: 0 };
+  const chunkSize = 1024 * 1024;
+  let emitted = 0;
+  const response = new Response(
+    new ReadableStream({
+      pull(controller) {
+        if (emitted >= 64) {
+          controller.close();
+          return;
+        }
+        emitted += 1;
+        state.enqueuedBytes += chunkSize;
+        controller.enqueue(new Uint8Array(chunkSize));
+      },
+      cancel() {
+        state.canceled = true;
+      },
+    }),
+    { status, headers: { "Content-Type": "application/json" } },
+  );
+  return { response, state };
+}
+
 describe("fetchClaudeUsage", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -75,6 +103,120 @@ describe("fetchClaudeUsage", () => {
       { label: "Week", usedPercent: 54, resetAt: new Date(weekReset).getTime() },
       { label: "Sonnet", usedPercent: 67 },
     ]);
+  });
+
+  it("omits invalid reset timestamps from usage windows", async () => {
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, {
+        five_hour: { utilization: 18, resets_at: "not-a-date" },
+        limits: [
+          {
+            percent: 27,
+            resets_at: "also-invalid",
+            is_active: true,
+            scope: { model: { display_name: "Fable" } },
+          },
+        ],
+      }),
+    );
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.windows).toEqual([
+      { label: "5h", usedPercent: 18, resetAt: undefined },
+      { label: "Fable", usedPercent: 27, resetAt: undefined },
+    ]);
+  });
+
+  it("parses model-scoped limits and extra usage billing", async () => {
+    const reset = "2026-01-12T00:00:00Z";
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, {
+        limits: [
+          {
+            kind: "weekly_scoped",
+            percent: 27,
+            resets_at: reset,
+            is_active: true,
+            scope: { model: { id: "claude-fable", display_name: "Fable" } },
+          },
+          {
+            percent: 80,
+            is_active: false,
+            scope: { model: { display_name: "Inactive" } },
+          },
+        ],
+        extra_usage: {
+          is_enabled: true,
+          monthly_limit: 100000,
+          used_credits: 4132,
+          utilization: 4.132,
+          currency: "usd",
+        },
+      }),
+    );
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    // Extra usage renders as the budget billing entry only; a duplicate
+    // window row for the same credits would double-display in usage surfaces.
+    expect(result.windows).toEqual([
+      { label: "Fable", usedPercent: 27, resetAt: new Date(reset).getTime() },
+    ]);
+    expect(result.billing).toEqual([
+      { type: "budget", used: 41.32, limit: 1000, unit: "USD", period: "month" },
+    ]);
+  });
+
+  it("accepts absent activity flags and deduplicates normalized model labels", async () => {
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, {
+        seven_day_sonnet: { utilization: 40 },
+        limits: [
+          { percent: 80, scope: { model: { display_name: " sonnet " } } },
+          { percent: 27, scope: { model: { display_name: " ", id: " Fable " } } },
+          { percent: 90, scope: { model: { display_name: "FABLE" } } },
+          { percent: 12, is_active: "false", scope: { model: { id: "Other" } } },
+          { percent: 0, is_active: null, scope: { model: { id: "Zero" } } },
+        ],
+      }),
+    );
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.windows).toEqual([
+      { label: "Sonnet", usedPercent: 40 },
+      { label: "Fable", usedPercent: 27, resetAt: undefined },
+      { label: "Other", usedPercent: 12, resetAt: undefined },
+      { label: "Zero", usedPercent: 0, resetAt: undefined },
+    ]);
+  });
+
+  it.each([
+    ["missing credit amounts", undefined, undefined, undefined],
+    ["negative credits", -1, 100, undefined],
+    [
+      "a zero credit budget",
+      0,
+      0,
+      [{ type: "budget", used: 0, limit: 0, unit: "USD", period: "month" }],
+    ],
+  ])("handles extra usage with %s", async (_name, usedCredits, monthlyLimit, billing) => {
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, {
+        extra_usage: {
+          is_enabled: true,
+          utilization: 12,
+          used_credits: usedCredits,
+          monthly_limit: monthlyLimit,
+        },
+      }),
+    );
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.windows).toEqual(billing ? [] : [{ label: "Extra usage", usedPercent: 12 }]);
+    expect(result.billing).toEqual(billing);
   });
 
   it("clamps oauth usage windows and prefers sonnet over opus when both exist", async () => {
@@ -128,6 +270,18 @@ describe("fetchClaudeUsage", () => {
     expect(result.windows).toHaveLength(0);
   });
 
+  it("bounds oversized oauth error bodies and cancels the stream", async () => {
+    const oversized = makeOversizedJsonResponse(403);
+    const mockFetch = createProviderUsageFetch(async () => oversized.response);
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.error).toBe("HTTP 403");
+    expect(result.windows).toHaveLength(0);
+    expect(oversized.state.canceled).toBe(true);
+    expect(oversized.state.enqueuedBytes).toBeLessThan(64 * 1024 * 1024);
+  });
+
   it("returns a stable error for malformed successful oauth usage JSON", async () => {
     const mockFetch = createProviderUsageFetch(async () => makeResponse(200, "{not json"));
 
@@ -135,6 +289,94 @@ describe("fetchClaudeUsage", () => {
 
     expect(result.error).toBe("Malformed usage response");
     expect(result.windows).toHaveLength(0);
+  });
+
+  it.each([
+    { name: "null", payload: null },
+    { name: "array", payload: [] },
+  ])("treats a successful top-level $name as an empty usage snapshot", async ({ payload }) => {
+    const mockFetch = createProviderUsageFetch(async () => makeResponse(200, payload));
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.error).toBeUndefined();
+    expect(result.windows).toEqual([]);
+    expect(result.billing).toBeUndefined();
+  });
+
+  it("ignores a non-array limits value", async () => {
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, { limits: { percent: 27 } }),
+    );
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.error).toBeUndefined();
+    expect(result.windows).toEqual([]);
+  });
+
+  it("skips malformed limits while preserving valid usage windows", async () => {
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, {
+        limits: [
+          null,
+          "malformed",
+          [],
+          { percent: 50, scope: [] },
+          { percent: 60, scope: { model: [] } },
+          { percent: "80", scope: { model: { id: "Numeric string" } } },
+          {
+            percent: 27,
+            is_active: true,
+            scope: { model: { display_name: "Fable" } },
+          },
+        ],
+      }),
+    );
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.error).toBeUndefined();
+    expect(result.windows).toEqual([{ label: "Fable", usedPercent: 27, resetAt: undefined }]);
+  });
+
+  it("skips malformed nested windows without masking a valid model window", async () => {
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, {
+        five_hour: { utilization: "18" },
+        seven_day: null,
+        seven_day_sonnet: {},
+        seven_day_opus: { utilization: 44 },
+        extra_usage: { is_enabled: "false", utilization: 12 },
+      }),
+    );
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.error).toBeUndefined();
+    expect(result.windows).toEqual([{ label: "Opus", usedPercent: 44 }]);
+  });
+
+  it("defaults malformed extra-usage currency without dropping valid billing", async () => {
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, {
+        extra_usage: {
+          is_enabled: true,
+          monthly_limit: 10_000,
+          used_credits: 500,
+          utilization: 5,
+          currency: 123,
+        },
+      }),
+    );
+
+    const result = await fetchClaudeUsage("token", 5000, mockFetch);
+
+    expect(result.error).toBeUndefined();
+    expect(result.windows).toEqual([]);
+    expect(result.billing).toEqual([
+      { type: "budget", used: 5, limit: 100, unit: "USD", period: "month" },
+    ]);
   });
 
   it("falls back to claude web usage when oauth scope is missing", async () => {
@@ -155,6 +397,8 @@ describe("fetchClaudeUsage", () => {
       if (url.endsWith("/api/organizations/org-123/usage")) {
         return makeResponse(200, {
           five_hour: { utilization: 12 },
+          limits: [{ percent: 30, scope: { model: { id: "Extra usage" } } }],
+          extra_usage: { is_enabled: true, utilization: 25, used_credits: 25, monthly_limit: 100 },
         });
       }
 
@@ -164,7 +408,12 @@ describe("fetchClaudeUsage", () => {
     const result = await fetchClaudeUsage("token", 5000, mockFetch);
 
     expect(result.error).toBeUndefined();
-    expect(result.windows).toEqual([{ label: "5h", usedPercent: 12, resetAt: undefined }]);
+    expect(result.windows).toStrictEqual([
+      { label: "5h", usedPercent: 12, resetAt: undefined },
+      { label: "Extra usage", usedPercent: 30, resetAt: undefined },
+      { label: "Extra usage", usedPercent: 25 },
+    ]);
+    expect(result.billing).toBeUndefined();
   });
 
   it("parses sessionKey from Cookie-prefixed CLAUDE_WEB_COOKIE headers", async () => {
@@ -228,6 +477,11 @@ describe("fetchClaudeUsage", () => {
       usageResponse: () => makeResponse(200, {}),
     },
     {
+      name: "org list has a malformed id",
+      orgResponse: () => makeResponse(200, [{ uuid: 123 }]),
+      usageResponse: () => makeResponse(200, {}),
+    },
+    {
       name: "usage request fails",
       orgResponse: makeOrgAResponse,
       usageResponse: () => makeResponse(503, "down"),
@@ -236,6 +490,11 @@ describe("fetchClaudeUsage", () => {
       name: "usage request has no windows",
       orgResponse: makeOrgAResponse,
       usageResponse: () => makeResponse(200, {}),
+    },
+    {
+      name: "usage request returns null",
+      orgResponse: makeOrgAResponse,
+      usageResponse: () => makeResponse(200, null),
     },
   ])(
     "returns oauth error when web fallback is unavailable: $name",

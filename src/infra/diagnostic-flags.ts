@@ -1,3 +1,4 @@
+// Resolves diagnostics feature flags from config and environment.
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { normalizeUniqueStringEntriesLower } from "@openclaw/normalization-core/string-normalization";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -25,18 +26,12 @@ function parseEnvFlags(raw?: string): ParsedEnvFlags {
     return { flags: ["*"], disablesAll: false };
   }
   return {
-    flags: trimmed
-      .split(/[,\s]+/)
-      .map((value) => normalizeLowercaseStringOrEmpty(value))
-      .filter(Boolean),
+    flags: trimmed.split(/[,\s]+/),
     disablesAll: false,
   };
 }
 
-function uniqueFlags(flags: string[]): string[] {
-  return normalizeUniqueStringEntriesLower(flags);
-}
-
+/** Resolves enabled diagnostic flags from config plus `OPENCLAW_DIAGNOSTICS` overrides. */
 export function resolveDiagnosticFlags(
   cfg?: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
@@ -46,9 +41,10 @@ export function resolveDiagnosticFlags(
   if (envFlags.disablesAll) {
     return [];
   }
-  return uniqueFlags([...configFlags, ...envFlags.flags]);
+  return normalizeUniqueStringEntriesLower([...configFlags, ...envFlags.flags]);
 }
 
+/** Matches one diagnostic flag against exact, wildcard, and namespace-enabled flags. */
 export function matchesDiagnosticFlag(flag: string, enabledFlags: string[]): boolean {
   const target = normalizeLowercaseStringOrEmpty(flag);
   if (!target) {
@@ -81,6 +77,7 @@ export function matchesDiagnosticFlag(flag: string, enabledFlags: string[]): boo
   return false;
 }
 
+/** Returns whether a diagnostic flag is enabled after config/env resolution. */
 export function isDiagnosticFlagEnabled(
   flag: string,
   cfg?: OpenClawConfig,

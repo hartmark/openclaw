@@ -1,22 +1,25 @@
+// Binding scope helpers normalize route binding scope values.
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { normalizeChatChannelId } from "../channels/ids.js";
 import type { AgentRouteBinding } from "../config/types.agents.js";
 import { normalizeAccountId, normalizeAgentId } from "./session-key.js";
 
-export type RouteBindingScopeConstraint = {
+// Route binding scopes constrain a configured agent/account binding to a guild,
+// team, group space, and optionally channel/platform role ids.
+type RouteBindingScopeConstraint = {
   guildId?: string | null;
   teamId?: string | null;
   roles?: string[] | null;
 };
 
-export type RouteBindingScope = {
+type RouteBindingScope = {
   guildId?: string | null;
   teamId?: string | null;
   groupSpace?: string | null;
   memberRoleIds?: Iterable<string> | null;
 };
 
-export type NormalizedRouteBindingMatch = {
+type NormalizedRouteBindingMatch = {
   agentId: string;
   accountId: string;
   channelId: string;
@@ -45,8 +48,11 @@ export function normalizeRouteBindingChannelId(raw?: string | null): string | nu
   return fallback || null;
 }
 
+// Convert a binding match into the same canonical ids used by session routing.
+// Diagnostics include implicit defaults; outbound account selection requires explicit bindings.
 export function resolveNormalizedRouteBindingMatch(
   binding: AgentRouteBinding,
+  options?: { includeImplicitDefaultAccount?: boolean },
 ): NormalizedRouteBindingMatch | null {
   if (!binding || typeof binding !== "object") {
     return null;
@@ -59,8 +65,11 @@ export function resolveNormalizedRouteBindingMatch(
   if (!channelId) {
     return null;
   }
-  const accountId = typeof match.accountId === "string" ? match.accountId.trim() : "";
-  if (!accountId || accountId === "*") {
+  if (match.accountId !== undefined && typeof match.accountId !== "string") {
+    return null;
+  }
+  const accountId = match.accountId?.trim();
+  if (accountId === "*" || (!accountId && !options?.includeImplicitDefaultAccount)) {
     return null;
   }
   return {
@@ -97,6 +106,8 @@ function hasAnyRouteBindingRole(
   if (hasRoleLookup(memberRoleIds)) {
     return roles.some((role) => memberRoleIds.has(role));
   }
+  // Most callers pass a Set, but arrays/iterables from channel adapters are
+  // accepted to avoid forcing allocation at every routing call site.
   const memberRoleIdSet = new Set(memberRoleIds);
   return roles.some((role) => memberRoleIdSet.has(role));
 }

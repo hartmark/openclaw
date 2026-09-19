@@ -1,3 +1,4 @@
+// Msteams tests cover probe plugin behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MSTeamsConfig } from "../runtime-api.js";
 
@@ -46,7 +47,7 @@ vi.mock("./token.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./token.js")>();
   return {
     ...actual,
-    loadDelegatedTokens: () => hostMockState.delegatedTokens,
+    loadDelegatedTokens: async () => hostMockState.delegatedTokens,
   };
 });
 

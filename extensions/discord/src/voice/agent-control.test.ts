@@ -1,3 +1,4 @@
+// Discord tests cover agent control plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { maybeControlDiscordVoiceAgentRun } from "./agent-control.js";
 
@@ -12,10 +13,17 @@ vi.mock("openclaw/plugin-sdk/realtime-voice", () => ({
 }));
 
 function createEntry() {
-  return { route: { sessionKey: "discord:g1:c1" } } as Parameters<
-    typeof maybeControlDiscordVoiceAgentRun
-  >[0]["entry"];
+  return {
+    route: { sessionKey: "discord:g1:c1" },
+    sessionLifecycle: { status: "active" },
+  } as Parameters<typeof maybeControlDiscordVoiceAgentRun>[0]["entry"];
 }
+
+const authority = {
+  accountId: "default",
+  context: { senderIsOwner: true, speakerLabel: "Speaker" },
+  isCurrent: () => true,
+};
 
 describe("maybeControlDiscordVoiceAgentRun", () => {
   beforeEach(() => {
@@ -37,6 +45,7 @@ describe("maybeControlDiscordVoiceAgentRun", () => {
 
     await expect(
       maybeControlDiscordVoiceAgentRun({
+        ...authority,
         entry: createEntry(),
         text: "cancel my meeting tomorrow",
       }),
@@ -57,6 +66,7 @@ describe("maybeControlDiscordVoiceAgentRun", () => {
 
     await expect(
       maybeControlDiscordVoiceAgentRun({
+        ...authority,
         entry: createEntry(),
         text: "cancel that",
       }),
@@ -72,6 +82,7 @@ describe("maybeControlDiscordVoiceAgentRun", () => {
 
     await expect(
       maybeControlDiscordVoiceAgentRun({
+        ...authority,
         entry: createEntry(),
         text: "what is next",
       }),

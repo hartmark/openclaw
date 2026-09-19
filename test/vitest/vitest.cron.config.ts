@@ -1,3 +1,4 @@
+// Vitest cron config wires the cron test shard.
 import { createScopedVitestConfig } from "./vitest.scoped-config.ts";
 
 export function createCronVitestConfig(env?: Record<string, string | undefined>) {
@@ -5,6 +6,7 @@ export function createCronVitestConfig(env?: Record<string, string | undefined>)
     dir: "src",
     env,
     name: "cron",
+    pool: "forks",
     passWithNoTests: true,
   });
   config.test = {

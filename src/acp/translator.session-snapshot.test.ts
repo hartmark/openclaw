@@ -1,3 +1,4 @@
+/** Tests ACP session metadata and usage snapshots after prompts. */
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "../gateway/client.js";
@@ -6,8 +7,11 @@ import {
   createPromptRequest,
   createChatFinalEvent,
 } from "./translator.bridge-test-helpers.js";
-import { AcpGatewayAgent } from "./translator.js";
-import { createAcpConnection, createAcpGateway } from "./translator.test-helpers.js";
+import {
+  createAcpConnection,
+  createAcpGateway,
+  createAcpGatewayAgent,
+} from "./translator.test-helpers.js";
 
 vi.mock("./commands.js", () => ({
   getAvailableCommands: () => [],
@@ -50,7 +54,7 @@ describe("acp session metadata and usage updates", () => {
       }
       return { ok: true };
     }) as GatewayClient["request"];
-    const agent = new AcpGatewayAgent(connection, createAcpGateway(request), {
+    const agent = createAcpGatewayAgent(connection, createAcpGateway(request), {
       sessionStore,
     });
 
@@ -85,8 +89,6 @@ describe("acp session metadata and usage updates", () => {
         },
       },
     });
-
-    sessionStore.clearAllSessionsForTest();
   });
 
   it("still resolves prompts when snapshot updates fail after completion", async () => {
@@ -125,7 +127,7 @@ describe("acp session metadata and usage updates", () => {
       }
       return { ok: true };
     }) as GatewayClient["request"];
-    const agent = new AcpGatewayAgent(connection, createAcpGateway(request), {
+    const agent = createAcpGatewayAgent(connection, createAcpGateway(request), {
       sessionStore,
     });
 
@@ -140,7 +142,5 @@ describe("acp session metadata and usage updates", () => {
     const session = sessionStore.getSession("usage-session");
     expect(session?.activeRunId).toBeNull();
     expect(session?.abortController).toBeNull();
-
-    sessionStore.clearAllSessionsForTest();
   });
 });

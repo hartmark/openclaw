@@ -1,81 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { handleMatrixAction } from "./tool-actions.js";
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  getMatrixActionMocks,
+  resetMatrixActionMocks,
+  runMatrixAction,
+} from "./tool-actions.test-support.js";
 import type { CoreConfig } from "./types.js";
 
-const mocks = vi.hoisted(() => ({
-  voteMatrixPoll: vi.fn(),
-  reactMatrixMessage: vi.fn(),
-  listMatrixReactions: vi.fn(),
-  removeMatrixReactions: vi.fn(),
-  sendMatrixMessage: vi.fn(),
-  listMatrixPins: vi.fn(),
-  getMatrixMemberInfo: vi.fn(),
-  getMatrixRoomInfo: vi.fn(),
-  applyMatrixProfileUpdate: vi.fn(),
-}));
+const mocks = getMatrixActionMocks();
 
-vi.mock("./matrix/actions.js", () => {
-  return {
-    getMatrixMemberInfo: mocks.getMatrixMemberInfo,
-    getMatrixRoomInfo: mocks.getMatrixRoomInfo,
-    listMatrixReactions: mocks.listMatrixReactions,
-    listMatrixPins: mocks.listMatrixPins,
-    removeMatrixReactions: mocks.removeMatrixReactions,
-    sendMatrixMessage: mocks.sendMatrixMessage,
-    voteMatrixPoll: mocks.voteMatrixPoll,
-  };
-});
-
-vi.mock("./matrix/send.js", () => {
-  return {
-    reactMatrixMessage: mocks.reactMatrixMessage,
-  };
-});
-
-vi.mock("./profile-update.js", () => ({
-  applyMatrixProfileUpdate: (...args: unknown[]) => mocks.applyMatrixProfileUpdate(...args),
-}));
-
-describe("handleMatrixAction pollVote", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.voteMatrixPoll.mockResolvedValue({
-      eventId: "evt-poll-vote",
-      roomId: "!room:example",
-      pollId: "$poll",
-      answerIds: ["a1", "a2"],
-      labels: ["Pizza", "Sushi"],
-      maxSelections: 2,
-    });
-    mocks.listMatrixReactions.mockResolvedValue([{ key: "👍", count: 1, users: ["@u:example"] }]);
-    mocks.listMatrixPins.mockResolvedValue({ pinned: ["$pin"], events: [] });
-    mocks.removeMatrixReactions.mockResolvedValue({ removed: 1 });
-    mocks.sendMatrixMessage.mockResolvedValue({
-      messageId: "$sent",
-      roomId: "!room:example",
-    });
-    mocks.getMatrixMemberInfo.mockResolvedValue({ userId: "@u:example" });
-    mocks.getMatrixRoomInfo.mockResolvedValue({ roomId: "!room:example" });
-    mocks.applyMatrixProfileUpdate.mockResolvedValue({
-      accountId: "ops",
-      displayName: "Ops Bot",
-      avatarUrl: "mxc://example/avatar",
-      profile: {
-        displayNameUpdated: true,
-        avatarUpdated: true,
-        resolvedAvatarUrl: "mxc://example/avatar",
-        uploadedAvatarSource: null,
-        convertedAvatarFromHttp: false,
-      },
-      configPath: "channels.matrix.accounts.ops",
-    });
-  });
+describe("Matrix public message actions", () => {
+  beforeEach(resetMatrixActionMocks);
 
   it("parses snake_case vote params and forwards normalized selectors", async () => {
     const cfg = {} as CoreConfig;
-    const result = await handleMatrixAction(
+    const result = await runMatrixAction(
+      "poll-vote",
       {
-        action: "pollVote",
         account_id: "main",
         room_id: "!room:example",
         poll_id: "$poll",
@@ -90,6 +30,7 @@ describe("handleMatrixAction pollVote", () => {
     expect(mocks.voteMatrixPoll).toHaveBeenCalledWith("!room:example", "$poll", {
       cfg,
       accountId: "main",
+      client: mocks.matrixClient,
       optionIds: ["a2", "a1"],
       optionIndexes: [1, 2],
     });
@@ -108,9 +49,9 @@ describe("handleMatrixAction pollVote", () => {
 
   it("rejects missing poll ids", async () => {
     await expect(
-      handleMatrixAction(
+      runMatrixAction(
+        "poll-vote",
         {
-          action: "pollVote",
           roomId: "!room:example",
           pollOptionIndex: 1,
         },
@@ -121,9 +62,9 @@ describe("handleMatrixAction pollVote", () => {
 
   it("rejects fractional poll option indexes before voting", async () => {
     await expect(
-      handleMatrixAction(
+      runMatrixAction(
+        "poll-vote",
         {
-          action: "pollVote",
           roomId: "!room:example",
           pollId: "$poll",
           pollOptionIndex: 1.5,
@@ -132,9 +73,9 @@ describe("handleMatrixAction pollVote", () => {
       ),
     ).rejects.toThrow("pollOptionIndex must be a positive integer.");
     await expect(
-      handleMatrixAction(
+      runMatrixAction(
+        "poll-vote",
         {
-          action: "pollVote",
           roomId: "!room:example",
           pollId: "$poll",
           pollOptionIndexes: [1, 2.5],
@@ -147,9 +88,9 @@ describe("handleMatrixAction pollVote", () => {
 
   it("accepts messageId as a pollId alias for poll votes", async () => {
     const cfg = {} as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "poll-vote",
       {
-        action: "pollVote",
         roomId: "!room:example",
         messageId: "$poll",
         pollOptionIndex: 1,
@@ -159,67 +100,199 @@ describe("handleMatrixAction pollVote", () => {
 
     expect(mocks.voteMatrixPoll).toHaveBeenCalledWith("!room:example", "$poll", {
       cfg,
+      client: mocks.matrixClient,
       optionIds: [],
       optionIndexes: [1],
     });
   });
 
+  it("authorizes the room before reading the poll", async () => {
+    mocks.withAuthorizedMatrixReadTarget.mockRejectedValueOnce(
+      new Error("Matrix read target is not allowed."),
+    );
+
+    await expect(
+      runMatrixAction(
+        "poll-vote",
+        {
+          roomId: "!blocked:example",
+          pollId: "$poll",
+          pollOptionIndex: 1,
+        },
+        {} as CoreConfig,
+      ),
+    ).rejects.toThrow("Matrix read target is not allowed.");
+
+    expect(mocks.voteMatrixPoll).not.toHaveBeenCalled();
+  });
+
   it("passes account-scoped opts to add reactions", async () => {
     const cfg = { channels: { matrix: { actions: { reactions: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "react",
       {
-        action: "react",
-        accountId: "ops",
         roomId: "!room:example",
         messageId: "$msg",
         emoji: "👍",
       },
       cfg,
+      { accountId: "ops" },
     );
 
     expect(mocks.reactMatrixMessage).toHaveBeenCalledWith("!room:example", "$msg", "👍", {
       cfg,
       accountId: "ops",
+      client: mocks.matrixClient,
     });
   });
 
+  it("lists custom emotes only after authorizing the selected Matrix room", async () => {
+    const cfg = { channels: { matrix: { actions: { reactions: true } } } } as CoreConfig;
+    const result = await runMatrixAction(
+      "emoji-list",
+      {
+        roomId: "room:!room:example",
+        limit: 5,
+      },
+      cfg,
+      {
+        requesterAccountId: "ops",
+        toolContext: { currentChannelId: "room:!room:example", currentChannelProvider: "matrix" },
+        accountId: "ops",
+      },
+    );
+
+    expect(mocks.listMatrixEmojis).toHaveBeenCalledWith("!room:example", {
+      cfg,
+      accountId: "ops",
+      client: mocks.matrixClient,
+      limit: 5,
+    });
+    expect(result.details).toEqual({
+      ok: true,
+      emojis: [{ name: "party", identifier: "party", url: "mxc://example.org/party" }],
+    });
+  });
+
+  it("rejects custom-emote discovery when reactions or room access are disabled", async () => {
+    const params = { action: "emoji-list", roomId: "!blocked:example" };
+
+    await expect(
+      runMatrixAction(
+        "emoji-list",
+        {
+          roomId: params.roomId,
+        },
+        {
+          channels: { matrix: { actions: { reactions: false } } },
+        } as CoreConfig,
+      ),
+    ).rejects.toThrow("Matrix reactions are disabled.");
+    expect(mocks.withAuthorizedMatrixReadTarget).not.toHaveBeenCalled();
+
+    mocks.withAuthorizedMatrixReadTarget.mockRejectedValueOnce(
+      new Error("Matrix read target is not allowed."),
+    );
+    await expect(
+      runMatrixAction(
+        "emoji-list",
+        {
+          roomId: params.roomId,
+        },
+        {} as CoreConfig,
+      ),
+    ).rejects.toThrow("Matrix read target is not allowed.");
+    expect(mocks.listMatrixEmojis).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      action: "react",
+      params: { emoji: "👍" },
+      providerCall: mocks.reactMatrixMessage,
+    },
+    {
+      action: "edit",
+      params: { message: "updated" },
+      providerCall: mocks.editMatrixMessage,
+    },
+    {
+      action: "delete",
+      params: {},
+      providerCall: mocks.deleteMatrixMessage,
+    },
+  ] as const)(
+    "rejects blocked $action before mutating Matrix",
+    async ({ action, params, providerCall }) => {
+      mocks.withAuthorizedMatrixReadTarget.mockRejectedValueOnce(
+        new Error("Matrix read target is not allowed."),
+      );
+      const cfg = {
+        channels: {
+          matrix: {
+            actions: {
+              messages: true,
+              reactions: true,
+            },
+          },
+        },
+      } as CoreConfig;
+
+      await expect(
+        runMatrixAction(
+          action,
+          {
+            roomId: "!blocked:example",
+            messageId: "$msg",
+            ...params,
+          },
+          cfg,
+        ),
+      ).rejects.toThrow("Matrix read target is not allowed.");
+
+      expect(providerCall).not.toHaveBeenCalled();
+    },
+  );
+
   it("passes account-scoped opts to remove reactions", async () => {
     const cfg = { channels: { matrix: { actions: { reactions: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "react",
       {
-        action: "react",
-        account_id: "ops",
         room_id: "!room:example",
         message_id: "$msg",
         emoji: "👍",
         remove: true,
       },
       cfg,
+      { accountId: "ops" },
     );
 
     expect(mocks.removeMatrixReactions).toHaveBeenCalledWith("!room:example", "$msg", {
       cfg,
       accountId: "ops",
+      client: mocks.matrixClient,
       emoji: "👍",
     });
   });
 
   it("passes account-scoped opts and limit to reaction listing", async () => {
     const cfg = { channels: { matrix: { actions: { reactions: true } } } } as CoreConfig;
-    const result = await handleMatrixAction(
+    const result = await runMatrixAction(
+      "reactions",
       {
-        action: "reactions",
-        account_id: "ops",
         room_id: "!room:example",
         message_id: "$msg",
         limit: "5",
       },
       cfg,
+      { accountId: "ops" },
     );
 
     expect(mocks.listMatrixReactions).toHaveBeenCalledWith("!room:example", "$msg", {
       cfg,
       accountId: "ops",
+      client: mocks.matrixClient,
       limit: 5,
     });
     expect(result.details).toEqual({
@@ -231,9 +304,9 @@ describe("handleMatrixAction pollVote", () => {
   it("rejects fractional reaction limits before listing reactions", async () => {
     const cfg = { channels: { matrix: { actions: { reactions: true } } } } as CoreConfig;
     await expect(
-      handleMatrixAction(
+      runMatrixAction(
+        "reactions",
         {
-          action: "reactions",
           roomId: "!room:example",
           messageId: "$msg",
           limit: 5.5,
@@ -246,16 +319,15 @@ describe("handleMatrixAction pollVote", () => {
 
   it("passes account-scoped opts to message sends", async () => {
     const cfg = { channels: { matrix: { actions: { messages: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "send",
       {
-        action: "sendMessage",
-        accountId: "ops",
         to: "room:!room:example",
-        content: "hello",
+        message: "hello",
         threadId: "$thread",
       },
       cfg,
-      { mediaLocalRoots: ["/tmp/openclaw-matrix-test"] },
+      { mediaLocalRoots: ["/tmp/openclaw-matrix-test"], accountId: "ops" },
     );
 
     expect(mocks.sendMatrixMessage).toHaveBeenCalledWith("room:!room:example", "hello", {
@@ -268,41 +340,296 @@ describe("handleMatrixAction pollVote", () => {
     });
   });
 
-  it("accepts media-only message sends", async () => {
+  it.each([
+    { action: "send", markdown: "    @room" },
+    { action: "send", markdown: "    @alice:example.org" },
+    { action: "edit", markdown: "    @room" },
+    { action: "edit", markdown: "    @alice:example.org" },
+  ] as const)(
+    "preserves indented Markdown for $action: $markdown",
+    async ({ action, markdown }) => {
+      const cfg = { channels: { matrix: { actions: { messages: true } } } } as CoreConfig;
+
+      await runMatrixAction(
+        action,
+        {
+          to: "room:!room:example",
+          roomId: "!room:example",
+          messageId: "$original",
+          message: markdown,
+        },
+        cfg,
+      );
+
+      const providerCall =
+        action === "send"
+          ? mocks.sendMatrixMessage.mock.lastCall?.[1]
+          : mocks.editMatrixMessage.mock.lastCall?.[2];
+      expect(providerCall).toBe(markdown);
+    },
+  );
+
+  it("returns the authorized room and thread with message reads", async () => {
     const cfg = { channels: { matrix: { actions: { messages: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    const result = await runMatrixAction(
+      "read",
       {
-        action: "sendMessage",
-        accountId: "ops",
-        to: "room:!room:example",
-        mediaUrl: "file:///tmp/photo.png",
+        roomId: "room:!room:example",
+        threadId: "$thread",
+        limit: 5,
       },
       cfg,
-      { mediaLocalRoots: ["/tmp/openclaw-matrix-test"] },
+      { accountId: "ops" },
+    );
+
+    expect(mocks.readMatrixMessages).toHaveBeenCalledWith("!room:example", {
+      cfg,
+      accountId: "ops",
+      client: mocks.matrixClient,
+      limit: 5,
+      before: undefined,
+      after: undefined,
+      threadId: "$thread",
+    });
+    expect(result.details).toEqual({
+      ok: true,
+      roomId: "!room:example",
+      threadId: "$thread",
+      messages: [{ eventId: "$message", id: "$message" }],
+      nextBatch: "next",
+    });
+  });
+
+  it("reads exactly the requested message id instead of room history", async () => {
+    mocks.readMatrixMessage.mockResolvedValueOnce({
+      eventId: "$older",
+      sender: "@alice:example.org",
+      body: "older",
+      timestamp: 1000,
+    });
+    const cfg = { channels: { matrix: { actions: { messages: true } } } } as CoreConfig;
+    const result = await runMatrixAction(
+      "read",
+      {
+        roomId: "room:!room:example",
+        messageId: "  $older  ",
+        limit: 5,
+        before: "before",
+        after: "after",
+        threadId: "$thread",
+      },
+      cfg,
+      { accountId: "ops" },
+    );
+
+    expect(mocks.readMatrixMessage).toHaveBeenCalledWith("!room:example", "$older", {
+      cfg,
+      accountId: "ops",
+      client: mocks.matrixClient,
+    });
+    expect(mocks.readMatrixMessages).not.toHaveBeenCalled();
+    expect(result.details).toEqual({
+      ok: true,
+      roomId: "!room:example",
+      messages: [
+        {
+          eventId: "$older",
+          sender: "@alice:example.org",
+          body: "older",
+          timestamp: 1000,
+          ts: "1970-01-01T00:00:01.000Z",
+          id: "$older",
+          authorTag: "@alice:example.org",
+          content: "older",
+        },
+      ],
+    });
+  });
+
+  it("does not fall back to history when the exact event cannot be summarized", async () => {
+    mocks.readMatrixMessage.mockRejectedValueOnce(
+      new Error("Matrix message $missing was not found in room !room:example."),
+    );
+    await expect(
+      runMatrixAction("read", { roomId: "!room:example", messageId: "$missing" }, {} as CoreConfig),
+    ).rejects.toThrow("was not found");
+    expect(mocks.readMatrixMessages).not.toHaveBeenCalled();
+  });
+
+  it("rejects disabled exact reads before authorization or event fetch", async () => {
+    await expect(
+      runMatrixAction("read", { roomId: "!room:example", messageId: "$older" }, {
+        channels: { matrix: { actions: { messages: false } } },
+      } as CoreConfig),
+    ).rejects.toThrow("Matrix messages are disabled.");
+    expect(mocks.withAuthorizedMatrixReadTarget).not.toHaveBeenCalled();
+    expect(mocks.readMatrixMessage).not.toHaveBeenCalled();
+    expect(mocks.readMatrixMessages).not.toHaveBeenCalled();
+  });
+
+  it("retains the read-policy gate before exact event selection", async () => {
+    mocks.withAuthorizedMatrixReadTarget.mockRejectedValueOnce(
+      new Error("Matrix read target is not allowed."),
+    );
+    await expect(
+      runMatrixAction(
+        "read",
+        { roomId: "!blocked:example", messageId: "$older" },
+        {} as CoreConfig,
+        {
+          accountId: "ops",
+          requesterAccountId: "other",
+          toolContext: { currentChannelId: "!current:example", currentChannelProvider: "matrix" },
+        },
+      ),
+    ).rejects.toThrow("Matrix read target is not allowed.");
+    expect(mocks.readMatrixMessage).not.toHaveBeenCalled();
+    expect(mocks.readMatrixMessages).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, 1.5, "not-a-number"])(
+    "still validates limit %s before exact selection",
+    async (limit) => {
+      await expect(
+        runMatrixAction(
+          "read",
+          { roomId: "!room:example", messageId: "$older", limit },
+          {} as CoreConfig,
+        ),
+      ).rejects.toThrow("limit must be a positive integer.");
+      expect(mocks.withAuthorizedMatrixReadTarget).not.toHaveBeenCalled();
+      expect(mocks.readMatrixMessage).not.toHaveBeenCalled();
+      expect(mocks.readMatrixMessages).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, "", "   "])(
+    "keeps absent/blank ID %s on the history path",
+    async (messageId) => {
+      const cfg = {} as CoreConfig;
+      mocks.readMatrixMessages.mockResolvedValueOnce({
+        messages: [{ eventId: "$newer" }],
+        nextBatch: "next",
+        prevBatch: "previous",
+      });
+      const result = await runMatrixAction(
+        "read",
+        {
+          roomId: "room:!room:example",
+          messageId,
+          limit: 7,
+          before: "before",
+          after: "after",
+          threadId: "$thread",
+        },
+        cfg,
+        { accountId: "ops" },
+      );
+      expect(mocks.readMatrixMessages).toHaveBeenCalledWith("!room:example", {
+        cfg,
+        accountId: "ops",
+        client: mocks.matrixClient,
+        limit: 7,
+        before: "before",
+        after: "after",
+        threadId: "$thread",
+      });
+      expect(mocks.readMatrixMessage).not.toHaveBeenCalled();
+      expect(result.details).toEqual({
+        ok: true,
+        roomId: "!room:example",
+        threadId: "$thread",
+        messages: [{ eventId: "$newer", id: "$newer" }],
+        nextBatch: "next",
+        prevBatch: "previous",
+      });
+    },
+  );
+
+  it("projects Matrix message summaries for human-readable CLI output", async () => {
+    mocks.readMatrixMessages.mockResolvedValueOnce({
+      messages: [
+        {
+          eventId: "$message",
+          sender: "@alice:example.org",
+          body: "hello from Matrix",
+          msgtype: "m.text",
+          timestamp: 1_750_000_000_000,
+        },
+      ],
+      nextBatch: "next",
+    });
+
+    const result = await runMatrixAction(
+      "read",
+      {
+        roomId: "!room:example",
+      },
+      {
+        channels: { matrix: { actions: { messages: true } } },
+      } as CoreConfig,
+    );
+
+    expect(result.details).toEqual({
+      ok: true,
+      roomId: "!room:example",
+      messages: [
+        {
+          eventId: "$message",
+          sender: "@alice:example.org",
+          body: "hello from Matrix",
+          msgtype: "m.text",
+          timestamp: 1_750_000_000_000,
+          id: "$message",
+          authorTag: "@alice:example.org",
+          content: "hello from Matrix",
+          ts: "2025-06-15T15:06:40.000Z",
+        },
+      ],
+      nextBatch: "next",
+    });
+  });
+
+  it("accepts media-only message sends", async () => {
+    const cfg = { channels: { matrix: { actions: { messages: true } } } } as CoreConfig;
+    const mediaAccess = {
+      localRoots: ["/tmp/openclaw-matrix-test"],
+      readFile: async () => Buffer.from("chart"),
+      workspaceDir: "/tmp/openclaw-matrix-test",
+    };
+    await runMatrixAction(
+      "send",
+      {
+        to: "room:!room:example",
+        mediaUrl: "chart.png",
+      },
+      cfg,
+      { mediaAccess, mediaLocalRoots: mediaAccess.localRoots, accountId: "ops" },
     );
 
     expect(mocks.sendMatrixMessage).toHaveBeenCalledWith("room:!room:example", undefined, {
       cfg,
       accountId: "ops",
-      mediaUrl: "file:///tmp/photo.png",
+      mediaUrl: "chart.png",
+      mediaAccess,
       mediaLocalRoots: ["/tmp/openclaw-matrix-test"],
       replyToId: undefined,
       threadId: undefined,
     });
+    expect(mocks.sendMatrixMessage.mock.lastCall?.[2]?.mediaAccess).toBe(mediaAccess);
   });
 
   it("accepts shared media aliases and voice-send flags", async () => {
     const cfg = { channels: { matrix: { actions: { messages: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "send",
       {
-        action: "sendMessage",
-        accountId: "ops",
         to: "room:!room:example",
         path: "/tmp/clip.mp3",
         asVoice: true,
       },
       cfg,
-      { mediaLocalRoots: ["/tmp/openclaw-matrix-test"] },
+      { mediaLocalRoots: ["/tmp/openclaw-matrix-test"], accountId: "ops" },
     );
 
     expect(mocks.sendMatrixMessage).toHaveBeenCalledWith("room:!room:example", undefined, {
@@ -318,14 +645,13 @@ describe("handleMatrixAction pollVote", () => {
 
   it("passes mediaLocalRoots to profile updates", async () => {
     const cfg = { channels: { matrix: { actions: { profile: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "set-profile",
       {
-        action: "setProfile",
-        accountId: "ops",
         avatarPath: "/tmp/avatar.jpg",
       },
       cfg,
-      { mediaLocalRoots: ["/tmp/openclaw-matrix-test"] },
+      { mediaLocalRoots: ["/tmp/openclaw-matrix-test"], accountId: "ops", senderIsOwner: true },
     );
 
     expect(mocks.applyMatrixProfileUpdate).toHaveBeenCalledWith({
@@ -340,65 +666,162 @@ describe("handleMatrixAction pollVote", () => {
 
   it("passes account-scoped opts to pin listing", async () => {
     const cfg = { channels: { matrix: { actions: { pins: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "list-pins",
       {
-        action: "listPins",
-        accountId: "ops",
         roomId: "!room:example",
       },
       cfg,
+      { accountId: "ops" },
     );
 
     expect(mocks.listMatrixPins).toHaveBeenCalledWith("!room:example", {
       cfg,
       accountId: "ops",
+      client: mocks.matrixClient,
     });
   });
+
+  it("projects pinned Matrix events without removing their original event fields", async () => {
+    const event = {
+      eventId: "$pin",
+      sender: "@alice:example.org",
+      body: "pinned message",
+      timestamp: 1_750_000_000_000,
+    };
+    mocks.listMatrixPins.mockResolvedValueOnce({ pinned: ["$pin"], events: [event] });
+
+    const result = await runMatrixAction(
+      "list-pins",
+      {
+        roomId: "!room:example",
+      },
+      {
+        channels: { matrix: { actions: { pins: true } } },
+      } as CoreConfig,
+    );
+
+    expect(result.details).toEqual({
+      ok: true,
+      pinned: ["$pin"],
+      events: [event],
+      pins: [
+        {
+          ...event,
+          id: "$pin",
+          authorTag: "@alice:example.org",
+          content: "pinned message",
+          ts: "2025-06-15T15:06:40.000Z",
+        },
+      ],
+    });
+  });
+
+  it.each([
+    {
+      action: "pin",
+      expected: mocks.pinMatrixMessage,
+      expectedPinned: ["$existing", "$pin"],
+    },
+    {
+      action: "unpin",
+      expected: mocks.unpinMatrixMessage,
+      expectedPinned: ["$existing"],
+    },
+  ] as const)(
+    "authorizes $action before reading pinned state",
+    async ({ action, expected, expectedPinned }) => {
+      const cfg = { channels: { matrix: { actions: { pins: true } } } } as CoreConfig;
+      const result = await runMatrixAction(
+        action,
+        {
+          roomId: "room:!room:example",
+          messageId: "$pin",
+        },
+        cfg,
+        { accountId: "ops" },
+      );
+
+      expect(expected).toHaveBeenCalledWith("!room:example", "$pin", {
+        cfg,
+        accountId: "ops",
+        client: mocks.matrixClient,
+      });
+      expect(result.details).toEqual({ ok: true, pinned: expectedPinned });
+    },
+  );
+
+  it.each(["pin", "unpin"] as const)(
+    "rejects blocked %s before reading or mutating pinned state",
+    async (action) => {
+      mocks.withAuthorizedMatrixReadTarget.mockRejectedValueOnce(
+        new Error("Matrix read target is not allowed."),
+      );
+      const cfg = { channels: { matrix: { actions: { pins: true } } } } as CoreConfig;
+
+      await expect(
+        runMatrixAction(
+          action,
+          {
+            roomId: "!blocked:example",
+            messageId: "$pin",
+          },
+          cfg,
+        ),
+      ).rejects.toThrow("Matrix read target is not allowed.");
+
+      expect(mocks.pinMatrixMessage).not.toHaveBeenCalled();
+      expect(mocks.unpinMatrixMessage).not.toHaveBeenCalled();
+      expect(mocks.listMatrixPins).not.toHaveBeenCalled();
+    },
+  );
 
   it("passes account-scoped opts to member and room info actions", async () => {
     const memberCfg = {
       channels: { matrix: { actions: { memberInfo: true } } },
     } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "member-info",
       {
-        action: "memberInfo",
-        accountId: "ops",
         userId: "@u:example",
         roomId: "!room:example",
       },
       memberCfg,
+      { accountId: "ops" },
     );
     const roomCfg = { channels: { matrix: { actions: { channelInfo: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "channel-info",
       {
-        action: "channelInfo",
-        accountId: "ops",
         roomId: "!room:example",
       },
       roomCfg,
+      { accountId: "ops" },
     );
 
     expect(mocks.getMatrixMemberInfo).toHaveBeenCalledWith("@u:example", {
       cfg: memberCfg,
       accountId: "ops",
       roomId: "!room:example",
+      client: mocks.matrixClient,
     });
     expect(mocks.getMatrixRoomInfo).toHaveBeenCalledWith("!room:example", {
       cfg: roomCfg,
       accountId: "ops",
+      client: mocks.matrixClient,
     });
   });
 
   it("persists self-profile updates through the shared profile helper", async () => {
     const cfg = { channels: { matrix: { actions: { profile: true } } } } as CoreConfig;
-    const result = await handleMatrixAction(
+    const result = await runMatrixAction(
+      "set-profile",
       {
-        action: "setProfile",
-        account_id: "ops",
         display_name: "Ops Bot",
         avatar_url: "mxc://example/avatar",
       },
       cfg,
+      { accountId: "ops", senderIsOwner: true },
     );
 
     expect(mocks.applyMatrixProfileUpdate).toHaveBeenCalledWith({
@@ -425,13 +848,13 @@ describe("handleMatrixAction pollVote", () => {
 
   it("accepts local avatar paths for self-profile updates", async () => {
     const cfg = { channels: { matrix: { actions: { profile: true } } } } as CoreConfig;
-    await handleMatrixAction(
+    await runMatrixAction(
+      "set-profile",
       {
-        action: "setProfile",
-        accountId: "ops",
         path: "/tmp/avatar.jpg",
       },
       cfg,
+      { accountId: "ops", senderIsOwner: true },
     );
 
     expect(mocks.applyMatrixProfileUpdate).toHaveBeenCalledWith({
@@ -443,14 +866,13 @@ describe("handleMatrixAction pollVote", () => {
     });
   });
 
-  it("respects account-scoped action overrides when gating direct tool actions", async () => {
+  it("respects account-scoped action overrides for public actions", async () => {
     await expect(
-      handleMatrixAction(
+      runMatrixAction(
+        "send",
         {
-          action: "sendMessage",
-          accountId: "ops",
           to: "room:!room:example",
-          content: "hello",
+          message: "hello",
         },
         {
           channels: {
@@ -468,6 +890,7 @@ describe("handleMatrixAction pollVote", () => {
             },
           },
         } as CoreConfig,
+        { accountId: "ops" },
       ),
     ).rejects.toThrow("Matrix messages are disabled.");
   });

@@ -1,34 +1,72 @@
+// Runs package update move, inventory, and cleanup steps.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathExists } from "./fs-safe.js";
+import { pathToFileURL } from "node:url";
+import { validRange } from "semver";
+import { LEGACY_PACKAGE_INSTALL_GUARD_RELATIVE_PATH } from "../../scripts/lib/package-lifecycle-marker.mjs";
+import { UPDATE_GLOBAL_PERMISSION_REASON } from "../shared/update-outcome.js";
+import { resolveBunGlobalInstallOwner } from "./detect-package-manager.js";
+import { formatErrorMessage } from "./errors.js";
+import { collectPackageDistContentInventoryErrors } from "./package-dist-inventory.js";
 import { readPackageVersion } from "./package-json.js";
-import { movePathWithCopyFallback } from "./replace-file.js";
+import { completePendingPackageLifecycle } from "./package-lifecycle.js";
+import type { LocalPackageOverridesResult } from "./package-local-overrides.js";
+import { readPackageVersionIfPresent } from "./package-update-integrity.js";
+import {
+  checkGlobalPackageUpdatePermissions,
+  classifyPackageUpdatePermissionFailure,
+  resolveCanonicalPath,
+  runPnpmPreflightProbe,
+  validatePnpmIsolatedUpdate,
+} from "./package-update-manager-preflight.js";
+import {
+  isBlockingPackageUpdateStep,
+  PackageUpdateActivationError,
+  removePackageUpdatePath,
+  swapStagedPackageInstall,
+  type PackageUpdateTransaction,
+  type StagedPackageInstall,
+} from "./package-update-swap.js";
+import { missingPackageVerificationStep } from "./package-update-verification-step.js";
+import { trimLogTail } from "./restart-sentinel.js";
+import {
+  PACKAGE_POST_INSTALL_DOCTOR_ADVISORY,
+  normalizeUpdatePostInstallDoctorWarnings,
+  UPDATE_POST_INSTALL_DOCTOR_ADVISORY_EXIT_CODE,
+  type UpdatePostInstallDoctorResult,
+} from "./update-doctor-result.js";
+import { createUpdateFailureFact } from "./update-failure-facts.js";
+import {
+  createFreeBsdPkgOwnershipInspection,
+  FreeBsdPkgOwnershipError,
+} from "./update-freebsd-pkg-ownership.js";
+import { readBuiltGatewayBuildId, type GitRuntimeIdentity } from "./update-git-runtime.js";
+import type { CommandRunner } from "./update-global-command-runner.js";
 import {
   collectInstalledGlobalPackageErrors,
+  cleanupGlobalRenameDirs,
   globalInstallArgs,
   globalInstallFallbackArgs,
-  resolveNpmGlobalPrefixLayoutFromGlobalRoot,
-  resolveNpmGlobalPrefixLayoutFromPrefix,
+  listActivePnpmIsolatedGlobalPackages,
+  resolvePnpmIsolatedInstallOwner,
   resolvePnpmGlobalDirFromGlobalRoot,
+  resolveNpmLifecyclePolicyGate,
   resolveExpectedInstalledVersionFromSpec,
   resolveGlobalInstallTarget,
-  type CommandRunner,
-  type NpmGlobalPrefixLayout,
+  verifyPackageUpdateRecovery,
   type ResolvedGlobalInstallTarget,
 } from "./update-global.js";
-
-const PACKAGE_MANAGER_SWAP_SOURCE_HARDLINKS = "allow" as const;
-
-export type PackageUpdateStepResult = {
-  name: string;
-  command: string;
-  cwd: string;
-  durationMs: number;
-  exitCode: number | null;
-  stdoutTail?: string | null;
-  stderrTail?: string | null;
-};
+import { prepareNativePackageStage } from "./update-native-package-stage.js";
+import {
+  readPackageManagerProbeValue,
+  resolveNpmGlobalPrefixLayoutFromGlobalRoot,
+  resolveNpmGlobalPrefixLayoutFromPrefix,
+  type NpmGlobalPrefixLayout,
+} from "./update-npm-prefix.js";
+import type { UpdateRecovery } from "./update-recovery.js";
+import type { UpdateStepResult } from "./update-runner-types.js";
+export type { PackageUpdateTransaction } from "./package-update-swap.js";
 
 type PackageUpdateStepRunner = (params: {
   name: string;
@@ -36,50 +74,126 @@ type PackageUpdateStepRunner = (params: {
   cwd?: string;
   timeoutMs: number;
   env?: NodeJS.ProcessEnv;
-}) => Promise<PackageUpdateStepResult>;
+}) => Promise<UpdateStepResult>;
 
-type StagedNpmInstall = {
-  prefix: string;
-  layout: NpmGlobalPrefixLayout;
-  packageRoot: string;
-  installTarget: ResolvedGlobalInstallTarget;
-};
-
-type NpmBinShimBackup = {
-  backupDir: string;
-  targetBinDir: string;
-  entries: Array<{
-    name: string;
-    hadExisting: boolean;
-  }>;
+type PackageUpdateStepsResult = {
+  localOverrides?: LocalPackageOverridesResult;
+  reason?: "already-current" | typeof UPDATE_GLOBAL_PERMISSION_REASON;
+  steps: UpdateStepResult[];
+  activePackageRoot: string | null;
+  afterVersion: string | null;
+  failedStep: UpdateStepResult | null;
+  recovery: UpdateRecovery;
 };
 
 const NPM_PACK_QUIET_FLAGS = ["--json", "--loglevel=error"] as const;
 
-function formatError(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+async function resolveNpmUpdateLifecyclePolicy(params: {
+  installTarget: ResolvedGlobalInstallTarget;
+}): Promise<{
+  policy: ReturnType<typeof resolveNpmLifecyclePolicyGate>["policy"];
+  failedStep: UpdateStepResult | null;
+}> {
+  const gate = resolveNpmLifecyclePolicyGate(params.installTarget);
+  if (!gate.error) {
+    return { policy: gate.policy, failedStep: null };
+  }
+  const argv = [params.installTarget.command, "--version"];
+  const version = params.installTarget.npmOwner?.version ?? "";
+  return {
+    policy: null,
+    failedStep: {
+      name: "npm lifecycle policy preflight",
+      command: argv.join(" "),
+      cwd: process.cwd(),
+      durationMs: 0,
+      exitCode: 1,
+      stdoutTail: version || null,
+      stderrTail: gate.error,
+    },
+  };
 }
 
-async function removePathBestEffort(targetPath: string): Promise<void> {
-  await fs
-    .rm(targetPath, {
-      recursive: true,
-      force: true,
-      maxRetries: process.platform === "win32" ? 5 : 2,
-      retryDelay: 100,
-    })
-    .catch(() => undefined);
+function isNormalProcessExit(step: {
+  signal?: NodeJS.Signals | null;
+  killed?: boolean;
+  termination?: "exit" | "timeout" | "no-output-timeout" | "signal";
+}): boolean {
+  return (
+    step.termination !== "timeout" &&
+    step.termination !== "no-output-timeout" &&
+    step.termination !== "signal" &&
+    step.killed !== true &&
+    (step.signal === undefined || step.signal === null)
+  );
 }
 
-async function readPackageVersionIfPresent(packageRoot: string | null): Promise<string | null> {
-  if (!packageRoot) {
-    return null;
+export function markPackagePostInstallDoctorAdvisory<
+  T extends {
+    exitCode: number | null;
+    stderrTail?: string | null;
+    signal?: NodeJS.Signals | null;
+    killed?: boolean;
+    termination?: "exit" | "timeout" | "no-output-timeout" | "signal";
+    advisory?: UpdateStepResult["advisory"];
+  },
+>(
+  step: T,
+  result: UpdatePostInstallDoctorResult | null,
+): T & {
+  advisory?: UpdateStepResult["advisory"];
+  warnings?: UpdateStepResult["warnings"];
+  failureFacts?: UpdateStepResult["failureFacts"];
+} {
+  if (step.exitCode !== 0 && result?.failureFacts?.length) {
+    return { ...step, failureFacts: result.failureFacts };
   }
-  try {
-    return await readPackageVersion(packageRoot);
-  } catch {
-    return null;
+  if (
+    !result ||
+    result.status === "error" ||
+    !isNormalProcessExit(step) ||
+    !(
+      (step.exitCode === UPDATE_POST_INSTALL_DOCTOR_ADVISORY_EXIT_CODE &&
+        result.status === "advisory") ||
+      (step.exitCode === 0 && result.warnings?.length)
+    )
+  ) {
+    return step;
   }
+  const repairGuidance = "Run openclaw doctor --fix to finish deferred repairs.";
+  const deferredWarnings =
+    result.status === "advisory"
+      ? normalizeUpdatePostInstallDoctorWarnings(result.advisory.details).map(
+          (detail) => `${detail}\n${repairGuidance}`,
+        )
+      : [];
+  const advisoryTail = [
+    step.stderrTail,
+    ...(result.status === "advisory" ? result.advisory.details : []),
+    ...(result.warnings ?? []),
+    PACKAGE_POST_INSTALL_DOCTOR_ADVISORY.message,
+  ]
+    .filter((line): line is string => Boolean(line?.trim()))
+    .join("\n");
+  return {
+    ...step,
+    warnings: [
+      ...new Set([
+        ...normalizeUpdatePostInstallDoctorWarnings(result.warnings ?? []),
+        ...deferredWarnings,
+      ]),
+    ].slice(0, 32),
+    advisory: {
+      ...PACKAGE_POST_INSTALL_DOCTOR_ADVISORY,
+      message: [
+        ...(result.warnings ?? []),
+        ...(result.status === "advisory" ? result.advisory.details : []),
+        PACKAGE_POST_INSTALL_DOCTOR_ADVISORY.message,
+        repairGuidance,
+      ].join("\n"),
+    },
+    stderrTail: trimLogTail(advisoryTail) ?? step.stderrTail,
+  };
 }
 
 function isUnambiguousNpmPrefixGlobalRoot(globalRoot: string | null): boolean {
@@ -163,16 +277,101 @@ function isNpmGitSourceInstallSpec(spec: string, packageName: string): boolean {
   );
 }
 
-async function createStagedNpmInstall(
+function isRegistrySourceInstallSpec(spec: string): boolean {
+  // Version-only deduplication is reserved for positively identified registry
+  // specs. Explicit and unknown npm source syntax must prove build identity.
+  // npm-package-arg gives unscoped archive names precedence over package names.
+  const archive = /[.](?:tgz|tar[.]gz|tar)$/iu;
+  const packageName = /^(?:@[a-z0-9_][a-z0-9._-]*\/)?[a-z0-9_][a-z0-9._-]*$/iu;
+  const value = spec.trim();
+  const separator = value.indexOf("@", 1);
+  const name = separator > 0 ? value.slice(0, separator) : value;
+  const selector = separator > 0 ? value.slice(separator + 1).trim() : "";
+
+  if (value.startsWith("npm:") || selector.startsWith("npm:")) {
+    // An alias can replace the underlying package at the same version.
+    return false;
+  }
+  if (!packageName.test(name) || (!name.startsWith("@") && archive.test(name))) {
+    return false;
+  }
+  // File suffixes take precedence over dist-tags in npm's resolve contract.
+  // npm treats leading dots as paths and accepts tags unchanged by encodeURIComponent.
+  return (
+    !selector.startsWith(".") &&
+    !archive.test(selector) &&
+    (validRange(selector, true) !== null || encodeURIComponent(selector) === selector)
+  );
+}
+
+function resolveNativeInstallSpecFromCwd(
+  spec: string,
+  packageName: string,
+  sourceCwd: string,
+  manager: "pnpm" | "bun",
+): string {
+  const trimmed = spec.trim();
+  const aliasPrefix = `${packageName.trim()}@`;
+  const hasAlias = trimmed.toLowerCase().startsWith(aliasPrefix.toLowerCase());
+  const targetSpec = hasAlias ? trimmed.slice(aliasPrefix.length).trim() : trimmed;
+  const windowsPath = /^[a-z]:[\\/]/iu.test(sourceCwd) || sourceCwd.startsWith("\\\\");
+  const paths = windowsPath ? path.win32 : path;
+  const localProtocol = /^(file:|git\+file:|link:)(.*)$/iu.exec(targetSpec);
+  if (localProtocol) {
+    const protocol = localProtocol[1] ?? "";
+    // Bun's link: names refer to its global link registry, not caller-relative directories.
+    if (manager === "bun" && protocol.toLowerCase() === "link:") {
+      return spec;
+    }
+    const target = localProtocol[2]?.trim() ?? "";
+    const fragmentIndex = protocol.toLowerCase() === "git+file:" ? target.indexOf("#") : -1;
+    const targetPath = fragmentIndex >= 0 ? target.slice(0, fragmentIndex) : target;
+    const fragment = fragmentIndex >= 0 ? target.slice(fragmentIndex) : "";
+    const resolvedTarget =
+      targetPath &&
+      !/^~[\\/]/u.test(targetPath) &&
+      !path.isAbsolute(targetPath) &&
+      !path.win32.isAbsolute(targetPath)
+        ? paths.resolve(sourceCwd, targetPath)
+        : targetPath;
+    if (protocol.toLowerCase() === "git+file:") {
+      return resolvedTarget === targetPath
+        ? spec
+        : `${hasAlias ? aliasPrefix : ""}git+${pathToFileURL(resolvedTarget, { windows: windowsPath }).href}${fragment}`;
+    }
+    return `${aliasPrefix}${protocol}${resolvedTarget}`;
+  }
+  const isPath =
+    /^(?:\.{1,2}|~)(?:[\\/]|$)/u.test(targetSpec) ||
+    path.isAbsolute(targetSpec) ||
+    path.win32.isAbsolute(targetSpec);
+  // Match the updater's explicit archive targets; bare .tar remains a registry name.
+  if (
+    !isPath &&
+    (hasAlias || /[:@]/u.test(targetSpec) || !/\.(?:tgz|tar\.gz)$/iu.test(targetSpec))
+  ) {
+    return spec;
+  }
+  const target =
+    isPath && !/^\.{1,2}(?:[\\/]|$)/u.test(targetSpec)
+      ? targetSpec
+      : paths.resolve(sourceCwd, targetSpec);
+  // Native pnpm needs a package name; source links must follow atomic file replacements.
+  const protocol = manager === "bun" || /\.(?:tgz|tar\.gz|tar)$/iu.test(target) ? "file" : "link";
+  return `${aliasPrefix}${protocol}:${target}`;
+}
+
+async function createStagedPackageInstall(
   installTarget: ResolvedGlobalInstallTarget,
   packageName: string,
-): Promise<StagedNpmInstall | null> {
+): Promise<StagedPackageInstall | null> {
   const targetLayout = resolveStagedNpmTargetLayout(installTarget);
   if (!targetLayout) {
     return null;
   }
   await fs.mkdir(targetLayout.globalRoot, { recursive: true });
-  const prefix = await fs.mkdtemp(path.join(targetLayout.globalRoot, ".openclaw-update-stage-"));
+  // Active stages must stay outside cleanupGlobalRenameDirs' disposable ".openclaw-" namespace.
+  const prefix = await fs.mkdtemp(path.join(targetLayout.globalRoot, ".openclaw.update-stage-"));
   const layout = resolveNpmGlobalPrefixLayoutFromPrefix(prefix);
   const command = installTarget.manager === "npm" ? installTarget.command : "npm";
   return {
@@ -207,15 +406,22 @@ async function prepareNpmGitSourceInstallSpec(params: {
   installCwd?: string;
 }): Promise<{
   installSpec: string;
+  installCwd: string | null;
   packDir: string | null;
-  steps: PackageUpdateStepResult[];
-  failedStep: PackageUpdateStepResult | null;
+  steps: UpdateStepResult[];
+  failedStep: UpdateStepResult | null;
 }> {
   if (
     params.installTarget.manager !== "npm" ||
     !isNpmGitSourceInstallSpec(params.installSpec, params.packageName)
   ) {
-    return { installSpec: params.installSpec, packDir: null, steps: [], failedStep: null };
+    return {
+      installSpec: params.installSpec,
+      installCwd: params.installCwd ?? null,
+      packDir: null,
+      steps: [],
+      failedStep: null,
+    };
   }
 
   const packDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-pack-"));
@@ -236,6 +442,7 @@ async function prepareNpmGitSourceInstallSpec(params: {
   if (packStep.exitCode !== 0) {
     return {
       installSpec: params.installSpec,
+      installCwd: params.installCwd ?? null,
       packDir,
       steps: [packStep],
       failedStep: packStep,
@@ -244,7 +451,7 @@ async function prepareNpmGitSourceInstallSpec(params: {
 
   const tarball = await findPackedTarball(packDir);
   if (!tarball) {
-    const failedStep: PackageUpdateStepResult = {
+    const failedStep: UpdateStepResult = {
       name: "global update pack verify",
       command: `find packed tarball in ${packDir}`,
       cwd: packDir,
@@ -255,6 +462,7 @@ async function prepareNpmGitSourceInstallSpec(params: {
     };
     return {
       installSpec: params.installSpec,
+      installCwd: params.installCwd ?? null,
       packDir,
       steps: [packStep, failedStep],
       failedStep,
@@ -263,25 +471,57 @@ async function prepareNpmGitSourceInstallSpec(params: {
 
   return {
     installSpec: tarball,
+    installCwd: packDir,
     packDir,
     steps: [packStep],
     failedStep: null,
   };
 }
 
-async function prepareStagedNpmInstall(
+async function prepareStagedPackageInstall(
   installTarget: ResolvedGlobalInstallTarget,
   packageName: string,
+  nativeOptions?: { env: NodeJS.ProcessEnv; globalBinDir?: string; installSpec: string },
+  requireStaging = false,
 ): Promise<{
-  stagedInstall: StagedNpmInstall | null;
-  failedStep: PackageUpdateStepResult | null;
+  stagedInstall: StagedPackageInstall | null;
+  failedStep: UpdateStepResult | null;
 }> {
   const startedAt = Date.now();
   try {
-    return {
-      stagedInstall: await createStagedNpmInstall(installTarget, packageName),
-      failedStep: null,
-    };
+    if (nativeOptions) {
+      const native = await prepareNativePackageStage({
+        installTarget,
+        packageName,
+        ...nativeOptions,
+      });
+      if (!native) {
+        throw new Error("Cannot resolve the native package manager's staging owner.");
+      }
+      // Isolated pnpm resolves its newly created owner after installation.
+      const packageRoot = path.join(native.globalRoot, packageName);
+      return {
+        stagedInstall: {
+          prefix: native.projectRoot,
+          layout: {
+            prefix: native.projectRoot,
+            globalRoot: native.globalRoot,
+            binDir: native.binDir,
+          },
+          packageRoot,
+          installTarget: { ...installTarget, globalRoot: native.globalRoot, packageRoot },
+          native,
+        },
+        failedStep: null,
+      };
+    }
+    const stagedInstall = await createStagedPackageInstall(installTarget, packageName);
+    if (!stagedInstall && requireStaging) {
+      throw new Error(
+        `The ${installTarget.manager} global install layout cannot prepare the update. Reinstall with ${installTarget.manager} into its default global layout, then retry the update.`,
+      );
+    }
+    return { stagedInstall, failedStep: null };
   } catch (err) {
     const targetLayout =
       installTarget.manager === "npm"
@@ -291,230 +531,264 @@ async function prepareStagedNpmInstall(
         : null;
     return {
       stagedInstall: null,
-      failedStep: {
-        name: "global install stage",
-        command: "prepare staged npm install",
-        cwd: targetLayout?.prefix ?? installTarget.globalRoot ?? process.cwd(),
-        durationMs: Date.now() - startedAt,
-        exitCode: 1,
-        stdoutTail: null,
-        stderrTail: formatError(err),
-      },
+      failedStep: await classifyPackageUpdatePermissionFailure(
+        {
+          name: "global install stage",
+          command: `prepare staged ${installTarget.manager} install`,
+          cwd: targetLayout?.prefix ?? installTarget.globalRoot ?? process.cwd(),
+          durationMs: Date.now() - startedAt,
+          exitCode: 1,
+          stdoutTail: null,
+          stderrTail: formatErrorMessage(err),
+        },
+        installTarget,
+        nativeOptions?.env,
+        err,
+      ),
     };
   }
 }
 
-async function cleanupStagedNpmInstall(stage: StagedNpmInstall | null): Promise<void> {
-  if (!stage) {
-    return;
-  }
-  await removePathBestEffort(stage.prefix);
-}
-
-async function copyPathEntry(source: string, destination: string): Promise<void> {
-  const stat = await fs.lstat(source);
-  await removePathBestEffort(destination);
-  if (stat.isSymbolicLink()) {
-    await fs.symlink(await fs.readlink(source), destination);
-    return;
-  }
-  if (stat.isDirectory()) {
-    await fs.cp(source, destination, {
-      recursive: true,
-      force: true,
-      preserveTimestamps: false,
-    });
-    return;
-  }
-  await fs.copyFile(source, destination);
-  await fs.chmod(destination, stat.mode).catch(() => undefined);
-}
-
-async function replaceNpmBinShims(params: {
-  stageLayout: NpmGlobalPrefixLayout;
-  targetLayout: NpmGlobalPrefixLayout;
-  packageName: string;
-}): Promise<void> {
-  let entries: string[];
-  try {
-    entries = await fs.readdir(params.stageLayout.binDir);
-  } catch {
-    return;
-  }
-
-  const names = new Set([params.packageName, "openclaw"]);
-  const shimEntries = entries.filter((entry) => {
-    const parsed = path.parse(entry);
-    return names.has(entry) || names.has(parsed.name);
-  });
-  if (shimEntries.length === 0) {
-    return;
-  }
-
-  const backup: NpmBinShimBackup = {
-    backupDir: await fs.mkdtemp(
-      path.join(params.targetLayout.globalRoot, ".openclaw-shim-backup-"),
-    ),
-    targetBinDir: params.targetLayout.binDir,
-    entries: [],
-  };
-
-  try {
-    await fs.mkdir(params.targetLayout.binDir, { recursive: true });
-    for (const entry of shimEntries) {
-      const destination = path.join(params.targetLayout.binDir, entry);
-      const hadExisting = await pathExists(destination);
-      backup.entries.push({ name: entry, hadExisting });
-      if (hadExisting) {
-        await copyPathEntry(destination, path.join(backup.backupDir, entry));
-      }
+async function cleanupStagedPackageInstall(stage: StagedPackageInstall | null): Promise<void> {
+  if (stage) {
+    if (stage.native) {
+      await removePackageUpdatePath(stage.native.binDir);
     }
-
-    for (const entry of shimEntries) {
-      await copyPathEntry(
-        path.join(params.stageLayout.binDir, entry),
-        path.join(params.targetLayout.binDir, entry),
-      );
-    }
-  } catch (err) {
-    await restoreNpmBinShimBackup(backup);
-    throw err;
-  } finally {
-    await removePathBestEffort(backup.backupDir);
+    await removePackageUpdatePath(stage.prefix);
   }
 }
 
-async function restoreNpmBinShimBackup(backup: NpmBinShimBackup): Promise<void> {
-  await fs.mkdir(backup.targetBinDir, { recursive: true });
-  for (const entry of backup.entries) {
-    const destination = path.join(backup.targetBinDir, entry.name);
-    await removePathBestEffort(destination);
-    if (entry.hadExisting) {
-      await copyPathEntry(path.join(backup.backupDir, entry.name), destination);
-    }
-  }
-}
-
-async function swapStagedNpmInstall(params: {
-  stage: StagedNpmInstall;
-  installTarget: ResolvedGlobalInstallTarget;
-  packageName: string;
-}): Promise<PackageUpdateStepResult> {
-  const startedAt = Date.now();
-  const targetLayout = resolveNpmGlobalPrefixLayoutFromGlobalRoot(params.installTarget.globalRoot, {
-    allowDirectNodeModulesRoot: params.installTarget.directNodeModulesRoot === true,
-  });
-  const targetPackageRoot = params.installTarget.packageRoot;
-  if (!targetLayout || !targetPackageRoot) {
-    return {
-      name: "global install swap",
-      command: "swap staged npm install",
-      cwd: params.stage.prefix,
-      durationMs: Date.now() - startedAt,
-      exitCode: 1,
-      stdoutTail: null,
-      stderrTail: "cannot resolve npm global prefix layout",
-    };
-  }
-
-  const backupRoot = path.join(targetLayout.globalRoot, `.openclaw-${process.pid}-${Date.now()}`);
-  let movedExisting = false;
-  let movedStaged = false;
-  try {
-    await fs.mkdir(targetLayout.globalRoot, { recursive: true });
-    if (await pathExists(targetPackageRoot)) {
-      await movePathWithCopyFallback({
-        from: targetPackageRoot,
-        sourceHardlinks: PACKAGE_MANAGER_SWAP_SOURCE_HARDLINKS,
-        to: backupRoot,
-      });
-      movedExisting = true;
-    }
-    await movePathWithCopyFallback({
-      from: params.stage.packageRoot,
-      sourceHardlinks: PACKAGE_MANAGER_SWAP_SOURCE_HARDLINKS,
-      to: targetPackageRoot,
-    });
-    movedStaged = true;
-    if (params.installTarget.directNodeModulesRoot !== true) {
-      await replaceNpmBinShims({
-        stageLayout: params.stage.layout,
-        targetLayout,
-        packageName: params.packageName,
-      });
-    }
-    if (movedExisting) {
-      await removePathBestEffort(backupRoot);
-    }
-    return {
-      name: "global install swap",
-      command: `swap ${params.stage.packageRoot} -> ${targetPackageRoot}`,
-      cwd: targetLayout.globalRoot,
-      durationMs: Date.now() - startedAt,
-      exitCode: 0,
-      stdoutTail: movedExisting
-        ? `replaced ${params.packageName}`
-        : `installed ${params.packageName}`,
-      stderrTail: null,
-    };
-  } catch (err) {
-    if (movedStaged) {
-      await removePathBestEffort(targetPackageRoot);
-    }
-    if (movedExisting) {
-      await movePathWithCopyFallback({
-        from: backupRoot,
-        sourceHardlinks: PACKAGE_MANAGER_SWAP_SOURCE_HARDLINKS,
-        to: targetPackageRoot,
-      }).catch(() => undefined);
-    }
-    return {
-      name: "global install swap",
-      command: `swap ${params.stage.packageRoot} -> ${targetPackageRoot}`,
-      cwd: targetLayout.globalRoot,
-      durationMs: Date.now() - startedAt,
-      exitCode: 1,
-      stdoutTail: null,
-      stderrTail: formatError(err),
-    };
-  }
-}
-
+/**
+ * Runs the global package update flow, including npm staging when possible,
+ * package verification, optional post-verification, and cleanup.
+ */
 export async function runGlobalPackageUpdateSteps(params: {
   installTarget: ResolvedGlobalInstallTarget;
   installSpec: string;
   packageName: string;
   packageRoot?: string | null;
+  requirePackageReplacement?: boolean;
   runCommand: CommandRunner;
   runStep: PackageUpdateStepRunner;
   timeoutMs: number;
   env?: NodeJS.ProcessEnv;
   installCwd?: string;
-  postVerifyStep?: (packageRoot: string) => Promise<PackageUpdateStepResult | null>;
-}): Promise<{
-  steps: PackageUpdateStepResult[];
-  verifiedPackageRoot: string | null;
-  afterVersion: string | null;
-  failedStep: PackageUpdateStepResult | null;
-}> {
-  const installCwd = params.installCwd === undefined ? {} : { cwd: params.installCwd };
-  const installEnv = params.env === undefined ? {} : { env: params.env };
-  let stagedInstall: StagedNpmInstall | null | undefined;
+  postVerifyStep?: (packageRoot: string) => Promise<UpdateStepResult | null>;
+  validateCandidate?: (packageRoot: string) => Promise<UpdateStepResult[]>;
+  beforeActivate?: () => Promise<void>;
+  assertCurrent?: () => void;
+  onTransaction?: (transaction: PackageUpdateTransaction) => void;
+  expectedGitCheckout?: GitRuntimeIdentity;
+  activateGitRoot?: string;
+  localOverrides?: { reapply: boolean; env?: NodeJS.ProcessEnv };
+}): Promise<PackageUpdateStepsResult> {
+  // Transaction callbacks must never silently become an in-place manager install.
+  // FreeBSD pkg ownership also needs staging's exact project and launcher targets;
+  // an in-place package-manager command does not expose that replacement set.
+  const requireStaging = Boolean(
+    process.platform === "freebsd" ||
+    params.validateCandidate ||
+    params.beforeActivate ||
+    params.onTransaction ||
+    params.activateGitRoot ||
+    params.localOverrides,
+  );
+  let localOverrides: LocalPackageOverridesResult | undefined;
+  let stagedInstall: StagedPackageInstall | null = null;
   let packedInstallDir: string | null = null;
+  const originalPackageRoot = params.installTarget.packageRoot ?? params.packageRoot ?? null;
+  let activePackageRoot = originalPackageRoot;
+  let afterVersion: string | null = null;
+  const initialRecovery = await verifyPackageUpdateRecovery(originalPackageRoot);
+  let liveTreeMutated = false;
+  let packageRollbackVerified: boolean | undefined;
+  const steps: UpdateStepResult[] = [];
+  const packageUpdateFailure = async (
+    failedStep: UpdateStepResult,
+    failedSteps = [failedStep],
+  ): Promise<PackageUpdateStepsResult> => {
+    failedStep.failureFacts ??= [
+      createUpdateFailureFact(
+        {
+          check: failedStep.name,
+          code: "global-install-failed",
+          message: failedStep.stderrTail ?? undefined,
+        },
+        params.env,
+      ),
+    ];
+    let recovery: UpdateRecovery = liveTreeMutated
+      ? {
+          serviceRestartSafe: false,
+          reason: "runtime-verification-failed",
+          ...(packageRollbackVerified === undefined ? {} : { packageRollbackVerified }),
+        }
+      : initialRecovery;
+    // A discarded stage must not hide damage to the live tree. Before mutation,
+    // recovery still belongs to the original runtime, verified again at failure.
+    if (!liveTreeMutated && initialRecovery.serviceRestartSafe) {
+      const liveRecovery = await verifyPackageUpdateRecovery(originalPackageRoot);
+      recovery =
+        liveRecovery.serviceRestartSafe && liveRecovery.version === initialRecovery.version
+          ? liveRecovery
+          : { serviceRestartSafe: false, reason: "runtime-verification-failed" };
+    }
+    return {
+      localOverrides,
+      ...(failedStep.failureFacts?.some((fact) => fact.code === UPDATE_GLOBAL_PERMISSION_REASON)
+        ? { reason: UPDATE_GLOBAL_PERMISSION_REASON }
+        : {}),
+      steps: failedSteps,
+      activePackageRoot,
+      afterVersion,
+      failedStep,
+      recovery,
+    };
+  };
 
   try {
-    const preparedInstall = await prepareStagedNpmInstall(params.installTarget, params.packageName);
-    stagedInstall = preparedInstall.stagedInstall;
-    if (preparedInstall.failedStep) {
-      return {
-        steps: [preparedInstall.failedStep],
-        verifiedPackageRoot: params.packageRoot ?? null,
-        afterVersion: null,
-        failedStep: preparedInstall.failedStep,
+    const permissions = await checkGlobalPackageUpdatePermissions(params.installTarget, params.env);
+    if (permissions) {
+      return await packageUpdateFailure(permissions);
+    }
+    if (process.platform === "freebsd") {
+      if (!params.installTarget.packageRoot) {
+        throw new FreeBsdPkgOwnershipError("pkg-ownership-unavailable", "paths");
+      }
+      const inspection = createFreeBsdPkgOwnershipInspection(params.timeoutMs);
+      await inspection.assertUnowned(params.packageRoot);
+      await inspection.assertUnowned(params.installTarget.packageRoot);
+    }
+    const npmPreflight = await resolveNpmUpdateLifecyclePolicy({
+      installTarget: params.installTarget,
+    });
+    if (npmPreflight.failedStep) {
+      return await packageUpdateFailure(npmPreflight.failedStep);
+    }
+    const pnpmPreflight = await validatePnpmIsolatedUpdate({
+      installTarget: params.installTarget,
+      packageName: params.packageName,
+      runCommand: params.runCommand,
+      timeoutMs: params.timeoutMs,
+      env: params.env,
+    });
+    if (pnpmPreflight.failedStep) {
+      return await packageUpdateFailure(pnpmPreflight.failedStep);
+    }
+    const packageRoot = params.packageRoot ?? params.installTarget.packageRoot;
+    if (packageRoot) {
+      // Lifecycle policy must refuse before cleanup can remove an interrupted update backup.
+      await cleanupGlobalRenameDirs({
+        globalRoot: path.dirname(packageRoot),
+        packageName: params.packageName,
+      });
+    }
+    const bunOwner =
+      params.installTarget.manager === "bun"
+        ? resolveBunGlobalInstallOwner(
+            params.installTarget.packageRoot ?? params.packageRoot,
+            params.env ?? process.env,
+          )
+        : null;
+    // Bun's global project follows its environment, not the selected binary.
+    // Bind the mutation to the verified owner even when service settings drift.
+    let effectiveInstallEnv =
+      params.installTarget.manager === "bun" && params.installTarget.globalRoot
+        ? {
+            ...(params.env ?? process.env),
+            BUN_INSTALL_GLOBAL_DIR: path.dirname(params.installTarget.globalRoot),
+            ...(bunOwner?.bunInstall ? { BUN_INSTALL: bunOwner.bunInstall } : {}),
+          }
+        : params.env;
+    if (params.installTarget.manager === "pnpm" && params.installTarget.globalRoot) {
+      const globalDir = resolvePnpmGlobalDirFromGlobalRoot(params.installTarget.globalRoot);
+      // Bind verified paths through both pnpm configuration dialects, in both
+      // cases, after original-env probes so inherited aliases cannot redirect it.
+      // pnpm 11 keeps its already-probed config and cwd.
+      effectiveInstallEnv = {
+        ...(params.env ?? process.env),
+        ...(globalDir
+          ? {
+              pnpm_config_global_dir: globalDir,
+              PNPM_CONFIG_GLOBAL_DIR: globalDir,
+              npm_config_global_dir: globalDir,
+              NPM_CONFIG_GLOBAL_DIR: globalDir,
+            }
+          : {}),
+        ...(pnpmPreflight.globalBinDir
+          ? {
+              pnpm_config_global_bin_dir: pnpmPreflight.globalBinDir,
+              PNPM_CONFIG_GLOBAL_BIN_DIR: pnpmPreflight.globalBinDir,
+              npm_config_global_bin_dir: pnpmPreflight.globalBinDir,
+              NPM_CONFIG_GLOBAL_BIN_DIR: pnpmPreflight.globalBinDir,
+            }
+          : {}),
       };
     }
+    const stageNative = params.installTarget.manager !== "npm" && requireStaging;
+    let globalBinDir = pnpmPreflight.globalBinDir ?? undefined;
+    if (stageNative && !globalBinDir) {
+      const bin = await runPnpmPreflightProbe({
+        ...params,
+        env: effectiveInstallEnv,
+        args: params.installTarget.manager === "bun" ? ["pm", "bin", "-g"] : ["bin", "-g"],
+        name: `${params.installTarget.manager} staging preflight`,
+      });
+      if (bin.failedStep) {
+        return await packageUpdateFailure(bin.failedStep);
+      }
+      globalBinDir = bin.result
+        ? readPackageManagerProbeValue(bin.result.stdout) || undefined
+        : undefined;
+    }
+    const nativeOptions = stageNative
+      ? { env: effectiveInstallEnv ?? process.env, globalBinDir, installSpec: params.installSpec }
+      : undefined;
+    const preparedInstall = await prepareStagedPackageInstall(
+      params.installTarget,
+      params.packageName,
+      nativeOptions,
+      requireStaging,
+    );
+    stagedInstall = preparedInstall.stagedInstall;
+    if (preparedInstall.failedStep) {
+      return await packageUpdateFailure(preparedInstall.failedStep);
+    }
+    const commandEnv = stagedInstall?.native?.env ?? effectiveInstallEnv;
+    const installEnv = commandEnv === undefined ? {} : { env: commandEnv };
 
-    const steps: PackageUpdateStepResult[] = [];
+    if (params.installTarget.manager === "pnpm" && stagedInstall?.native) {
+      const stage = stagedInstall.native;
+      for (const [probeName, expectedPath] of [
+        ["root", stage.globalRoot],
+        ["bin", stage.binDir],
+      ] as const) {
+        const args = [probeName, "-g", ...stage.configArgs];
+        const probe = await runPnpmPreflightProbe({
+          ...params,
+          args,
+          cwd: stage.projectRoot,
+          env: stage.env,
+          name: "pnpm staging preflight",
+        });
+        const reportedPath = probe.result && readPackageManagerProbeValue(probe.result.stdout);
+        if (
+          !reportedPath ||
+          (await resolveCanonicalPath(reportedPath)) !== (await resolveCanonicalPath(expectedPath))
+        ) {
+          const failedStep = probe.failedStep ?? {
+            name: "pnpm staging preflight",
+            command: [params.installTarget.command, ...args].join(" "),
+            cwd: stage.projectRoot,
+            durationMs: 0,
+            exitCode: 1,
+            stderrTail: `pnpm ${probeName} selected ${reportedPath || "an unknown path"}, expected staged destination ${expectedPath}. The live installation was left unchanged.`,
+          };
+          return await packageUpdateFailure(failedStep, [...steps, failedStep]);
+        }
+      }
+    }
+
     const installCommandTarget = stagedInstall?.installTarget ?? params.installTarget;
     const preparedSpec = await prepareNpmGitSourceInstallSpec({
       installTarget: installCommandTarget,
@@ -528,50 +802,68 @@ export async function runGlobalPackageUpdateSteps(params: {
     packedInstallDir = preparedSpec.packDir;
     steps.push(...preparedSpec.steps);
     if (preparedSpec.failedStep) {
-      return {
-        steps,
-        verifiedPackageRoot: params.packageRoot ?? null,
-        afterVersion: null,
-        failedStep: preparedSpec.failedStep,
-      };
+      return await packageUpdateFailure(preparedSpec.failedStep, steps);
     }
 
-    const installLocation =
-      stagedInstall?.prefix ??
-      (installCommandTarget.manager === "pnpm"
-        ? resolvePnpmGlobalDirFromGlobalRoot(installCommandTarget.globalRoot)
-        : null);
-    const updateStep = await params.runStep({
-      name: "global update",
-      argv: globalInstallArgs(
-        installCommandTarget,
-        preparedSpec.installSpec,
-        undefined,
-        installLocation,
-      ),
-      ...installCwd,
-      ...installEnv,
-      timeoutMs: params.timeoutMs,
-    });
+    // pnpm selects its version from cwd. Keep every pnpm mutation beside its
+    // detected global root, after preserving caller-relative package specs.
+    const pnpmMutationCwd =
+      installCommandTarget.manager === "pnpm" ? installCommandTarget.globalRoot : null;
+    const updateCwd =
+      stagedInstall?.native?.projectRoot ?? pnpmMutationCwd ?? preparedSpec.installCwd;
+    const updateInstallSpec =
+      installCommandTarget.manager !== "npm"
+        ? resolveNativeInstallSpecFromCwd(
+            preparedSpec.installSpec,
+            params.packageName,
+            preparedSpec.installCwd ?? process.cwd(),
+            installCommandTarget.manager,
+          )
+        : preparedSpec.installSpec;
+    liveTreeMutated ||= !stagedInstall;
+    const updateStep = await classifyPackageUpdatePermissionFailure(
+      await params.runStep({
+        name: "global update",
+        argv: [
+          ...globalInstallArgs(
+            installCommandTarget,
+            updateInstallSpec,
+            undefined,
+            stagedInstall?.prefix,
+            preparedSpec.installCwd,
+            npmPreflight.policy ?? undefined,
+          ),
+          ...(stagedInstall?.native?.configArgs ?? []),
+        ],
+        ...(updateCwd ? { cwd: updateCwd } : {}),
+        ...installEnv,
+        timeoutMs: params.timeoutMs,
+      }),
+      params.installTarget,
+      params.env,
+    );
 
     steps.push(updateStep);
     let finalInstallStep = updateStep;
     if (updateStep.exitCode !== 0) {
-      await cleanupStagedNpmInstall(stagedInstall);
+      if (updateStep.failureFacts?.some((fact) => fact.code === UPDATE_GLOBAL_PERMISSION_REASON)) {
+        return await packageUpdateFailure(updateStep, steps);
+      }
+      await cleanupStagedPackageInstall(stagedInstall);
       stagedInstall = null;
-      const preparedFallbackInstall = await prepareStagedNpmInstall(
-        params.installTarget,
-        params.packageName,
-      );
+      const preparedFallbackInstall =
+        installCommandTarget.manager === "npm"
+          ? await prepareStagedPackageInstall(
+              params.installTarget,
+              params.packageName,
+              undefined,
+              requireStaging,
+            )
+          : { stagedInstall: null, failedStep: null };
       stagedInstall = preparedFallbackInstall.stagedInstall;
       if (preparedFallbackInstall.failedStep) {
         steps.push(preparedFallbackInstall.failedStep);
-        return {
-          steps,
-          verifiedPackageRoot: params.packageRoot ?? null,
-          afterVersion: null,
-          failedStep: preparedFallbackInstall.failedStep,
-        };
+        return await packageUpdateFailure(preparedFallbackInstall.failedStep, steps);
       }
 
       const fallbackArgv = globalInstallFallbackArgs(
@@ -579,24 +871,104 @@ export async function runGlobalPackageUpdateSteps(params: {
         preparedSpec.installSpec,
         undefined,
         stagedInstall?.prefix,
+        preparedSpec.installCwd,
+        npmPreflight.policy ?? undefined,
       );
       if (fallbackArgv) {
-        const fallbackStep = await params.runStep({
-          name: "global update (omit optional)",
-          argv: fallbackArgv,
-          ...installCwd,
-          ...installEnv,
-          timeoutMs: params.timeoutMs,
-        });
+        liveTreeMutated ||= !stagedInstall;
+        const fallbackStep = await classifyPackageUpdatePermissionFailure(
+          await params.runStep({
+            name: "global update (omit optional)",
+            argv: fallbackArgv,
+            ...(preparedSpec.installCwd ? { cwd: preparedSpec.installCwd } : {}),
+            ...installEnv,
+            timeoutMs: params.timeoutMs,
+          }),
+          params.installTarget,
+          params.env,
+        );
         steps.push(fallbackStep);
         finalInstallStep = fallbackStep;
       } else {
-        await cleanupStagedNpmInstall(stagedInstall);
+        await cleanupStagedPackageInstall(stagedInstall);
         stagedInstall = null;
       }
     }
 
+    if (
+      stagedInstall?.native &&
+      params.installTarget.pnpmIsolated &&
+      finalInstallStep.exitCode === 0
+    ) {
+      const activePackages = await listActivePnpmIsolatedGlobalPackages({
+        globalRoot: stagedInstall.native.globalRoot,
+        packageName: params.packageName,
+      });
+      const candidate = activePackages.length === 1 ? activePackages[0] : undefined;
+      if (!candidate) {
+        const failedStep: UpdateStepResult = {
+          name: "global install verify",
+          command: "resolve staged pnpm replacement",
+          cwd: stagedInstall.native.projectRoot,
+          durationMs: 0,
+          exitCode: 1,
+          stderrTail: "could not identify a unique active staged pnpm replacement package",
+        };
+        return await packageUpdateFailure(failedStep, [...steps, failedStep]);
+      }
+      stagedInstall.packageRoot = candidate.packageRoot;
+    }
+
+    // pnpm 11 replaces an isolated global project with a new install directory.
+    // Resolve it again before verification so doctor and version checks inspect
+    // the package behind the refreshed global shim, not the removed old root.
+    const refreshedPnpmPackageRoot =
+      finalInstallStep.exitCode === 0 && !stagedInstall && params.installTarget.pnpmIsolated
+        ? await (async () => {
+            const activeRoots = (
+              await listActivePnpmIsolatedGlobalPackages({
+                globalRoot: params.installTarget.globalRoot,
+                packageName: params.packageName,
+              })
+            ).map((entry) => entry.packageRoot);
+            if (activeRoots.length !== 1 || !params.installTarget.packageRoot) {
+              return null;
+            }
+            const replacementRoot = activeRoots[0];
+            if (!replacementRoot) {
+              return null;
+            }
+            const [replacementOwner, previousOwner] = await Promise.all([
+              resolvePnpmIsolatedInstallOwner(replacementRoot),
+              resolvePnpmIsolatedInstallOwner(params.installTarget.packageRoot),
+            ]);
+            return replacementOwner && previousOwner && replacementOwner !== previousOwner
+              ? replacementRoot
+              : null;
+          })()
+        : null;
+    const pnpmReplacementMissing =
+      finalInstallStep.exitCode === 0 &&
+      !stagedInstall &&
+      params.installTarget.manager === "pnpm" &&
+      params.installTarget.pnpmIsolated !== undefined &&
+      params.installTarget.packageRoot !== null &&
+      refreshedPnpmPackageRoot === null;
+    if (pnpmReplacementMissing) {
+      activePackageRoot = null;
+      const replacementStep: UpdateStepResult = {
+        name: "global install verify",
+        command: `resolve pnpm replacement in ${params.installTarget.globalRoot ?? "unknown root"}`,
+        cwd: params.installTarget.globalRoot ?? process.cwd(),
+        durationMs: 0,
+        exitCode: 1,
+        stderrTail: "could not identify a unique active pnpm replacement package",
+      };
+      steps.push(replacementStep);
+      return await packageUpdateFailure(replacementStep, steps);
+    }
     const livePackageRoot =
+      refreshedPnpmPackageRoot ??
       params.installTarget.packageRoot ??
       params.packageRoot ??
       (
@@ -604,13 +976,26 @@ export async function runGlobalPackageUpdateSteps(params: {
           manager: params.installTarget,
           runCommand: params.runCommand,
           timeoutMs: params.timeoutMs,
+          packageName: params.packageName,
         })
       ).packageRoot ??
       null;
     const verificationPackageRoot = stagedInstall?.packageRoot ?? livePackageRoot;
-    let verifiedPackageRoot = livePackageRoot ?? verificationPackageRoot;
+    if (!stagedInstall) {
+      activePackageRoot = livePackageRoot;
+    }
+    if (finalInstallStep.exitCode === 0 && !verificationPackageRoot) {
+      const failedStep: UpdateStepResult = {
+        name: "global install verify",
+        command: "resolve installed package",
+        cwd: updateCwd ?? process.cwd(),
+        durationMs: 0,
+        exitCode: 1,
+        stderrTail: "could not identify the installed package root",
+      };
+      return await packageUpdateFailure(failedStep, [...steps, failedStep]);
+    }
 
-    let afterVersion: string | null = null;
     if (finalInstallStep.exitCode === 0 && verificationPackageRoot) {
       const candidateVersion = await readPackageVersion(verificationPackageRoot);
       if (!stagedInstall) {
@@ -620,10 +1005,99 @@ export async function runGlobalPackageUpdateSteps(params: {
         params.packageName,
         params.installSpec,
       );
-      const verificationErrors = await collectInstalledGlobalPackageErrors({
+      let verificationErrors = await collectInstalledGlobalPackageErrors({
         packageRoot: verificationPackageRoot,
         expectedVersion,
+        expectedGitCheckout: params.expectedGitCheckout,
       });
+      // Registry versions identify published releases. Explicit artifacts can
+      // be rebuilt at the same version, so compare known build identities before
+      // skipping validation. Missing identity is not equality.
+      const registryTarget = isRegistrySourceInstallSpec(params.installSpec);
+      let sameArtifact = false;
+      if (!registryTarget && originalPackageRoot) {
+        const [candidateBuild, installedBuild] = await Promise.all([
+          readBuiltGatewayBuildId(verificationPackageRoot),
+          readBuiltGatewayBuildId(originalPackageRoot),
+        ]);
+        sameArtifact = Boolean(candidateBuild && candidateBuild === installedBuild);
+      }
+      // Verify the requested candidate before admitting a no-op.
+      // Source exposure follows the Git SHA contract instead.
+      if (
+        verificationErrors.length === 0 &&
+        stagedInstall &&
+        !params.expectedGitCheckout &&
+        requireStaging &&
+        !params.requirePackageReplacement &&
+        (registryTarget || sameArtifact) &&
+        candidateVersion &&
+        candidateVersion === (await readPackageVersionIfPresent(originalPackageRoot))
+      ) {
+        return {
+          reason: "already-current",
+          steps,
+          activePackageRoot: originalPackageRoot,
+          afterVersion: candidateVersion,
+          failedStep: null,
+          recovery: await verifyPackageUpdateRecovery(originalPackageRoot),
+        };
+      }
+      // v2026.8.1 alone shipped this pending marker inside the closed dist inventory.
+      const blockingVerificationErrors = verificationErrors.filter(
+        (error) =>
+          params.installSpec !== "openclaw@2026.8.1" ||
+          error !== `unexpected packaged dist file ${LEGACY_PACKAGE_INSTALL_GUARD_RELATIVE_PATH}`,
+      );
+      if (blockingVerificationErrors.length === 0) {
+        let failedLifecycleStep: UpdateStepResult | null = null;
+        try {
+          const completedLifecycle = await completePendingPackageLifecycle({
+            packageRoot: verificationPackageRoot,
+            timeoutMs: params.timeoutMs,
+            runScript: async (script) => {
+              const lifecycleStep = await params.runStep({
+                name: `${params.installTarget.manager} package ${script.name}`,
+                argv: [process.execPath, path.join(verificationPackageRoot, script.relativePath)],
+                cwd: verificationPackageRoot,
+                env: commandEnv,
+                timeoutMs: params.timeoutMs,
+              });
+              steps.push(lifecycleStep);
+              if (lifecycleStep.exitCode !== 0) {
+                failedLifecycleStep = lifecycleStep;
+                throw new Error(lifecycleStep.stderrTail ?? `${lifecycleStep.name} failed`);
+              }
+            },
+          });
+          if (completedLifecycle) {
+            verificationErrors = await collectInstalledGlobalPackageErrors({
+              packageRoot: verificationPackageRoot,
+              expectedVersion,
+              expectedGitCheckout: params.expectedGitCheckout,
+            });
+          }
+        } catch (error) {
+          if (failedLifecycleStep) {
+            return await packageUpdateFailure(failedLifecycleStep, steps);
+          }
+          const lifecycleStep: UpdateStepResult = {
+            name: `${params.installTarget.manager} package lifecycle`,
+            command: `complete ${verificationPackageRoot}`,
+            cwd: verificationPackageRoot,
+            durationMs: 0,
+            exitCode: 1,
+            stderrTail: formatErrorMessage(error),
+          };
+          steps.push(lifecycleStep);
+          return await packageUpdateFailure(lifecycleStep, steps);
+        }
+      }
+      if (!params.expectedGitCheckout && verificationErrors.length === 0) {
+        verificationErrors.push(
+          ...(await collectPackageDistContentInventoryErrors(verificationPackageRoot)),
+        );
+      }
       if (verificationErrors.length > 0) {
         steps.push({
           name: "global install verify",
@@ -635,53 +1109,145 @@ export async function runGlobalPackageUpdateSteps(params: {
           stdoutTail: null,
         });
       }
-
+      let failedVerification = verificationErrors.length > 0;
       if (stagedInstall && verificationErrors.length === 0) {
-        const swapStep = await swapStagedNpmInstall({
+        const validation = (await params.validateCandidate?.(verificationPackageRoot)) ?? [];
+        steps.push(...validation);
+        const rejectedCandidate = validation.find(isBlockingPackageUpdateStep);
+        if (rejectedCandidate) {
+          return await packageUpdateFailure(rejectedCandidate, steps);
+        }
+        if (params.activateGitRoot) {
+          if (
+            stagedInstall.native ||
+            !params.expectedGitCheckout ||
+            !(await fs.lstat(stagedInstall.packageRoot)).isSymbolicLink()
+          ) {
+            throw new Error(
+              "Prepared source checkout exposure requires an npm package symlink; the current installation has not been changed.",
+            );
+          }
+          // The source owner publishes this exact root inside beforeActivate. Rebind only
+          // after validating the temporary candidate, so its cleanup cannot break exposure.
+          await fs.unlink(stagedInstall.packageRoot);
+          await fs.symlink(
+            path.resolve(params.activateGitRoot),
+            stagedInstall.packageRoot,
+            process.platform === "win32" ? "junction" : undefined,
+          );
+        }
+        const swap = await swapStagedPackageInstall({
+          timeoutMs: params.timeoutMs,
           stage: stagedInstall,
           installTarget: params.installTarget,
           packageName: params.packageName,
+          postVerifyStep: params.postVerifyStep,
+          beforeActivate: params.beforeActivate,
+          assertCurrent: params.assertCurrent,
+          onLiveMutation: () => {
+            liveTreeMutated = true;
+          },
+          onTransaction: params.onTransaction,
+          localOverrides: params.expectedGitCheckout ? undefined : params.localOverrides,
+          onLocalOverrides: (result) => {
+            localOverrides = result;
+            if (result.status === "none") {
+              return;
+            }
+            const message = `Local package overrides: ${result.status}; ${result.applied} replayed. Recovery bundle: ${result.recoveryDir}. ${result.warnings.join(" ")}`;
+            const report: UpdateStepResult = {
+              name: "local package overrides",
+              command: "preserve packaged dist edits",
+              cwd: originalPackageRoot ?? process.cwd(),
+              durationMs: 0,
+              exitCode: result.status === "error" ? 1 : 0,
+              stdoutTail: message,
+              // Existing warning rows keep recovery location visible after handoff/finalization.
+              ...(result.status === "error"
+                ? { stderrTail: message }
+                : { advisory: { kind: "recoverable-maintenance", message } }),
+            };
+            const previous = steps.findIndex((step) => step.name === report.name);
+            if (previous === -1) {
+              steps.push(report);
+            } else {
+              steps[previous] = report;
+            }
+          },
         });
-        steps.push(swapStep);
-        if (swapStep.exitCode === 0) {
-          verifiedPackageRoot = params.installTarget.packageRoot ?? verifiedPackageRoot;
+        steps.push(swap.step);
+        if (swap.postVerifyStep) {
+          steps.push(swap.postVerifyStep);
+        }
+        failedVerification = swap.status === "failed";
+        activePackageRoot = swap.activePackageRoot;
+        // Verified rollback restores package files, not state changed by hooks.
+        if (swap.status === "committed") {
           afterVersion = candidateVersion;
+        } else {
+          packageRollbackVerified = swap.packageRollbackVerified;
         }
       }
 
-      const failedVerifyOrSwap = steps.find(
-        (step) =>
-          (step.name === "global install verify" || step.name === "global install swap") &&
-          step.exitCode !== 0,
-      );
-      const postVerifyStep = failedVerifyOrSwap
-        ? null
-        : verifiedPackageRoot
-          ? await params.postVerifyStep?.(verifiedPackageRoot)
+      if (!stagedInstall && !failedVerification) {
+        const postVerifyStep = activePackageRoot
+          ? ((await params.postVerifyStep?.(activePackageRoot)) ?? null)
           : null;
-      if (postVerifyStep) {
-        steps.push(postVerifyStep);
+        if (postVerifyStep) {
+          steps.push(postVerifyStep);
+        } else if (params.postVerifyStep) {
+          steps.push(missingPackageVerificationStep(activePackageRoot ?? process.cwd()));
+        }
       }
-      if (failedVerifyOrSwap && stagedInstall) {
-        afterVersion = await readPackageVersionIfPresent(livePackageRoot);
+      if (failedVerification && stagedInstall) {
+        afterVersion = await readPackageVersionIfPresent(activePackageRoot);
       }
     }
 
-    const failedStep =
-      finalInstallStep.exitCode !== 0
-        ? finalInstallStep
-        : (steps.find((step) => step !== updateStep && step.exitCode !== 0) ?? null);
+    const failedStep = isBlockingPackageUpdateStep(finalInstallStep)
+      ? finalInstallStep
+      : (steps.find((step) => step !== updateStep && isBlockingPackageUpdateStep(step)) ?? null);
 
+    if (failedStep) {
+      return await packageUpdateFailure(failedStep, steps);
+    }
     return {
+      localOverrides,
       steps,
-      verifiedPackageRoot,
+      activePackageRoot,
       afterVersion,
       failedStep,
+      recovery: afterVersion
+        ? { serviceRestartSafe: true, version: afterVersion }
+        : { serviceRestartSafe: false, reason: "runtime-verification-failed" },
     };
+  } catch (error) {
+    if (error instanceof PackageUpdateActivationError) {
+      throw error.cause;
+    }
+    if (error instanceof FreeBsdPkgOwnershipError) {
+      throw error;
+    }
+    const failedStep = await classifyPackageUpdatePermissionFailure(
+      {
+        name: "package update",
+        command: "update installed package",
+        cwd: activePackageRoot ?? params.installCwd ?? process.cwd(),
+
+        durationMs: 0,
+        exitCode: 1,
+        stderrTail: formatErrorMessage(error),
+      },
+      params.installTarget,
+      params.env,
+      error,
+    );
+    return await packageUpdateFailure(failedStep, [...steps, failedStep]);
   } finally {
-    await cleanupStagedNpmInstall(stagedInstall ?? null);
+    await cleanupStagedPackageInstall(stagedInstall);
     if (packedInstallDir) {
-      await removePathBestEffort(packedInstallDir);
+      await removePackageUpdatePath(packedInstallDir);
     }
   }
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

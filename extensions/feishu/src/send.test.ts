@@ -1,13 +1,16 @@
+// Feishu tests cover send plugin behavior.
+import type { HttpInstance, HttpRequestOptions } from "@larksuiteoapi/node-sdk";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig } from "../runtime-api.js";
-import { buildMarkdownCard } from "./send.js";
 
 const {
   mockConvertMarkdownTables,
   mockClientGet,
   mockClientList,
   mockClientPatch,
+  mockClientUpdate,
   mockCreateFeishuClient,
+  mockLogVerbose,
   mockResolveMarkdownTableMode,
   mockResolveFeishuAccount,
   mockRuntimeConvertMarkdownTables,
@@ -17,7 +20,9 @@ const {
   mockClientGet: vi.fn(),
   mockClientList: vi.fn(),
   mockClientPatch: vi.fn(),
+  mockClientUpdate: vi.fn(),
   mockCreateFeishuClient: vi.fn(),
+  mockLogVerbose: vi.fn(),
   mockResolveMarkdownTableMode: vi.fn(() => "preserve"),
   mockResolveFeishuAccount: vi.fn(),
   mockRuntimeConvertMarkdownTables: vi.fn((text: string) => text),
@@ -27,6 +32,14 @@ const {
 vi.mock("openclaw/plugin-sdk/markdown-table-runtime", () => ({
   resolveMarkdownTableMode: mockResolveMarkdownTableMode,
 }));
+
+vi.mock("openclaw/plugin-sdk/runtime-env", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/runtime-env")>();
+  return {
+    ...actual,
+    logVerbose: mockLogVerbose,
+  };
+});
 
 vi.mock("openclaw/plugin-sdk/text-chunking", async (importOriginal) => {
   const actual = await importOriginal<typeof import("openclaw/plugin-sdk/text-chunking")>();
@@ -56,55 +69,86 @@ vi.mock("./runtime.js", () => ({
   }),
 }));
 
-let buildStructuredCard: typeof import("./send.js").buildStructuredCard;
 let editMessageFeishu: typeof import("./send.js").editMessageFeishu;
 let getMessageFeishu: typeof import("./send.js").getMessageFeishu;
-let listFeishuThreadMessages: typeof import("./send.js").listFeishuThreadMessages;
 let resolveFeishuCardTemplate: typeof import("./send.js").resolveFeishuCardTemplate;
 let sendMessageFeishu: typeof import("./send.js").sendMessageFeishu;
+let sendStructuredCardFeishu: typeof import("./send.js").sendStructuredCardFeishu;
+
+beforeAll(async () => {
+  ({
+    editMessageFeishu,
+    getMessageFeishu,
+    resolveFeishuCardTemplate,
+    sendMessageFeishu,
+    sendStructuredCardFeishu,
+  } = await import("./send.js"));
+});
+
+afterAll(() => {
+  vi.doUnmock("openclaw/plugin-sdk/markdown-table-runtime");
+  vi.doUnmock("openclaw/plugin-sdk/runtime-env");
+  vi.doUnmock("openclaw/plugin-sdk/text-chunking");
+  vi.doUnmock("./client.js");
+  vi.doUnmock("./accounts.js");
+  vi.doUnmock("./runtime.js");
+  vi.resetModules();
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockResolveMarkdownTableMode.mockReturnValue("preserve");
+  mockConvertMarkdownTables.mockImplementation((text: string) => text);
+  mockRuntimeResolveMarkdownTableMode.mockReturnValue("preserve");
+  mockRuntimeConvertMarkdownTables.mockImplementation((text: string) => text);
+  mockResolveFeishuAccount.mockReturnValue({
+    accountId: "default",
+    configured: true,
+  });
+  mockCreateFeishuClient.mockReturnValue({
+    im: {
+      message: {
+        create: vi.fn(),
+        get: mockClientGet,
+        list: mockClientList,
+        patch: mockClientPatch,
+      },
+    },
+  });
+});
 
 describe("getMessageFeishu", () => {
-  beforeAll(async () => {
-    ({
-      buildStructuredCard,
-      editMessageFeishu,
-      getMessageFeishu,
-      listFeishuThreadMessages,
-      resolveFeishuCardTemplate,
-      sendMessageFeishu,
-    } = await import("./send.js"));
-  });
-
-  afterAll(() => {
-    vi.doUnmock("openclaw/plugin-sdk/markdown-table-runtime");
-    vi.doUnmock("openclaw/plugin-sdk/text-chunking");
-    vi.doUnmock("./client.js");
-    vi.doUnmock("./accounts.js");
-    vi.doUnmock("./runtime.js");
-    vi.resetModules();
-  });
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockResolveMarkdownTableMode.mockReturnValue("preserve");
-    mockConvertMarkdownTables.mockImplementation((text: string) => text);
-    mockRuntimeResolveMarkdownTableMode.mockReturnValue("preserve");
-    mockRuntimeConvertMarkdownTables.mockImplementation((text: string) => text);
-    mockResolveFeishuAccount.mockReturnValue({
-      accountId: "default",
-      configured: true,
-    });
-    mockCreateFeishuClient.mockReturnValue({
-      im: {
-        message: {
-          create: vi.fn(),
-          get: mockClientGet,
-          list: mockClientList,
-          patch: mockClientPatch,
-        },
+  function expectTextReceipt(
+    result: Awaited<ReturnType<typeof sendMessageFeishu>>,
+    messageId: string,
+  ) {
+    const chatId = "oc_send";
+    const raw = { channel: "feishu", messageId, chatId, conversationId: chatId };
+    expect(typeof result.receipt.sentAt).toBe("number");
+    expect(result).toEqual({
+      messageId,
+      chatId,
+      receipt: {
+        primaryPlatformMessageId: messageId,
+        platformMessageIds: [messageId],
+        parts: [{ platformMessageId: messageId, kind: "text", index: 0, raw }],
+        sentAt: result.receipt.sentAt,
+        raw: [raw],
       },
     });
-  });
+  }
+
+  function expectParsedMessage(result: unknown, expected: Record<string, unknown>) {
+    expect(result).toEqual({
+      chatType: undefined,
+      senderId: undefined,
+      senderOpenId: undefined,
+      senderType: undefined,
+      createTime: undefined,
+      threadId: undefined,
+      ...expected,
+    });
+  }
 
   it("sends text without requiring Feishu runtime text helpers", async () => {
     mockRuntimeResolveMarkdownTableMode.mockImplementation(() => {
@@ -113,7 +157,6 @@ describe("getMessageFeishu", () => {
     mockRuntimeConvertMarkdownTables.mockImplementation(() => {
       throw new Error("Feishu runtime not initialized");
     });
-    mockClientPatch.mockResolvedValueOnce({ code: 0 });
     mockCreateFeishuClient.mockReturnValue({
       im: {
         message: {
@@ -137,38 +180,143 @@ describe("getMessageFeishu", () => {
       channel: "feishu",
     });
     expect(mockConvertMarkdownTables).toHaveBeenCalledWith("hello", "preserve");
-    expect(typeof result.receipt.sentAt).toBe("number");
-    expect(result).toEqual({
-      messageId: "om_send",
-      chatId: "oc_send",
-      receipt: {
-        primaryPlatformMessageId: "om_send",
-        platformMessageIds: ["om_send"],
-        parts: [
-          {
-            platformMessageId: "om_send",
-            kind: "text",
-            index: 0,
-            raw: {
-              channel: "feishu",
-              messageId: "om_send",
-              chatId: "oc_send",
-              conversationId: "oc_send",
-            },
-            threadId: "oc_send",
-          },
-        ],
-        threadId: "oc_send",
-        sentAt: result.receipt.sentAt,
-        raw: [
-          {
-            channel: "feishu",
-            messageId: "om_send",
-            chatId: "oc_send",
-            conversationId: "oc_send",
-          },
-        ],
+    expectTextReceipt(result, "om_send");
+  });
+
+  it("materializes prose soft breaks in the public post send path", async () => {
+    const create = vi.fn().mockResolvedValue({ code: 0, data: { message_id: "om_newlines" } });
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create,
+          reply: vi.fn(),
+          get: mockClientGet,
+          list: mockClientList,
+          patch: mockClientPatch,
+        },
       },
+    });
+
+    await sendMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      to: "oc_send",
+      text: "first line\nsecond line\n\n```ts\nconst value = 1\n```",
+    });
+
+    const request = create.mock.calls[0]?.[0] as { data?: { content?: string } } | undefined;
+    const element = JSON.parse(request?.data?.content ?? "null").zh_cn.content[0][0];
+    expect(element).toEqual({
+      tag: "md",
+      text: "first line  \nsecond line\n\n```ts\nconst value = 1\n```",
+    });
+  });
+
+  it("rejects direct text deliveries that acknowledge no platform message identifier", async () => {
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create: vi.fn().mockResolvedValue({ code: 0, data: {} }),
+          reply: vi.fn(),
+          get: mockClientGet,
+          list: mockClientList,
+          patch: mockClientPatch,
+        },
+      },
+    });
+
+    await expect(
+      sendMessageFeishu({ cfg: {} as ClawdbotConfig, to: "oc_send", text: "hello" }),
+    ).rejects.toThrow("Feishu send failed: no message_id returned");
+  });
+
+  it("sends automatic mentions as native post elements without rewriting body text", async () => {
+    const create = vi.fn().mockResolvedValue({ code: 0, data: { message_id: "om_mentions" } });
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create,
+          reply: vi.fn(),
+          get: mockClientGet,
+          list: mockClientList,
+          patch: mockClientPatch,
+        },
+      },
+    });
+
+    const result = await sendMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      to: "oc_send",
+      text: 'body <at user_id="ou_body">Body User</at>',
+      mentions: [{ openId: "ou_target", name: "Target User", key: "@_user_1" }],
+    });
+
+    expect(mockConvertMarkdownTables).toHaveBeenCalledWith(
+      'body <at user_id="ou_body">Body User</at>',
+      "preserve",
+    );
+    expect(create).toHaveBeenCalledWith({
+      params: { receive_id_type: "chat_id" },
+      data: {
+        receive_id: "oc_send",
+        msg_type: "post",
+        content: JSON.stringify({
+          zh_cn: {
+            content: [
+              [
+                { tag: "at", user_id: "ou_target", user_name: "Target User" },
+                { tag: "md", text: 'body <at user_id="ou_body">Body User</at>' },
+              ],
+            ],
+          },
+        }),
+      },
+    });
+    expectTextReceipt(result, "om_mentions");
+  });
+
+  it.each([
+    {
+      name: "structured",
+      send: () =>
+        sendStructuredCardFeishu({
+          cfg: {} as ClawdbotConfig,
+          to: "oc_card",
+          text: "hello",
+          header: { title: "Agent", template: "space lobster" },
+        }),
+      expectedHeader: {
+        title: { tag: "plain_text", content: "Agent" },
+        template: "blue",
+      },
+    },
+    {
+      name: "without header",
+      send: () =>
+        sendStructuredCardFeishu({ cfg: {} as ClawdbotConfig, to: "oc_card", text: "hello" }),
+      expectedHeader: undefined,
+    },
+  ])("sends $name cards with schema-2.0 width config", async ({ send, expectedHeader }) => {
+    const create = vi.fn().mockResolvedValue({ code: 0, data: { message_id: "om_card" } });
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create,
+          reply: vi.fn(),
+          get: mockClientGet,
+          list: mockClientList,
+          patch: mockClientPatch,
+        },
+      },
+    });
+
+    await send();
+
+    const request = create.mock.calls[0]?.[0] as { data?: { content?: string } } | undefined;
+    expect(JSON.parse(request?.data?.content ?? "null")).toEqual({
+      schema: "2.0",
+      config: { width_mode: "fill" },
+      body: { elements: [{ tag: "markdown", content: "hello" }] },
+      ...(expectedHeader ? { header: expectedHeader } : {}),
     });
   });
 
@@ -199,18 +347,47 @@ describe("getMessageFeishu", () => {
       messageId: "om_1",
     });
 
-    expect(result).toEqual({
+    expect(mockClientGet).toHaveBeenCalledWith({
+      params: { card_msg_content_type: "user_card_content" },
+      path: { message_id: "om_1" },
+    });
+    expectParsedMessage(result, {
       messageId: "om_1",
       chatId: "oc_1",
-      chatType: undefined,
-      senderId: undefined,
-      senderOpenId: undefined,
-      senderType: undefined,
       content: "hello markdown\nhello div",
       contentType: "interactive",
-      createTime: undefined,
-      threadId: undefined,
     });
+  });
+
+  it("preserves the canonical root and thread returned by the Feishu message API", async () => {
+    mockClientGet.mockResolvedValueOnce({
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: "om_topic_child",
+            root_id: "om_topic_root",
+            thread_id: "omt_topic",
+            chat_id: "oc_topic_group",
+            msg_type: "text",
+            body: { content: JSON.stringify({ text: "topic reply" }) },
+          },
+        ],
+      },
+    });
+
+    const result = await getMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      messageId: "om_topic_child",
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        messageId: "om_topic_child",
+        rootId: "om_topic_root",
+        threadId: "omt_topic",
+      }),
+    );
   });
 
   it("falls through empty interactive card element arrays and locale variants", async () => {
@@ -252,17 +429,11 @@ describe("getMessageFeishu", () => {
       messageId: "om_i18n_card",
     });
 
-    expect(result).toEqual({
+    expectParsedMessage(result, {
       messageId: "om_i18n_card",
       chatId: "oc_i18n_card",
-      chatType: undefined,
-      senderId: undefined,
-      senderOpenId: undefined,
-      senderType: undefined,
       content: "hello 2 tasks {{metadata}}",
       contentType: "interactive",
-      createTime: undefined,
-      threadId: undefined,
     });
   });
 
@@ -296,17 +467,11 @@ describe("getMessageFeishu", () => {
       messageId: "om_post_card",
     });
 
-    expect(result).toEqual({
+    expectParsedMessage(result, {
       messageId: "om_post_card",
       chatId: "oc_post_card",
-      chatType: undefined,
-      senderId: undefined,
-      senderOpenId: undefined,
-      senderType: undefined,
       content: "Card summary\n\n**fallback** body",
       contentType: "interactive",
-      createTime: undefined,
-      threadId: undefined,
     });
   });
 
@@ -323,7 +488,13 @@ describe("getMessageFeishu", () => {
               content: JSON.stringify({
                 zh_cn: {
                   title: "Summary",
-                  content: [[{ tag: "text", text: "post body" }]],
+                  content: [
+                    [
+                      { tag: "text", text: "post body", style: ["bold"] },
+                      { tag: "text", text: " " },
+                      { tag: "a", text: "Docs", href: "https://example.com", style: ["italic"] },
+                    ],
+                  ],
                 },
               }),
             },
@@ -337,17 +508,11 @@ describe("getMessageFeishu", () => {
       messageId: "om_post",
     });
 
-    expect(result).toEqual({
+    expectParsedMessage(result, {
       messageId: "om_post",
       chatId: "oc_post",
-      chatType: undefined,
-      senderId: undefined,
-      senderOpenId: undefined,
-      senderType: undefined,
-      content: "Summary\n\npost body",
+      content: "Summary\n\n**post body** *[Docs](https://example.com)*",
       contentType: "post",
-      createTime: undefined,
-      threadId: undefined,
     });
   });
 
@@ -373,17 +538,11 @@ describe("getMessageFeishu", () => {
       messageId: "om_file",
     });
 
-    expect(result).toEqual({
+    expectParsedMessage(result, {
       messageId: "om_file",
       chatId: "oc_file",
-      chatType: undefined,
-      senderId: undefined,
-      senderOpenId: undefined,
-      senderType: undefined,
       content: "[file message]",
       contentType: "file",
-      createTime: undefined,
-      threadId: undefined,
     });
   });
 
@@ -405,154 +564,143 @@ describe("getMessageFeishu", () => {
       messageId: "om_single",
     });
 
-    expect(result).toEqual({
+    expectParsedMessage(result, {
       messageId: "om_single",
       chatId: "oc_single",
-      chatType: undefined,
-      senderId: undefined,
-      senderOpenId: undefined,
-      senderType: undefined,
       content: "single payload",
       contentType: "text",
-      createTime: undefined,
-      threadId: undefined,
     });
   });
 
-  it("reuses the same content parsing for thread history messages", async () => {
-    mockClientList.mockResolvedValueOnce({
+  it("logs a safe diagnostic (not raw content) when message content is not valid JSON", async () => {
+    mockClientGet.mockResolvedValueOnce({
       code: 0,
       data: {
-        items: [
-          {
-            message_id: "om_root",
-            msg_type: "text",
-            body: {
-              content: JSON.stringify({ text: "root starter" }),
-            },
-          },
-          {
-            message_id: "om_card",
-            msg_type: "interactive",
-            body: {
-              content: JSON.stringify({
-                body: {
-                  elements: [{ tag: "markdown", content: "hello from card 2.0" }],
-                },
-              }),
-            },
-            sender: {
-              id: "app_1",
-              sender_type: "app",
-            },
-            create_time: "1710000000000",
-          },
-          {
-            message_id: "om_file",
-            msg_type: "file",
-            body: {
-              content: JSON.stringify({ file_key: "file_v3_123" }),
-            },
-            sender: {
-              id: "ou_1",
-              sender_type: "user",
-            },
-            create_time: "1710000001000",
-          },
-        ],
+        message_id: "om_bad_json",
+        chat_id: "oc_test",
+        chat_type: "group",
+        msg_type: "text",
+        body: {
+          content: "{bad json}",
+        },
+        sender: {
+          id: "ou_1",
+          sender_type: "user",
+        },
       },
     });
 
-    const result = await listFeishuThreadMessages({
+    const result = await getMessageFeishu({
       cfg: {} as ClawdbotConfig,
-      threadId: "omt_1",
-      rootMessageId: "om_root",
+      messageId: "om_bad_json",
     });
 
-    expect(result).toEqual([
-      {
-        messageId: "om_file",
-        senderId: "ou_1",
-        senderType: "user",
-        contentType: "file",
-        content: "[file message]",
-        createTime: 1710000001000,
-      },
-      {
-        messageId: "om_card",
-        senderId: "app_1",
-        senderType: "app",
-        contentType: "interactive",
-        content: "hello from card 2.0",
-        createTime: 1710000000000,
-      },
-    ]);
-  });
-
-  it("does not partially parse malformed thread history create_time values", async () => {
-    mockClientList.mockResolvedValueOnce({
-      code: 0,
-      data: {
-        items: [
-          {
-            message_id: "om_text",
-            msg_type: "text",
-            body: {
-              content: JSON.stringify({ text: "partial time" }),
-            },
-            sender: {
-              id: "ou_1",
-              sender_type: "user",
-            },
-            create_time: "1710000000000ms",
-          },
-        ],
-      },
+    expect(mockLogVerbose).toHaveBeenCalledWith(
+      expect.stringContaining("feishu message content parse failed for text message"),
+    );
+    expect(mockLogVerbose.mock.calls.flat().map(String).join("\n")).not.toContain("{bad json}");
+    expect(result).toMatchObject({
+      messageId: "om_bad_json",
+      contentType: "text",
+      content: "{bad json}",
     });
-
-    const result = await listFeishuThreadMessages({
-      cfg: {} as ClawdbotConfig,
-      threadId: "omt_1",
-      rootMessageId: "om_root",
-    });
-
-    expect(result).toEqual([
-      {
-        messageId: "om_text",
-        senderId: "ou_1",
-        senderType: "user",
-        contentType: "text",
-        content: "partial time",
-        createTime: undefined,
-      },
-    ]);
   });
 });
 
 describe("editMessageFeishu", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    mockResolveFeishuAccount.mockReturnValue({
-      accountId: "default",
-      configured: true,
-    });
+    mockClientPatch.mockReset();
+    mockClientUpdate.mockReset();
     mockCreateFeishuClient.mockReturnValue({
       im: {
         message: {
           patch: mockClientPatch,
+          update: mockClientUpdate,
         },
       },
     });
   });
 
-  it("patches post content for text edits", async () => {
+  it("routes card and rich-post edits through their distinct Feishu SDK HTTP methods", async () => {
+    const Lark = await import("@larksuiteoapi/node-sdk");
+    const requests: Array<{ method: string; url: string; data: unknown }> = [];
+    const tokenRequest = vi.fn(async (): Promise<never> => {
+      throw new Error("Unexpected Feishu HTTP request");
+    });
+    const transport: HttpInstance = {
+      request: tokenRequest,
+      get: tokenRequest,
+      delete: tokenRequest,
+      head: tokenRequest,
+      options: tokenRequest,
+      post: tokenRequest,
+      put: tokenRequest,
+      patch: tokenRequest,
+    };
+    Object.defineProperty(transport, "request", {
+      value: async (options: HttpRequestOptions<{ content?: string; msg_type?: string }>) => {
+        const method = options.method ?? "GET";
+        const data = options.data ?? {};
+        requests.push({ method, url: options.url ?? "", data });
+        const content = JSON.parse(data.content ?? "{}") as { schema?: string };
+        const valid = content.schema
+          ? method === "PATCH"
+          : method === "PUT" && data.msg_type === "post";
+        return Response.json({ code: valid ? 0 : 230020, msg: "edit contract" }).json();
+      },
+    });
+    mockCreateFeishuClient.mockReturnValue(
+      new Lark.Client({
+        appId: "cli_edit_contract",
+        appSecret: "local-test-placeholder", // pragma: allowlist secret
+        domain: Lark.Domain.Feishu,
+        loggerLevel: Lark.LoggerLevel.error,
+        disableTokenCache: true,
+        httpInstance: transport,
+      }),
+    );
+
+    await expect(
+      editMessageFeishu({
+        cfg: {} as ClawdbotConfig,
+        messageId: "om_card_contract",
+        card: { schema: "2.0" },
+      }),
+    ).resolves.toEqual({ messageId: "om_card_contract", contentType: "interactive" });
+    await expect(
+      editMessageFeishu({
+        cfg: {} as ClawdbotConfig,
+        messageId: "om_post_contract",
+        text: "updated rich-post body",
+      }),
+    ).resolves.toEqual({ messageId: "om_post_contract", contentType: "post" });
+
+    expect(requests).toEqual([
+      {
+        method: "PATCH",
+        url: "https://open.feishu.cn/open-apis/im/v1/messages/om_card_contract",
+        data: { content: JSON.stringify({ schema: "2.0" }) },
+      },
+      {
+        method: "PUT",
+        url: "https://open.feishu.cn/open-apis/im/v1/messages/om_post_contract",
+        data: {
+          msg_type: "post",
+          content: expect.any(String),
+        },
+      },
+    ]);
+    expect(tokenRequest).not.toHaveBeenCalled();
+  });
+
+  it("updates rich-post content for text edits", async () => {
     mockRuntimeResolveMarkdownTableMode.mockImplementation(() => {
       throw new Error("Feishu runtime not initialized");
     });
     mockRuntimeConvertMarkdownTables.mockImplementation(() => {
       throw new Error("Feishu runtime not initialized");
     });
-    mockClientPatch.mockResolvedValueOnce({ code: 0 });
+    mockClientUpdate.mockResolvedValueOnce({ code: 0 });
 
     const result = await editMessageFeishu({
       cfg: {} as ClawdbotConfig,
@@ -560,9 +708,10 @@ describe("editMessageFeishu", () => {
       text: "updated body",
     });
 
-    expect(mockClientPatch).toHaveBeenCalledWith({
+    expect(mockClientUpdate).toHaveBeenCalledWith({
       path: { message_id: "om_edit" },
       data: {
+        msg_type: "post",
         content: JSON.stringify({
           zh_cn: {
             content: [
@@ -580,6 +729,33 @@ describe("editMessageFeishu", () => {
     expect(result).toEqual({ messageId: "om_edit", contentType: "post" });
   });
 
+  it("normalizes post edits and accepts content beyond the delivery chunk size", async () => {
+    mockClientUpdate.mockResolvedValueOnce({ code: 0 });
+    const text = `${"a".repeat(4_500)}\nsecond line`;
+
+    await editMessageFeishu({
+      cfg: {} as ClawdbotConfig,
+      messageId: "om_edit",
+      text,
+    });
+
+    const request = mockClientUpdate.mock.calls[0]?.[0] as { data?: { content?: string } };
+    const element = JSON.parse(request.data?.content ?? "null").zh_cn.content[0][0];
+    expect(element.text).toBe(`${"a".repeat(4_500)}  \nsecond line`);
+  });
+
+  it("rejects edits that exceed the rich-post byte envelope", async () => {
+    await expect(
+      editMessageFeishu({
+        cfg: {} as ClawdbotConfig,
+        messageId: "om_edit",
+        text: "界".repeat(11_000),
+      }),
+    ).rejects.toThrow("Feishu message edit exceeds the 30 KB rich-post API limit");
+    expect(mockClientPatch).not.toHaveBeenCalled();
+    expect(mockClientUpdate).not.toHaveBeenCalled();
+  });
+
   it("patches interactive content for card edits", async () => {
     mockClientPatch.mockResolvedValueOnce({ code: 0 });
 
@@ -595,7 +771,23 @@ describe("editMessageFeishu", () => {
         content: JSON.stringify({ schema: "2.0" }),
       },
     });
+    expect(mockClientUpdate).not.toHaveBeenCalled();
     expect(result).toEqual({ messageId: "om_card", contentType: "interactive" });
+  });
+
+  it.each([
+    { name: "rich-post", body: { text: "updated body" }, request: mockClientUpdate },
+    { name: "interactive-card", body: { card: { schema: "2.0" } }, request: mockClientPatch },
+  ])("preserves provider errors for $name edits", async ({ body, request }) => {
+    request.mockResolvedValueOnce({ code: 230020, msg: "permission denied" });
+
+    await expect(
+      editMessageFeishu({
+        cfg: {} as ClawdbotConfig,
+        messageId: "om_denied",
+        ...body,
+      }),
+    ).rejects.toThrow("Feishu message edit failed: permission denied");
   });
 });
 
@@ -608,53 +800,40 @@ describe("resolveFeishuCardTemplate", () => {
     expect(resolveFeishuCardTemplate("space lobster")).toBeUndefined();
   });
 });
+describe("Feishu card-mode newline preservation", () => {
+  function createCardClient() {
+    const create = vi.fn().mockResolvedValue({ code: 0, data: { message_id: "om_card" } });
+    mockCreateFeishuClient.mockReturnValue({
+      im: {
+        message: {
+          create,
+          reply: vi.fn(),
+          get: mockClientGet,
+          list: mockClientList,
+          patch: mockClientPatch,
+        },
+      },
+    });
+    return create;
+  }
 
-function expectSchema2WidthConfig(card: unknown) {
-  const typedCard = card as {
-    config: {
-      width_mode?: string;
-      enable_forward?: boolean;
-      wide_screen_mode?: boolean;
+  function parseCardContent(create: ReturnType<typeof vi.fn>) {
+    const request = create.mock.calls[0]?.[0] as { data?: { content?: string } } | undefined;
+    return JSON.parse(request?.data?.content ?? "null") as {
+      body: { elements: Array<{ tag: string; content: string }> };
     };
-  };
+  }
 
-  expect(typedCard.config.width_mode).toBe("fill");
-  expect(typedCard.config.enable_forward).toBeUndefined();
-  expect(typedCard.config.wide_screen_mode).toBeUndefined();
-}
-
-describe("Feishu card schema config", () => {
   it.each([
-    {
-      name: "structured card",
-      build: () => buildStructuredCard("hello"),
-    },
-    {
-      name: "markdown card",
-      build: () => buildMarkdownCard("hello"),
-    },
-  ])("$name uses schema-2.0 width config instead of legacy wide screen mode", ({ build }) => {
-    expectSchema2WidthConfig(build());
-  });
-});
-
-describe("buildStructuredCard", () => {
-  it("falls back to blue when the header template is unsupported", () => {
-    const card = buildStructuredCard("hello", {
-      header: {
-        title: "Agent",
-        template: "space lobster",
-      },
+    ["single", "line one\nline two\nline three"],
+    ["double", "para a\n\npara b"],
+  ] as const)("preserves %s newlines in cards", async (_newline, text) => {
+    const create = createCardClient();
+    await sendStructuredCardFeishu({
+      cfg: {} as ClawdbotConfig,
+      to: "oc_card",
+      text,
     });
-
-    expect(card).toEqual({
-      schema: "2.0",
-      config: { width_mode: "fill" },
-      body: { elements: [{ tag: "markdown", content: "hello" }] },
-      header: {
-        title: { tag: "plain_text", content: "Agent" },
-        template: "blue",
-      },
-    });
+    expect(parseCardContent(create).body.elements[0]?.content).toBe(text);
   });
 });

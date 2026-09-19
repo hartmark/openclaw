@@ -1,3 +1,4 @@
+// Unwraps dispatch wrappers that delegate to real commands.
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { sortUniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import {
@@ -8,13 +9,23 @@ import {
 import { normalizeExecutableToken } from "./exec-wrapper-tokens.js";
 import { parseInlineOptionToken } from "./inline-option-token.js";
 
-export { unwrapEnvInvocation } from "./command-carriers.js";
-
 export const MAX_DISPATCH_WRAPPER_DEPTH = 4;
 
 const NICE_OPTIONS_WITH_VALUE = new Set(["-n", "--adjustment", "--priority"]);
 const CAFFEINATE_OPTIONS_WITH_VALUE = new Set(["-t", "-w"]);
 const STDBUF_OPTIONS_WITH_VALUE = new Set(["-i", "--input", "-o", "--output", "-e", "--error"]);
+const FLOCK_SHORT_FLAG_OPTIONS = new Set(["-e", "-F", "-n", "-o", "-s", "-x"]);
+const FLOCK_LONG_FLAG_OPTIONS = new Set([
+  "--close",
+  "--exclusive",
+  "--nb",
+  "--no-fork",
+  "--nonblock",
+  "--shared",
+  "--verbose",
+]);
+const FLOCK_SHORT_OPTIONS_WITH_VALUE = new Set(["-E", "-w"]);
+const FLOCK_LONG_OPTIONS_WITH_VALUE = new Set(["--conflict-exit-code", "--timeout", "--wait"]);
 const TIME_FLAG_OPTIONS = new Set([
   "-a",
   "--append",
@@ -47,7 +58,6 @@ const XCRUN_FLAG_OPTIONS = new Set([
   "-v",
   "--verbose",
 ]);
-
 function isArchSelectorToken(token: string): boolean {
   return /^-[A-Za-z0-9_]+$/.test(token);
 }
@@ -236,6 +246,50 @@ function unwrapTimeInvocation(argv: string[]): string[] | null {
   });
 }
 
+function isFlockShortFlagCluster(token: string): boolean {
+  return /^-[eFnsxo]+$/.test(token);
+}
+
+function unwrapFlockInvocation(argv: string[]): string[] | null {
+  return scanWrapperInvocation(argv, {
+    separators: new Set(["--"]),
+    onToken: (token, lower) => {
+      if (!token.startsWith("-") || token === "-") {
+        return "stop";
+      }
+      const parsedToken = parseInlineOptionToken(token);
+      const lowerFlag = parseInlineOptionToken(lower).name;
+      if (FLOCK_LONG_FLAG_OPTIONS.has(lowerFlag)) {
+        return "continue";
+      }
+      if (FLOCK_LONG_OPTIONS_WITH_VALUE.has(lowerFlag)) {
+        return parsedToken.hasInlineValue ? "continue" : "consume-next";
+      }
+      if (isFlockShortFlagCluster(token)) {
+        return "continue";
+      }
+      if (FLOCK_SHORT_FLAG_OPTIONS.has(parsedToken.name)) {
+        return "continue";
+      }
+      if (FLOCK_SHORT_OPTIONS_WITH_VALUE.has(parsedToken.name)) {
+        return parsedToken.hasInlineValue || token !== parsedToken.name
+          ? "continue"
+          : "consume-next";
+      }
+      return "invalid";
+    },
+    adjustCommandIndex: (commandIndex, currentArgv) => {
+      // The first non-option token is the lock target; only the next token can be
+      // the wrapped executable. Shell-string and fd-only forms stay blocked.
+      const wrappedCommandIndex = commandIndex + 1;
+      const wrappedCommand = currentArgv[wrappedCommandIndex]?.trim() ?? "";
+      return wrappedCommand && (!wrappedCommand.startsWith("-") || wrappedCommand === "-")
+        ? wrappedCommandIndex
+        : null;
+    },
+  });
+}
+
 function timeInvocationWritesOutputFile(argv: string[]): boolean {
   let expectsOptionValue = false;
   for (let idx = 1; idx < argv.length; idx += 1) {
@@ -380,6 +434,7 @@ type DispatchWrapperSpec = {
   name: string;
   unwrap?: (argv: string[], platform?: NodeJS.Platform) => string[] | null;
   transparentUsage?: boolean | ((argv: string[], platform?: NodeJS.Platform) => boolean);
+  changesExecutableLookup?: true;
 };
 
 const DISPATCH_WRAPPER_SPECS: readonly DispatchWrapperSpec[] = [
@@ -390,21 +445,42 @@ const DISPATCH_WRAPPER_SPECS: readonly DispatchWrapperSpec[] = [
     transparentUsage: (_argv, platform) => supportsArchDispatchWrapper(platform),
   },
   { name: "caffeinate", unwrap: unwrapCaffeinateInvocation, transparentUsage: true },
+  { name: "bwrap" },
+  { name: "catchsegv" },
   { name: "chrt" },
+  { name: "chroot" },
+  { name: "cpulimit" },
   { name: "doas" },
+  { name: "eatmydata" },
   {
     name: "env",
     unwrap: unwrapEnvInvocation,
     transparentUsage: (argv) => !envInvocationUsesModifiers(argv),
   },
+  { name: "firejail" },
+  { name: "flock", unwrap: unwrapFlockInvocation, transparentUsage: true },
+  { name: "gosu" },
   { name: "ionice" },
+  { name: "linux32" },
+  { name: "linux64" },
   { name: "nice", unwrap: unwrapNiceInvocation, transparentUsage: true },
+  { name: "nsenter" },
   { name: "nohup", unwrap: unwrapNohupInvocation, transparentUsage: true },
+  { name: "numactl" },
+  { name: "pkexec" },
+  { name: "proot" },
+  { name: "proxychains" },
+  { name: "proxychains4" },
+  { name: "runuser" },
   { name: "sandbox-exec", unwrap: unwrapSandboxExecInvocation, transparentUsage: true },
   { name: "script", unwrap: unwrapScriptInvocation, transparentUsage: false },
+  { name: "setarch" },
   { name: "setsid" },
+  { name: "setpriv" },
   { name: "stdbuf", unwrap: unwrapStdbufInvocation, transparentUsage: true },
+  { name: "su" },
   { name: "sudo" },
+  { name: "systemd-run" },
   { name: "taskset" },
   {
     name: "time",
@@ -412,17 +488,27 @@ const DISPATCH_WRAPPER_SPECS: readonly DispatchWrapperSpec[] = [
     transparentUsage: (argv) => !timeInvocationWritesOutputFile(argv),
   },
   { name: "timeout", unwrap: unwrapTimeoutInvocation, transparentUsage: true },
+  { name: "torify" },
+  { name: "torsocks" },
+  { name: "unbuffer" },
+  { name: "unshare" },
+  { name: "watch" },
   {
     name: "xcrun",
+    changesExecutableLookup: true,
     unwrap: (argv, platform) =>
       supportsXcrunDispatchWrapper(platform) ? unwrapXcrunInvocation(argv) : null,
     transparentUsage: (_argv, platform) => supportsXcrunDispatchWrapper(platform),
   },
+  { name: "xvfb-run" },
 ];
 
 const DISPATCH_WRAPPER_SPEC_BY_NAME = new Map(
   DISPATCH_WRAPPER_SPECS.map((spec) => [spec.name, spec] as const),
 );
+function normalizeDispatchWrapperName(token: string): string {
+  return normalizeExecutableToken(token);
+}
 
 type DispatchWrapperUnwrapResult =
   | { kind: "not-wrapper" }
@@ -430,11 +516,15 @@ type DispatchWrapperUnwrapResult =
   | { kind: "unwrapped"; wrapper: string; argv: string[] };
 
 type DispatchWrapperTrustPlan = {
+  dispatchChainComplete: boolean;
   argv: string[];
   wrappers: string[];
+  wrapperInvocations: DispatchWrapperInvocation[];
   policyBlocked: boolean;
   blockedWrapper?: string;
 };
+
+export type DispatchWrapperInvocation = { wrapper: string; sourceArgv: string[] };
 
 function blockDispatchWrapper(wrapper: string): DispatchWrapperUnwrapResult {
   return { kind: "blocked", wrapper };
@@ -450,7 +540,7 @@ function unwrapDispatchWrapper(
 }
 
 export function isDispatchWrapperExecutable(token: string): boolean {
-  return DISPATCH_WRAPPER_SPEC_BY_NAME.has(normalizeExecutableToken(token));
+  return DISPATCH_WRAPPER_SPEC_BY_NAME.has(normalizeDispatchWrapperName(token));
 }
 
 export function unwrapKnownDispatchWrapperInvocation(
@@ -461,7 +551,7 @@ export function unwrapKnownDispatchWrapperInvocation(
   if (!token0) {
     return { kind: "not-wrapper" };
   }
-  const wrapper = normalizeExecutableToken(token0);
+  const wrapper = normalizeDispatchWrapperName(token0);
   const spec = DISPATCH_WRAPPER_SPEC_BY_NAME.get(wrapper);
   if (!spec) {
     return { kind: "not-wrapper" };
@@ -499,12 +589,15 @@ function isSemanticDispatchWrapperUsage(
 function blockedDispatchWrapperPlan(params: {
   argv: string[];
   wrappers: string[];
+  wrapperInvocations: DispatchWrapperInvocation[];
   blockedWrapper: string;
 }): DispatchWrapperTrustPlan {
   return {
     argv: params.argv,
     wrappers: params.wrappers,
+    wrapperInvocations: params.wrapperInvocations,
     policyBlocked: true,
+    dispatchChainComplete: false,
     blockedWrapper: params.blockedWrapper,
   };
 }
@@ -516,12 +609,14 @@ export function resolveDispatchWrapperTrustPlan(
 ): DispatchWrapperTrustPlan {
   let current = argv;
   const wrappers: string[] = [];
+  const wrapperInvocations: DispatchWrapperInvocation[] = [];
   for (let depth = 0; depth < maxDepth; depth += 1) {
     const unwrap = unwrapKnownDispatchWrapperInvocation(current, platform);
     if (unwrap.kind === "blocked") {
       return blockedDispatchWrapperPlan({
         argv: current,
         wrappers,
+        wrapperInvocations,
         blockedWrapper: unwrap.wrapper,
       });
     }
@@ -529,10 +624,12 @@ export function resolveDispatchWrapperTrustPlan(
       break;
     }
     wrappers.push(unwrap.wrapper);
+    wrapperInvocations.push({ wrapper: unwrap.wrapper, sourceArgv: [...current] });
     if (isSemanticDispatchWrapperUsage(unwrap.wrapper, current, platform)) {
       return blockedDispatchWrapperPlan({
         argv: current,
         wrappers,
+        wrapperInvocations,
         blockedWrapper: unwrap.wrapper,
       });
     }
@@ -544,11 +641,20 @@ export function resolveDispatchWrapperTrustPlan(
       return blockedDispatchWrapperPlan({
         argv: current,
         wrappers,
+        wrapperInvocations,
         blockedWrapper: overflow.wrapper,
       });
     }
   }
-  return { argv: current, wrappers, policyBlocked: false };
+  return {
+    argv: current,
+    wrappers,
+    wrapperInvocations,
+    policyBlocked: false,
+    dispatchChainComplete: wrappers.every(
+      (wrapper) => !DISPATCH_WRAPPER_SPEC_BY_NAME.get(wrapper)?.changesExecutableLookup,
+    ),
+  };
 }
 
 export function hasDispatchEnvManipulation(argv: string[]): boolean {

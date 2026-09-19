@@ -1,3 +1,4 @@
+// Registers and watches plugin channel runtime context values.
 import type {
   ChannelRuntimeContextKey,
   ChannelRuntimeSurface,
@@ -28,6 +29,7 @@ function resolveRuntimeContextRegistry(params: {
   return params.channelRuntime?.runtimeContexts ?? null;
 }
 
+/** Registers a channel-scoped runtime context, returning null when no runtime registry exists. */
 export function registerChannelRuntimeContext(
   params: ChannelRuntimeContextKey & {
     channelRuntime?: ChannelRuntimeSurface;
@@ -48,23 +50,24 @@ export function registerChannelRuntimeContext(
   });
 }
 
-// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Runtime context values are caller-typed by key.
-export function getChannelRuntimeContext<T = unknown>(
+/** Reads a channel-scoped runtime context from the current runtime registry. */
+export function getChannelRuntimeContext(
   params: ChannelRuntimeContextKey & {
     channelRuntime?: ChannelRuntimeSurface;
   },
-): T | undefined {
+): unknown {
   const runtimeContexts = resolveRuntimeContextRegistry(params);
   if (!runtimeContexts) {
     return undefined;
   }
-  return runtimeContexts.get<T>({
+  return runtimeContexts.get({
     channelId: params.channelId,
     accountId: params.accountId,
     capability: params.capability,
   });
 }
 
+/** Watches context registration changes for one channel/account/capability key. */
 export function watchChannelRuntimeContexts(
   params: ChannelRuntimeContextKey & {
     channelRuntime?: ChannelRuntimeSurface;
@@ -83,6 +86,7 @@ export function watchChannelRuntimeContexts(
   });
 }
 
+/** Wraps a channel runtime so contexts registered during a task are disposed together. */
 export function createTaskScopedChannelRuntime<T extends ChannelRuntimeSurface>(params: {
   channelRuntime?: T;
 }): {
@@ -99,28 +103,21 @@ export function createTaskScopedChannelRuntime<T extends ChannelRuntimeSurface>(
   const runtimeContexts = resolveScopedRuntimeContextRegistry({ channelRuntime: baseRuntime });
 
   const trackedLeases = new Set<{ dispose: () => void }>();
-  const trackLease = (lease: { dispose: () => void }) => {
-    trackedLeases.add(lease);
-    let disposed = false;
-    return {
-      dispose: () => {
-        if (disposed) {
-          return;
-        }
-        disposed = true;
-        trackedLeases.delete(lease);
-        lease.dispose();
-      },
-    };
-  };
-
   const scopedRuntime = {
     ...baseRuntime,
     runtimeContexts: {
       ...runtimeContexts,
       register: (registerParams) => {
         const lease = runtimeContexts.register(registerParams);
-        return trackLease(lease);
+        const trackedLease = {
+          dispose: () => {
+            if (trackedLeases.delete(trackedLease)) {
+              lease.dispose();
+            }
+          },
+        };
+        trackedLeases.add(trackedLease);
+        return trackedLease;
       },
     },
   } as T;

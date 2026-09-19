@@ -1,3 +1,5 @@
+// Preemptive compaction tests cover token-pressure estimates before prompt
+// submission and the route chosen to compact, truncate, or proceed.
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import "../../test-helpers/agent-session-token-mock.js";
@@ -6,19 +8,21 @@ import { estimateToolResultReductionPotential } from "../tool-result-truncation.
 let PREEMPTIVE_OVERFLOW_ERROR_TEXT: typeof import("./preemptive-compaction.js").PREEMPTIVE_OVERFLOW_ERROR_TEXT;
 let estimateLlmBoundaryTokenPressure: typeof import("./preemptive-compaction.js").estimateLlmBoundaryTokenPressure;
 let buildPrePromptContextBudgetStatus: typeof import("./preemptive-compaction.js").buildPrePromptContextBudgetStatus;
-let estimatePrePromptTokens: typeof import("./preemptive-compaction.js").estimatePrePromptTokens;
+let estimateToolSchemaTokenPressure: typeof import("./preemptive-compaction.js").estimateToolSchemaTokenPressure;
 let estimateRenderedLlmBoundaryTokenPressure: typeof import("./preemptive-compaction.js").estimateRenderedLlmBoundaryTokenPressure;
 let formatPrePromptPrecheckLog: typeof import("./preemptive-compaction.js").formatPrePromptPrecheckLog;
 let shouldPreemptivelyCompactBeforePrompt: typeof import("./preemptive-compaction.js").shouldPreemptivelyCompactBeforePrompt;
 
 beforeAll(async () => {
+  // Import after the session-token mock is installed so token estimates match
+  // the runtime environment these helpers protect.
   vi.resetModules();
   ({
     PREEMPTIVE_OVERFLOW_ERROR_TEXT,
     estimateLlmBoundaryTokenPressure,
     buildPrePromptContextBudgetStatus,
-    estimatePrePromptTokens,
     estimateRenderedLlmBoundaryTokenPressure,
+    estimateToolSchemaTokenPressure,
     formatPrePromptPrecheckLog,
     shouldPreemptivelyCompactBeforePrompt,
   } = await import("./preemptive-compaction.js"));
@@ -30,6 +34,54 @@ function makeAssistantHistory(text: string): AgentMessage {
   return {
     role: "assistant",
     content: [{ type: "text", text }],
+    timestamp: timestamp++,
+  } as AgentMessage;
+}
+
+function makeProviderAssistant(params: {
+  promptTokens: number;
+  totalTokens: number;
+  text?: string;
+}): AgentMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: params.text ?? "provider answer" }],
+    usage: {
+      input: params.promptTokens,
+      output: params.totalTokens - params.promptTokens,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: params.totalTokens,
+      contextUsage: {
+        state: "available",
+        promptTokens: params.promptTokens,
+        totalTokens: params.totalTokens,
+      },
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: timestamp++,
+  } as AgentMessage;
+}
+
+function makeUnavailableAssistant(params: {
+  totalTokens: number;
+  legacyCli?: boolean;
+}): AgentMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: "usage unavailable" }],
+    api: params.legacyCli ? "cli" : "anthropic-messages",
+    usage: {
+      input: params.totalTokens,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: params.totalTokens,
+      ...(params.legacyCli ? {} : { contextUsage: { state: "unavailable" as const } }),
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
     timestamp: timestamp++,
   } as AgentMessage;
 }
@@ -46,6 +98,8 @@ function makeToolResultMessage(...texts: string[]): AgentMessage {
 }
 
 function makeJsonToolResultMessage(payload: unknown): AgentMessage {
+  // JSON tool results reach providers through rendered boundary payloads; this
+  // fixture proves estimates count object payloads, not just text blocks.
   return {
     role: "toolResult",
     toolCallId: `call_${timestamp}`,
@@ -85,12 +139,12 @@ describe("preemptive-compaction", () => {
   });
 
   it("raises the estimate as prompt-side content grows", () => {
-    const smaller = estimatePrePromptTokens({
+    const smaller = estimateLlmBoundaryTokenPressure({
       messages: [makeAssistantHistory(verboseHistory)],
       systemPrompt: "sys",
       prompt: "hello",
     });
-    const larger = estimatePrePromptTokens({
+    const larger = estimateLlmBoundaryTokenPressure({
       messages: [makeAssistantHistory(verboseHistory)],
       systemPrompt: verboseSystem,
       prompt: verbosePrompt,
@@ -125,6 +179,143 @@ describe("preemptive-compaction", () => {
     expect(result.shouldCompact).toBe(false);
     expect(result.route).toBe("fits");
     expect(result.estimatedPromptTokens).toBeLessThan(result.promptBudgetBeforeReserve);
+  });
+
+  it("uses exact provider context plus later transcript and current prompt pressure", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 240_000, totalTokens: 240_304 }),
+        { role: "user", content: "small tail", timestamp: timestamp++ } as AgentMessage,
+      ],
+      systemPrompt: "current system prompt",
+      prompt: "continue",
+      contextTokenBudget: 272_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("provider_context_usage");
+    expect(result.estimatedPromptTokens).toBeGreaterThan(240_304);
+    expect(result.estimatedPromptTokens).toBeLessThan(252_000);
+    expect(result.route).toBe("fits");
+  });
+
+  it("counts the current system prompt after a provider usage boundary", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 240_000, totalTokens: 240_304 }),
+        { role: "user", content: "small tail", timestamp: timestamp++ } as AgentMessage,
+      ],
+      systemPrompt: "new system instruction ".repeat(5_000),
+      prompt: "continue",
+      contextTokenBudget: 272_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("provider_context_usage");
+    expect(result.estimatedPromptTokens).toBeGreaterThan(result.promptBudgetBeforeReserve);
+    expect(result.route).toBe("compact_only");
+  });
+
+  it("uses the later assistant boundary when distinct responses have equal totals", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000, text: "first" }),
+        makeToolResultMessage("x".repeat(100_000)),
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000, text: "second" }),
+        { role: "user", content: "small tail", timestamp: timestamp++ } as AgentMessage,
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.estimatedPromptTokens).toBeGreaterThan(180_000);
+    expect(result.estimatedPromptTokens).toBeLessThan(190_000);
+    expect(result.route).toBe("fits");
+  });
+
+  it("still compacts when content after the provider boundary exceeds the budget", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000 }),
+        makeToolResultMessage("x".repeat(40_000)),
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.estimatedPromptTokens).toBeGreaterThan(190_000);
+    expect(result.route).not.toBe("fits");
+  });
+
+  it("falls back to full transcript pressure without available provider context", () => {
+    const unavailable = makeProviderAssistant({ promptTokens: 1, totalTokens: 2 });
+    if (unavailable.role === "assistant") {
+      unavailable.usage.contextUsage = { state: "unavailable" };
+    }
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        unavailable,
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("transcript_estimate");
+    expect(result.route).not.toBe("fits");
+  });
+
+  it("does not scan past a zero unavailable context marker", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000 }),
+        makeUnavailableAssistant({ totalTokens: 0 }),
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("transcript_estimate");
+    expect(result.route).toBe("compact_only");
+  });
+
+  it("treats legacy CLI usage without context provenance as a barrier", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000 }),
+        makeUnavailableAssistant({ totalTokens: 1_000, legacyCli: true }),
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("transcript_estimate");
+    expect(result.route).toBe("compact_only");
+  });
+
+  it("can reuse an older provider boundary past nonzero unavailable billing usage", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000 }),
+        makeUnavailableAssistant({ totalTokens: 927_907 }),
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("provider_context_usage");
+    expect(result.route).toBe("fits");
   });
 
   it("formats all-route pre-prompt diagnostics for a fits decision", () => {
@@ -222,6 +413,8 @@ describe("preemptive-compaction", () => {
   });
 
   it("uses rendered LLM-boundary pressure when the runtime owns the final payload shape", () => {
+    // Runtime renderers can add large provider-facing payloads after transcript
+    // assembly, so the precheck must prefer that boundary estimate when present.
     const renderedPrompt = "x".repeat(60_000);
     const estimatedPromptTokens = estimateRenderedLlmBoundaryTokenPressure({
       systemPrompt: "sys",
@@ -285,7 +478,7 @@ describe("preemptive-compaction", () => {
         })),
       }),
     ];
-    const estimatedPromptTokens = estimatePrePromptTokens({
+    const estimatedPromptTokens = estimateLlmBoundaryTokenPressure({
       messages,
       systemPrompt: "sys",
       prompt: "continue",
@@ -334,8 +527,8 @@ describe("preemptive-compaction", () => {
       reserveTokens: 20_000,
     });
 
-    expect(result.effectiveReserveTokens).toBe(8_000);
-    expect(result.promptBudgetBeforeReserve).toBe(8_000);
+    expect(result.effectiveReserveTokens).toBe(4_000);
+    expect(result.promptBudgetBeforeReserve).toBe(12_000);
     expect(result.shouldCompact).toBe(false);
     expect(result.route).toBe("fits");
   });
@@ -346,15 +539,17 @@ describe("preemptive-compaction", () => {
       systemPrompt: "sys",
       prompt: "hello",
       contextTokenBudget: 32_000,
-      reserveTokens: 20_000,
+      reserveTokens: 4_000,
     });
 
-    expect(result.effectiveReserveTokens).toBe(20_000);
-    expect(result.promptBudgetBeforeReserve).toBe(12_000);
+    expect(result.effectiveReserveTokens).toBe(4_000);
+    expect(result.promptBudgetBeforeReserve).toBe(28_000);
     expect(result.shouldCompact).toBe(false);
   });
 
   it("routes to direct tool-result truncation when recent tool tails can clearly absorb the overflow", () => {
+    // If reducible recent tool output covers the overflow, truncation is enough
+    // and a full transcript compaction would waste time/context.
     const medium = "alpha beta gamma delta epsilon ".repeat(2200);
     const messages: AgentMessage[] = [
       makeAssistantHistory("short history"),
@@ -362,7 +557,7 @@ describe("preemptive-compaction", () => {
     ];
     const reserveTokens = 2_000;
     const contextTokenBudget = 26_000;
-    const estimatedPromptTokens = estimatePrePromptTokens({
+    const estimatedPromptTokens = estimateLlmBoundaryTokenPressure({
       messages,
       systemPrompt: "sys",
       prompt: "hello",
@@ -385,7 +580,7 @@ describe("preemptive-compaction", () => {
   });
 
   it("routes to compact then truncate when recent tool tails help but cannot fully cover the overflow", () => {
-    const medium = "alpha beta gamma delta epsilon ".repeat(220);
+    const medium = "alpha beta gamma delta epsilon ".repeat(600);
     const longHistory = "old discussion with substantial retained context and decisions ".repeat(
       5000,
     );
@@ -418,16 +613,18 @@ describe("preemptive-compaction", () => {
       makeToolResultMessage(oversized),
       makeToolResultMessage(medium),
       makeToolResultMessage(medium),
+      makeToolResultMessage(medium),
+      makeToolResultMessage(medium),
     ];
     const reserveTokens = 2_000;
-    const estimatedPromptTokens = estimatePrePromptTokens({
+    const estimatedPromptTokens = estimateLlmBoundaryTokenPressure({
       messages,
       systemPrompt: "sys",
       prompt: "hello",
     });
     const potential = estimateToolResultReductionPotential({
       messages,
-      contextWindowTokens: 128_000,
+      contextWindowTokens: 20_000,
     });
     const desiredOverflowTokens = 2_000;
     const result = shouldPreemptivelyCompactBeforePrompt({
@@ -444,5 +641,249 @@ describe("preemptive-compaction", () => {
     expect(potential.maxReducibleChars).toBeGreaterThan(desiredOverflowTokens * 4);
     expect(result.route).toBe("truncate_tool_results_only");
     expect(result.shouldCompact).toBe(false);
+  });
+
+  it("estimates CJK tool results at roughly one token per character", () => {
+    const cjkText = "中".repeat(85_000);
+    const toolResultTokens = estimateLlmBoundaryTokenPressure({
+      messages: [makeToolResultMessage(cjkText)],
+      systemPrompt: "sys",
+      prompt: "continue",
+    });
+    const assistantTokens = estimateLlmBoundaryTokenPressure({
+      messages: [makeAssistantHistory(cjkText)],
+      systemPrompt: "sys",
+      prompt: "continue",
+    });
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [makeToolResultMessage(cjkText)],
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget: 128_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(toolResultTokens).toBeGreaterThanOrEqual(assistantTokens);
+    expect(toolResultTokens - assistantTokens).toBeLessThanOrEqual(5);
+    expect(result.estimatedPromptTokens).toBe(toolResultTokens);
+    expect(result.promptBudgetBeforeReserve).toBeGreaterThan(result.estimatedPromptTokens);
+    expect(result.route).toBe("fits");
+    expect(result.shouldCompact).toBe(false);
+    expect(result.overflowTokens).toBe(0);
+  });
+
+  it("avoids false overflow when CJK is less than half of a tool result", () => {
+    const mixedContent = "中".repeat(40_000) + "a".repeat(60_000);
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [makeToolResultMessage(mixedContent)],
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget: 100_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.estimatedPromptTokens).toBeLessThan(result.promptBudgetBeforeReserve);
+    expect(result.route).toBe("fits");
+    expect(result.shouldCompact).toBe(false);
+  });
+
+  it("keeps mixed-script estimates monotonic across the former CJK cutoff", () => {
+    const estimate = (cjkChars: number) =>
+      estimateLlmBoundaryTokenPressure({
+        messages: [makeToolResultMessage("中".repeat(cjkChars) + "a".repeat(10_000 - cjkChars))],
+        systemPrompt: "sys",
+        prompt: "continue",
+      });
+
+    const belowCutoff = estimate(4_999);
+    const atCutoff = estimate(5_000);
+    const aboveCutoff = estimate(5_001);
+
+    expect(atCutoff).toBeGreaterThanOrEqual(belowCutoff);
+    expect(aboveCutoff).toBeGreaterThanOrEqual(atCutoff);
+    expect(aboveCutoff - belowCutoff).toBeLessThanOrEqual(2);
+  });
+
+  it("keeps the conservative ratio for non-CJK tool results", () => {
+    const latinText = "alpha beta gamma delta epsilon ".repeat(1000);
+    const toolResultTokens = estimateLlmBoundaryTokenPressure({
+      messages: [makeToolResultMessage(latinText)],
+      systemPrompt: "sys",
+      prompt: "continue",
+    });
+    const assistantTokens = estimateLlmBoundaryTokenPressure({
+      messages: [makeAssistantHistory(latinText)],
+      systemPrompt: "sys",
+      prompt: "continue",
+    });
+
+    expect(toolResultTokens).toBeGreaterThan(assistantTokens * 1.5);
+    expect(toolResultTokens).toBeLessThan(assistantTokens * 2.5);
+  });
+
+  it("applies the CJK-aware ratio to JSON tool-result payloads", () => {
+    const cjkPayload = {
+      summary: "中文内容".repeat(5_000),
+      note: "更多中文文本".repeat(2_000),
+    };
+    const messages = [makeJsonToolResultMessage(cjkPayload)];
+
+    const estimatedPromptTokens = estimateLlmBoundaryTokenPressure({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+    });
+
+    expect(estimatedPromptTokens).toBeLessThan(90_000);
+
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget: 128_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.route).toBe("fits");
+    expect(result.shouldCompact).toBe(false);
+    expect(result.overflowTokens).toBe(0);
+  });
+
+  it("includes tool schema tokens in the precheck estimate so large catalogs trigger overflow", () => {
+    const messages = [makeAssistantHistory("short conversation text")];
+    const contextTokenBudget = 128_000;
+    const reserveTokens = 20_000;
+
+    const withoutTools = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget,
+      reserveTokens,
+    });
+
+    const toolSchemaTokens = estimateToolSchemaTokenPressure(
+      Array.from({ length: 79 }, (_, i) => ({
+        name: `tool_${i}`,
+        description: "x".repeat(4000),
+        parameters: { type: "object", properties: { arg: { type: "string" } } },
+      })),
+    );
+
+    expect(toolSchemaTokens).toBeGreaterThan(contextTokenBudget - reserveTokens);
+
+    const withTools = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget,
+      reserveTokens,
+      toolSchemaTokens,
+    });
+
+    expect(withoutTools.route).toBe("fits");
+    expect(withTools.route).not.toBe("fits");
+    expect(withTools.estimatedPromptTokens).toBeGreaterThan(withoutTools.estimatedPromptTokens);
+    expect(withTools.overflowTokens).toBeGreaterThan(0);
+  });
+
+  it("excludes runtime output schemas and metadata from tool pressure", () => {
+    const definition = {
+      name: "lookup",
+      description: "Look up a record.",
+      parameters: { type: "object", properties: { query: { type: "string" } } },
+    };
+    const runtimeTool = {
+      ...definition,
+      label: "Record lookup",
+      outputSchema: { type: "string", description: "result documentation ".repeat(4_000) },
+      executionMode: "parallel",
+      hideFromChannelProgress: true,
+      resultContentSource: "network",
+      execute: async () => ({ content: [], details: {} }),
+    };
+
+    expect(estimateToolSchemaTokenPressure([runtimeTool])).toBe(
+      estimateToolSchemaTokenPressure([definition]),
+    );
+  });
+
+  it("does not alter the estimate when toolSchemaTokens is zero or undefined", () => {
+    const messages = [makeAssistantHistory("short conversation text")];
+    const baseParams = {
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget: 128_000,
+      reserveTokens: 20_000,
+    };
+
+    const withoutToolSchema = shouldPreemptivelyCompactBeforePrompt(baseParams);
+    const withZeroToolSchema = shouldPreemptivelyCompactBeforePrompt({
+      ...baseParams,
+      toolSchemaTokens: 0,
+    });
+
+    expect(withZeroToolSchema.estimatedPromptTokens).toBe(withoutToolSchema.estimatedPromptTokens);
+    expect(withZeroToolSchema.route).toBe(withoutToolSchema.route);
+  });
+
+  it("does not double-count tool schema tokens when a provider boundary is available", () => {
+    // The provider boundary totalTokens already includes the tool schemas from
+    // its request. Adding toolSchemaTokens again would over-count an unchanged
+    // catalog. This test verifies the fix: when a provider boundary exists,
+    // toolSchemaTokens are not added on top of the boundary total.
+    const providerTotal = 100_000;
+    const messages = [
+      makeProviderAssistant({ promptTokens: 80_000, totalTokens: providerTotal }),
+      makeAssistantHistory("additional conversation after boundary"),
+    ];
+    const toolSchemaTokens = 40_000;
+    const contextTokenBudget = 150_000;
+    const reserveTokens = 20_000;
+
+    const withoutToolSchema = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget,
+      reserveTokens,
+    });
+
+    const withToolSchema = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget,
+      reserveTokens,
+      toolSchemaTokens,
+    });
+
+    // With a provider boundary, tool schema tokens must not inflate the estimate.
+    expect(withToolSchema.estimatedPromptTokens).toBe(withoutToolSchema.estimatedPromptTokens);
+    expect(withToolSchema.pressureSource).toBe("provider_context_usage");
+  });
+
+  it("does not throw when tool-result content cannot be serialized", () => {
+    const circular: Record<string, unknown> = { self: undefined };
+    circular.self = circular;
+    const message = {
+      role: "toolResult",
+      toolCallId: "call_circular",
+      toolName: "bad_tool",
+      content: circular,
+      isError: false,
+      timestamp: timestamp++,
+    } as unknown as AgentMessage;
+
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [message],
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget: 128_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(Number.isFinite(result.estimatedPromptTokens)).toBe(true);
   });
 });

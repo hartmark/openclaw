@@ -1,3 +1,4 @@
+/** Parses user-provided cron delivery fields into narrow runtime values. */
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import { z, type ZodType } from "zod";
 
@@ -8,6 +9,7 @@ const trimLowercaseStringPreprocess = (value: unknown) =>
 
 const DeliveryModeFieldSchema = z
   .preprocess(trimLowercaseStringPreprocess, z.enum(["deliver", "announce", "none", "webhook"]))
+  // "deliver" is the historical CLI spelling; runtime delivery uses announce.
   .transform((value) => (value === "deliver" ? "announce" : value));
 
 /** Accepts non-empty string fields after trimming and lowercasing user-provided delivery input. */
@@ -50,8 +52,8 @@ export function parseDeliveryInput(input: Record<string, unknown>): ParsedDelive
   };
 }
 
-/** Returns a parsed field value only when the supplied schema accepts it. */
+/** Parses present optional fields, returning undefined for missing or invalid values. */
 export function parseOptionalField<T>(schema: ZodType<T>, value: unknown): T | undefined {
-  const parsed = schema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
+  const parsed = value === undefined ? undefined : schema.safeParse(value);
+  return parsed?.success ? parsed.data : undefined;
 }

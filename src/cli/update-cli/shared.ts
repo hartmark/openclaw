@@ -1,32 +1,76 @@
-import { spawnSync } from "node:child_process";
+// Shared update command primitives for channel resolution, install roots, and subprocess steps.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
+import { resolveBrewOpenClawPath } from "../../infra/brew.js";
+import { hasErrnoCode } from "../../infra/errors.js";
 import { resolveRequiredHomeDir } from "../../infra/home-dir.js";
 import { resolveOpenClawPackageRoot } from "../../infra/openclaw-root.js";
 import { readPackageName, readPackageVersion } from "../../infra/package-json.js";
 import { normalizePackageTagInput } from "../../infra/package-tag.js";
-import { parseStrictPositiveInteger } from "../../infra/parse-finite-number.js";
-import { trimLogTail } from "../../infra/restart-sentinel.js";
 import { parseSemver } from "../../infra/runtime-guard.js";
 import { fetchNpmTagVersion } from "../../infra/update-check.js";
+import {
+  normalizeUpdateFailureFacts,
+  type UpdateFailureFact,
+} from "../../infra/update-failure-facts.js";
+import {
+  createFreeBsdPkgOwnershipInspection,
+  type FreeBsdPkgOwnershipInspection,
+} from "../../infra/update-freebsd-pkg-ownership.js";
 import {
   canResolveRegistryVersionForPackageTarget,
   createGlobalInstallEnv,
   detectGlobalInstallManagerByPresence,
   detectGlobalInstallManagerForRoot,
-  type CommandRunner,
   type GlobalInstallManager,
 } from "../../infra/update-global.js";
-import type { UpdateStepProgress, UpdateStepResult } from "../../infra/update-runner.js";
+import { createUpdatePreflightFailure } from "../../infra/update-preflight-details.js";
+import type { UpdateRequesterAuthority } from "../../infra/update-requester-authority.js";
+import type { UpdateRecoveryFence } from "../../infra/update-run-recovery.js";
+import { runStep } from "../../infra/update-runner-command.js";
+import {
+  describeUpdateInstallRoot,
+  resolveUnmanagedUpdateInstallReason,
+} from "../../infra/update-runner-install-surface.js";
+import type {
+  UpdateRunResult,
+  UpdateStepProgress,
+  UpdateStepResult,
+} from "../../infra/update-runner.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
 import { defaultRuntime } from "../../runtime.js";
+import type { UpdateRecoveryStep } from "../../shared/update-outcome.js";
+import { UPDATE_INSTALL_SKIP_GUIDANCE } from "../../shared/update-outcome.js";
 import { pathExists } from "../../utils.js";
 import { COMPLETION_SKIP_PLUGIN_COMMANDS_ENV } from "../completion-runtime.js";
+import { isJsonOutputModeActive } from "../json-output-mode.js";
+import { resolveNodeRunner } from "./node-runner.js";
+
+export { resolveNodeRunner } from "./node-runner.js";
 
 export type UpdateCommandOptions = {
+  /** Doctor's accepted source update targets dev without changing the saved channel. */
+  sourceUpdate?: { root: string };
+  /** In-process reporting only, after the update owner settles. Never serialized. */
+  onResult?: (result: UpdateRunResult) => void;
+  /** Legacy live context is unsupported; its presence is refusal-only. */
+  recovery?: unknown;
+  reapplyLocalOverrides?: boolean;
+  /** Internal orchestration context, shared across update phases and child processes. */
+  run?: {
+    runId: string;
+    defaultStepTimeoutMs?: number;
+    activationTimeoutMs?: number;
+    env: NodeJS.ProcessEnv;
+    /** Prepared before replacement; never load the old authority graph after activation. */
+    requesterAuthority?: UpdateRequesterAuthority;
+    /** Live local executor only. A child must independently acquire its owner. */
+    executorFence?: UpdateRecoveryFence;
+  };
+  acceptCapabilities?: boolean;
   json?: boolean;
   restart?: boolean;
   dryRun?: boolean;
@@ -42,40 +86,81 @@ export type UpdateStatusOptions = {
 };
 
 export type UpdateFinalizeOptions = {
+  acceptCapabilities?: boolean;
   json?: boolean;
   channel?: string;
   timeout?: string;
   yes?: boolean;
   restart?: boolean;
+  /** Internal external-supervisor handshake; public repair always leaves this false. */
+  deferCompletionCache?: boolean;
 };
 
 export type UpdateWizardOptions = {
+  acceptCapabilities?: boolean;
   timeout?: string;
 };
+
+export class UpdatePreMutationError extends Error {
+  readonly recoverySteps?: readonly UpdateRecoveryStep[];
+  readonly failureFacts: UpdateFailureFact[];
+
+  constructor(
+    readonly reason: string,
+    message: string,
+    options?: ErrorOptions & {
+      failureFacts?: readonly UpdateFailureFact[];
+      recoverySteps?: readonly UpdateRecoveryStep[];
+    },
+  ) {
+    super(message, options);
+    this.name = "UpdatePreMutationError";
+    this.recoverySteps = options?.recoverySteps;
+    this.failureFacts = normalizeUpdateFailureFacts(
+      options?.failureFacts ?? [{ check: reason, code: reason, message }],
+    );
+  }
+}
 
 const INVALID_TIMEOUT_ERROR = "--timeout must be a positive integer (seconds)";
 const MAX_SAFE_TIMEOUT_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
 
-export function parseTimeoutMsOrExit(timeout?: string): number | undefined | null {
+/** Parse the shared timeout contract without exiting an owning operation. */
+export function parseUpdateTimeoutMs(timeout?: string): number | undefined {
   if (timeout === undefined) {
     return undefined;
   }
   const trimmed = timeout.trim();
   const seconds = parseStrictPositiveInteger(trimmed);
   if (seconds === undefined || seconds > MAX_SAFE_TIMEOUT_SECONDS) {
-    defaultRuntime.error(INVALID_TIMEOUT_ERROR);
-    defaultRuntime.exit(1);
-    return null;
+    throw new Error(INVALID_TIMEOUT_ERROR);
   }
   return seconds * 1000;
 }
 
-const OPENCLAW_REPO_URL = "https://github.com/openclaw/openclaw.git";
-const MAX_LOG_CHARS = 8000;
+/** Parse a CLI timeout in seconds, exiting through the runtime on invalid input. */
+export function parseTimeoutMsOrExit(timeout?: string): number | undefined | null {
+  try {
+    return parseUpdateTimeoutMs(timeout);
+  } catch (error) {
+    if (isJsonOutputModeActive(process.argv)) {
+      throw error;
+    }
+    defaultRuntime.error(INVALID_TIMEOUT_ERROR);
+    defaultRuntime.exit(1);
+    return null;
+  }
+}
+
+const UPSTREAM_REPOSITORY_URL = "https://github.com/openclaw/openclaw.git";
+// Keep the full commit graph for dev ref switching while deferring historical blobs.
+// A shallow clone would make older or non-default dev targets unreachable.
+const GIT_CLONE_BLOB_FILTER = "--filter=blob:none";
 
 export const DEFAULT_PACKAGE_NAME = "openclaw";
 const CORE_PACKAGE_NAMES = new Set([DEFAULT_PACKAGE_NAME]);
 
+/** Normalize a CLI tag/version/spec into the npm target form accepted by update flows. */
 export function normalizeTag(value?: string | null): string | null {
   return normalizePackageTagInput(value, ["openclaw", DEFAULT_PACKAGE_NAME]);
 }
@@ -91,9 +176,11 @@ function normalizeVersionTag(tag: string): string | null {
 
 export { readPackageName, readPackageVersion };
 
+/** Resolve an npm dist-tag or explicit version into a concrete package version. */
 export async function resolveTargetVersion(
   tag: string,
   timeoutMs?: number,
+  options: { spec?: string; command?: string; cwd?: string; env?: NodeJS.ProcessEnv } = {},
 ): Promise<string | null> {
   if (!canResolveRegistryVersionForPackageTarget(tag)) {
     return null;
@@ -102,10 +189,18 @@ export async function resolveTargetVersion(
   if (direct) {
     return direct;
   }
-  const res = await fetchNpmTagVersion({ tag, timeoutMs });
+  const res = await fetchNpmTagVersion({
+    tag,
+    timeoutMs,
+    spec: options.spec,
+    command: options.command,
+    cwd: options.cwd,
+    env: options.env,
+  });
   return res.version ?? null;
 }
 
+/** Return true when `root` is a local git checkout directory. */
 export async function isGitCheckout(root: string): Promise<boolean> {
   try {
     await fs.stat(path.join(root, ".git"));
@@ -120,6 +215,7 @@ async function isCorePackage(root: string): Promise<boolean> {
   return Boolean(name && CORE_PACKAGE_NAMES.has(name));
 }
 
+/** Return true only for existing directories with no entries. */
 export async function isEmptyDir(targetPath: string): Promise<boolean> {
   try {
     const entries = await fs.readdir(targetPath);
@@ -129,6 +225,7 @@ export async function isEmptyDir(targetPath: string): Promise<boolean> {
   }
 }
 
+/** Resolve the checkout path used by source-based self-update. */
 export function resolveGitInstallDir(): string {
   const override = process.env.OPENCLAW_GIT_DIR?.trim();
   if (override) {
@@ -145,24 +242,29 @@ function resolveDefaultGitDir(): string {
   return path.join(home, "openclaw");
 }
 
-export function resolveNodeRunner(): string {
-  const base = normalizeLowercaseStringOrEmpty(path.basename(process.execPath));
-  if (base === "node" || base === "node.exe") {
-    return process.execPath;
+export function tryResolveInvocationCwd(): string | undefined {
+  try {
+    return process.cwd();
+  } catch {
+    return undefined;
   }
-  return "node";
 }
 
+/** Locate the installed OpenClaw package root that should receive update operations. */
 export async function resolveUpdateRoot(): Promise<string> {
+  // Preserve the lexical package path from the invoking shim. pnpm 11 package
+  // modules realpath into a shared store, which is not the install owner.
+  const invocationRoot = process.argv[1]
+    ? await resolveOpenClawPackageRoot({ cwd: path.dirname(path.resolve(process.argv[1])) })
+    : null;
   return (
-    (await resolveOpenClawPackageRoot({
-      moduleUrl: import.meta.url,
-      argv1: process.argv[1],
-      cwd: process.cwd(),
-    })) ?? process.cwd()
+    invocationRoot ??
+    (await resolveOpenClawPackageRoot({ moduleUrl: import.meta.url, cwd: process.cwd() })) ??
+    process.cwd()
   );
 }
 
+/** Run one update subprocess and report bounded stdout/stderr tails to progress listeners. */
 export async function runUpdateStep(params: {
   name: string;
   argv: string[];
@@ -170,108 +272,252 @@ export async function runUpdateStep(params: {
   timeoutMs: number;
   progress?: UpdateStepProgress;
   env?: NodeJS.ProcessEnv;
+  runCommand?: Parameters<typeof runStep>[0]["runCommand"];
 }): Promise<UpdateStepResult> {
-  const command = params.argv.join(" ");
-  params.progress?.onStepStart?.({
-    name: params.name,
-    command,
-    index: 0,
-    total: 0,
-  });
-
-  const started = Date.now();
-  const res = await runCommandWithTimeout(params.argv, {
-    cwd: params.cwd,
-    env: params.env,
-    timeoutMs: params.timeoutMs,
-  });
-  const durationMs = Date.now() - started;
-  const stderrTail = trimLogTail(res.stderr, MAX_LOG_CHARS);
-
-  params.progress?.onStepComplete?.({
-    name: params.name,
-    command,
-    index: 0,
-    total: 0,
-    durationMs,
-    exitCode: res.code,
-    stderrTail,
-  });
-
-  return {
-    name: params.name,
-    command,
+  return await runStep({
+    ...params,
     cwd: params.cwd ?? process.cwd(),
-    durationMs,
-    exitCode: res.code,
-    stdoutTail: trimLogTail(res.stdout, MAX_LOG_CHARS),
-    stderrTail,
-  };
+    runCommand: params.runCommand ?? runCommandWithTimeout,
+    stepIndex: 0,
+    totalSteps: 0,
+  });
 }
 
+type GitCheckoutResult = {
+  checkoutDir: string;
+  step: UpdateStepResult | null;
+};
+
+type StagedGitCheckout = (
+  root: string,
+  publish: () => Promise<string>,
+  targetRoot: string,
+) => Promise<void>;
+
+async function cloneGitCheckoutTransactionally(params: {
+  dir: string;
+  timeoutMs: number;
+  progress?: UpdateStepProgress;
+  env?: NodeJS.ProcessEnv;
+  useStagedCheckout?: StagedGitCheckout;
+}): Promise<GitCheckoutResult> {
+  const parentDir = path.dirname(params.dir);
+  await fs.mkdir(parentDir, { recursive: true });
+  const canonicalParentDir = await fs.realpath(parentDir);
+  const preserveDir = (await pathExists(params.dir)) && (await isEmptyDir(params.dir));
+  const targetDir = preserveDir
+    ? await fs.realpath(params.dir)
+    : path.join(canonicalParentDir, path.basename(params.dir));
+  const targetIdentity = preserveDir ? await fs.lstat(targetDir, { bigint: true }) : undefined;
+  const stagingParent = preserveDir ? targetDir : canonicalParentDir;
+  const stagingDir = await fs.mkdtemp(path.join(stagingParent, ".openclaw-clone-"));
+  const stagingIdentity = await fs.lstat(stagingDir, { bigint: true });
+  let cleanupStaging = true;
+
+  async function ownsDirectory(directory: string, identity: typeof stagingIdentity) {
+    try {
+      const current = await fs.lstat(directory, { bigint: true });
+      // Unknown Windows identities cannot authorize publication or recursive cleanup.
+      return (
+        current.isDirectory() &&
+        current.ino !== 0n &&
+        (process.platform !== "win32" || current.dev !== 0n) &&
+        current.ino === identity.ino &&
+        current.dev === identity.dev
+      );
+    } catch (error) {
+      if (hasErrnoCode(error, "ENOENT")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  try {
+    const result = await runUpdateStep({
+      name: "git clone",
+      argv: ["git", "clone", GIT_CLONE_BLOB_FILTER, UPSTREAM_REPOSITORY_URL, stagingDir],
+      env: params.env,
+      timeoutMs: params.timeoutMs,
+      progress: params.progress,
+    });
+    if (result.exitCode !== 0) {
+      return { checkoutDir: targetDir, step: result };
+    }
+
+    const publish = async (): Promise<string> => {
+      if (
+        !(await ownsDirectory(stagingDir, stagingIdentity)) ||
+        (targetIdentity && !(await ownsDirectory(targetDir, targetIdentity)))
+      ) {
+        throw new Error(
+          `The clone destination or staging directory changed before publication: ${targetDir}. The replacement was left unchanged; choose an empty OPENCLAW_GIT_DIR and retry.`,
+        );
+      }
+      if (!preserveDir) {
+        try {
+          await fs.lstat(targetDir);
+        } catch (error) {
+          if (!hasErrnoCode(error, "ENOENT")) {
+            throw error;
+          }
+          await fs.rename(stagingDir, targetDir);
+          return targetDir;
+        }
+      }
+
+      if (!preserveDir) {
+        throw new Error(
+          `OPENCLAW_GIT_DIR appeared while cloning: ${params.dir}. The existing path was left unchanged; move it or choose another OPENCLAW_GIT_DIR, then retry.`,
+        );
+      }
+
+      const expectedEntries = preserveDir ? [path.basename(stagingDir)] : [];
+      const destinationEntries = await fs.readdir(targetDir);
+      if (destinationEntries.toSorted().join("\0") !== expectedEntries.toSorted().join("\0")) {
+        throw new Error(
+          `OPENCLAW_GIT_DIR appeared while cloning: ${params.dir}. The existing path was left unchanged; move it or choose another OPENCLAW_GIT_DIR, then retry.`,
+        );
+      }
+
+      const entries = (await fs.readdir(stagingDir)).toSorted((a, b) =>
+        a === ".git" ? 1 : b === ".git" ? -1 : 0,
+      );
+      const moved: string[] = [];
+      let publishError: { value: unknown } | undefined;
+      try {
+        for (const entry of entries) {
+          await fs.rename(path.join(stagingDir, entry), path.join(targetDir, entry));
+          moved.push(entry);
+        }
+      } catch (error) {
+        publishError = { value: error };
+      }
+      if (publishError) {
+        const rollbackErrors: unknown[] = [];
+        for (const entry of moved.toReversed()) {
+          try {
+            await fs.rename(path.join(targetDir, entry), path.join(stagingDir, entry));
+          } catch (rollbackError) {
+            rollbackErrors.push(rollbackError);
+          }
+        }
+        if (rollbackErrors.length > 0) {
+          cleanupStaging = false;
+          throw new AggregateError(
+            [publishError.value, ...rollbackErrors],
+            `Could not publish or fully roll back the cloned checkout at ${targetDir}; recovery files remain at ${stagingDir}`,
+          );
+        }
+        throw publishError.value;
+      }
+      return targetDir;
+    };
+    if (params.useStagedCheckout) {
+      await params.useStagedCheckout(stagingDir, publish, targetDir);
+    } else {
+      await publish();
+    }
+    return { checkoutDir: targetDir, step: result };
+  } finally {
+    if (cleanupStaging && (await ownsDirectory(stagingDir, stagingIdentity))) {
+      await fs.rm(stagingDir, { recursive: true, force: true });
+    }
+  }
+}
+
+/** Ensure the configured source-update directory exists and points at an OpenClaw checkout. */
 export async function ensureGitCheckout(params: {
   dir: string;
   timeoutMs: number;
   progress?: UpdateStepProgress;
   env?: NodeJS.ProcessEnv;
-}): Promise<UpdateStepResult | null> {
+  useStagedCheckout?: StagedGitCheckout;
+}): Promise<GitCheckoutResult> {
   const gitEnv = params.env ?? (await createGlobalInstallEnv());
   const dirExists = await pathExists(params.dir);
   if (!dirExists) {
-    await fs.mkdir(path.dirname(params.dir), { recursive: true });
-    return await runUpdateStep({
-      name: "git clone",
-      argv: ["git", "clone", OPENCLAW_REPO_URL, params.dir],
+    return await cloneGitCheckoutTransactionally({
+      dir: params.dir,
       env: gitEnv,
       timeoutMs: params.timeoutMs,
       progress: params.progress,
+      useStagedCheckout: params.useStagedCheckout,
     });
   }
 
   if (!(await isGitCheckout(params.dir))) {
     const empty = await isEmptyDir(params.dir);
     if (!empty) {
-      throw new Error(
+      throw new UpdatePreMutationError(
+        "invalid-git-directory",
         `OPENCLAW_GIT_DIR points at a non-git directory: ${params.dir}. Set OPENCLAW_GIT_DIR to an empty folder or an openclaw checkout.`,
       );
     }
 
-    return await runUpdateStep({
-      name: "git clone",
-      argv: ["git", "clone", OPENCLAW_REPO_URL, params.dir],
-      cwd: params.dir,
+    return await cloneGitCheckoutTransactionally({
+      dir: params.dir,
       env: gitEnv,
       timeoutMs: params.timeoutMs,
       progress: params.progress,
+      useStagedCheckout: params.useStagedCheckout,
     });
   }
 
   if (!(await isCorePackage(params.dir))) {
-    throw new Error(`OPENCLAW_GIT_DIR does not look like a core checkout: ${params.dir}.`);
+    throw new UpdatePreMutationError(
+      "invalid-git-directory",
+      `OPENCLAW_GIT_DIR does not look like a core checkout: ${params.dir}.`,
+    );
   }
 
-  return null;
+  return { checkoutDir: await fs.realpath(params.dir), step: null };
 }
 
+/** Detect the package manager that owns a global/package OpenClaw install. */
 export async function resolveGlobalManager(params: {
   root: string;
   installKind: "git" | "package" | "unknown";
   timeoutMs: number;
+  pkgOwnership?: FreeBsdPkgOwnershipInspection;
+  serviceUnitTarget?: string;
 }): Promise<GlobalInstallManager> {
-  const runCommand = createGlobalCommandRunner();
-
-  if (params.installKind === "package") {
+  await (
+    params.pkgOwnership ?? createFreeBsdPkgOwnershipInspection(params.timeoutMs)
+  ).assertUnowned(params.root);
+  if (params.installKind !== "git") {
+    if (await resolveBrewOpenClawPath(params.root)) {
+      const reason = resolveUnmanagedUpdateInstallReason();
+      throw new UpdatePreMutationError(
+        reason,
+        "This OpenClaw installation is managed by Homebrew. To update OpenClaw, run:\n\n  brew upgrade openclaw-cli\n\nThen restart the gateway:\n\n  openclaw gateway restart",
+        { failureFacts: [] },
+      );
+    }
+    const diagnostics: string[] = [];
     const detected = await detectGlobalInstallManagerForRoot(
-      runCommand,
+      runCommandWithTimeout,
       params.root,
       params.timeoutMs,
+      diagnostics,
     );
-    if (detected) {
-      return detected;
+    if (!detected) {
+      const reason = resolveUnmanagedUpdateInstallReason();
+      const failure = createUpdatePreflightFailure(
+        "installation-unclassified",
+        `${await describeUpdateInstallRoot(params.root)} Service unit target: ${params.serviceUnitTarget ?? "not inspected"}. Inspected package-manager owners: ${diagnostics.join("; ")}. ${UPDATE_INSTALL_SKIP_GUIDANCE[reason]}`,
+      );
+      throw new UpdatePreMutationError(reason, failure.message, {
+        failureFacts: failure.failureFacts,
+      });
     }
+    return detected;
   }
 
-  const byPresence = await detectGlobalInstallManagerByPresence(runCommand, params.timeoutMs);
+  const byPresence = await detectGlobalInstallManagerByPresence(
+    runCommandWithTimeout,
+    params.timeoutMs,
+  );
   return byPresence ?? "npm";
 }
 
@@ -279,52 +525,101 @@ const COMPLETION_CACHE_WRITE_TIMEOUT_MS = 30_000;
 const COMPLETION_CACHE_MANUAL_REFRESH_HINT =
   "Shell tab-completion may be stale; refresh manually with: openclaw completion --write-state";
 
-export async function tryWriteCompletionCache(root: string, jsonMode: boolean): Promise<void> {
+/** Best-effort refresh of shell completion state after a successful update. */
+export async function tryWriteCompletionCache(
+  root: string,
+  jsonMode: boolean,
+  timeoutMs = COMPLETION_CACHE_WRITE_TIMEOUT_MS,
+): Promise<"completed" | "failed" | "skipped"> {
   const binPath = path.join(root, "openclaw.mjs");
   if (!(await pathExists(binPath))) {
-    return;
+    return "skipped";
   }
 
-  const result = spawnSync(resolveNodeRunner(), [binPath, "completion", "--write-state"], {
-    cwd: root,
-    env: {
-      ...process.env,
-      [COMPLETION_SKIP_PLUGIN_COMMANDS_ENV]: "1",
-    },
-    encoding: "utf-8",
-    timeout: COMPLETION_CACHE_WRITE_TIMEOUT_MS,
-  });
-
-  if (result.error) {
-    if (!jsonMode) {
-      const err = result.error as NodeJS.ErrnoException;
-      const reason =
-        err.code === "ETIMEDOUT"
-          ? `timed out after ${COMPLETION_CACHE_WRITE_TIMEOUT_MS / 1000}s`
-          : String(result.error);
-      defaultRuntime.log(
-        theme.warn(
-          `Completion cache update failed: ${reason}. ${COMPLETION_CACHE_MANUAL_REFRESH_HINT}`,
-        ),
-      );
+  let failure: string;
+  try {
+    const result = await runCommandWithTimeout(
+      [resolveNodeRunner(), binPath, "completion", "--write-state"],
+      {
+        cwd: root,
+        env: { ...process.env, [COMPLETION_SKIP_PLUGIN_COMMANDS_ENV]: "1" },
+        input: "",
+        timeoutMs,
+        killProcessTree: true,
+      },
+    );
+    if (result.code === 0) {
+      return "completed";
     }
-    return;
+    failure =
+      result.termination === "timeout"
+        ? `timed out after ${timeoutMs / 1000}s`
+        : result.stderr.trim();
+  } catch (error) {
+    failure = String(error);
   }
-
-  if (result.status !== 0 && !jsonMode) {
-    const stderr = (result.stderr ?? "").trim();
-    const detail = stderr ? ` (${stderr})` : "";
+  if (!jsonMode) {
     defaultRuntime.log(
       theme.warn(
-        `Completion cache update failed${detail}. ${COMPLETION_CACHE_MANUAL_REFRESH_HINT}`,
+        `Completion cache update failed${failure ? `: ${failure}` : ""}. ${COMPLETION_CACHE_MANUAL_REFRESH_HINT}`,
       ),
     );
   }
+  return "failed";
 }
 
-export function createGlobalCommandRunner(): CommandRunner {
-  return async (argv, options) => {
-    const res = await runCommandWithTimeout(argv, options);
-    return { stdout: res.stdout, stderr: res.stderr, code: res.code };
-  };
+export async function requestUpdateDowngradeConfirmation(params: {
+  json: boolean;
+  currentVersion: string | null;
+  targetVersion: string | null;
+  tag: string;
+}): Promise<"confirmed" | "cancelled" | "confirmation-required"> {
+  if (!process.stdin.isTTY || params.json) {
+    return "confirmation-required";
+  }
+  const { confirm, isCancel } = await import("@clack/prompts");
+  const { stylePromptMessage } =
+    await import("../../../packages/terminal-core/src/prompt-style.js");
+  const targetLabel = params.targetVersion ?? `${params.tag} (unknown)`;
+  const message = `Downgrading from ${params.currentVersion} to ${targetLabel} can break configuration. Continue?`;
+  const ok = await confirm({ message: stylePromptMessage(message), initialValue: false });
+  return isCancel(ok) || !ok ? "cancelled" : "confirmed";
+}
+
+export async function confirmUpdateDowngrade(params: {
+  opts: UpdateCommandOptions;
+  currentVersion: string | null;
+  targetVersion: string | null;
+  tag: string;
+}): Promise<boolean> {
+  const { finishUpdateRun } = await import("../../infra/update-run-ledger.js");
+  const { opts, currentVersion, targetVersion, tag } = params;
+  const decision = await requestUpdateDowngradeConfirmation({
+    json: Boolean(opts.json),
+    currentVersion,
+    targetVersion,
+    tag,
+  });
+  const run = opts.run!;
+  if (decision === "confirmation-required") {
+    finishUpdateRun(
+      run.runId,
+      { status: "skipped", reason: "downgrade-confirmation-required" },
+      { env: run.env },
+    );
+    defaultRuntime.error(
+      "Downgrade confirmation required.\nDowngrading can break configuration. Re-run in a TTY to confirm.",
+    );
+    defaultRuntime.exit(1);
+    return false;
+  }
+  if (decision === "cancelled") {
+    finishUpdateRun(run.runId, { status: "skipped", reason: "cancelled" }, { env: run.env });
+    if (!opts.json) {
+      defaultRuntime.log(theme.muted("Update cancelled."));
+    }
+    defaultRuntime.exit(0);
+    return false;
+  }
+  return true;
 }

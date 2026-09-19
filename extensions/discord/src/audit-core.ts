@@ -6,6 +6,7 @@ import type {
 } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { isRecord, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isDiscordThreadChannelType } from "./channel-type.js";
 
 type DiscordChannelPermissionsAuditEntry = {
   channelId: string;
@@ -25,6 +26,7 @@ export type DiscordChannelPermissionsAudit = {
 };
 
 const REQUIRED_TEXT_CHANNEL_PERMISSIONS = ["ViewChannel", "SendMessages"] as const;
+const REQUIRED_THREAD_CHANNEL_PERMISSIONS = ["ViewChannel", "SendMessagesInThreads"] as const;
 const REQUIRED_VOICE_CHANNEL_PERMISSIONS = [
   "ViewChannel",
   "Connect",
@@ -34,6 +36,9 @@ const REQUIRED_VOICE_CHANNEL_PERMISSIONS = [
 ] as const;
 
 export function resolveRequiredDiscordChannelPermissions(channelType?: number): string[] {
+  if (isDiscordThreadChannelType(channelType)) {
+    return [...REQUIRED_THREAD_CHANNEL_PERMISSIONS];
+  }
   if (channelType === ChannelType.GuildVoice || channelType === ChannelType.GuildStageVoice) {
     return [...REQUIRED_VOICE_CHANNEL_PERMISSIONS];
   }
@@ -82,7 +87,7 @@ function listConfiguredGuildChannelKeys(
   return [...ids].toSorted((a, b) => a.localeCompare(b));
 }
 
-export function collectDiscordAuditChannelIdsForGuilds(
+function collectDiscordAuditChannelIdsForGuilds(
   guilds: Record<string, DiscordGuildEntry> | undefined,
 ) {
   const keys = listConfiguredGuildChannelKeys(guilds);

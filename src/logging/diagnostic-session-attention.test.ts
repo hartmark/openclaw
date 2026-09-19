@@ -1,7 +1,37 @@
+// Diagnostic session attention tests cover active work summaries for sessions.
 import { describe, expect, it } from "vitest";
 import { classifySessionAttention } from "./diagnostic-session-attention.js";
 
 describe("classifySessionAttention", () => {
+  it.each([false, true])(
+    "classifies provider retry waiting until its deadline (expired=%s)",
+    (expired) => {
+      const classification = classifySessionAttention({
+        state: "processing",
+        queueDepth: 1,
+        activity: {
+          activeWorkKind: "embedded_run",
+          hasActiveEmbeddedRun: true,
+          lastProgressAgeMs: 660_000,
+          activeRetryWaitDeadlineAtMs: Date.now() + (expired ? -1000 : 60_000),
+        },
+        staleMs: 120_000,
+        stuckSessionAbortMs: 360_000,
+      });
+      expect(classification).toMatchObject(
+        expired
+          ? {
+              eventType: "session.stalled",
+              reason: "active_work_without_progress",
+            }
+          : {
+              eventType: "session.long_running",
+              reason: "provider_retry_wait",
+              recoveryEligible: false,
+            },
+      );
+    },
+  );
   it.each([
     {
       name: "stale state without queued work",
@@ -72,11 +102,28 @@ describe("classifySessionAttention", () => {
       },
     },
     {
-      name: "active work without progress",
+      name: "active model call without progress before abort threshold",
       queueDepth: 0,
       activity: {
         activeWorkKind: "model_call" as const,
+        hasActiveEmbeddedRun: true,
         lastProgressAgeMs: 31_000,
+      },
+      expected: {
+        eventType: "session.long_running",
+        reason: "active_model_call_without_progress",
+        classification: "long_running",
+        activeWorkKind: "model_call",
+        recoveryEligible: false,
+      },
+    },
+    {
+      name: "active model call without progress after abort threshold",
+      queueDepth: 0,
+      activity: {
+        activeWorkKind: "model_call" as const,
+        hasActiveEmbeddedRun: true,
+        lastProgressAgeMs: 60_000,
       },
       expected: {
         eventType: "session.stalled",
@@ -161,6 +208,7 @@ describe("classifySessionAttention", () => {
         queueDepth,
         activity,
         staleMs: 30_000,
+        stuckSessionAbortMs: 60_000,
       }),
     ).toEqual(expected);
   });

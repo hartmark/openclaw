@@ -1,26 +1,30 @@
-import { agentCommandFromIngress } from "openclaw/plugin-sdk/agent-runtime";
+import { randomUUID } from "node:crypto";
 import type { DiscordAccountConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveRealtimeBootstrapContextInstructions } from "openclaw/plugin-sdk/realtime-bootstrap-context";
+import type { RealtimeVoiceSelectionHandle } from "openclaw/plugin-sdk/realtime-voice";
 import { createSubsystemLogger, type RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { formatMention } from "../mentions.js";
 import { normalizeDiscordSlug } from "../monitor/allow-list.js";
 import { buildDiscordGroupSystemPrompt } from "../monitor/inbound-context.js";
+import type { DiscordLivePolicyReader } from "../monitor/live-policy.js";
+import { getDiscordRuntime } from "../runtime.js";
 import { authorizeDiscordVoiceIngress } from "./access.js";
 import type { VoiceSessionEntry } from "./session.js";
 import type { DiscordVoiceSpeakerContextResolver } from "./speaker-context.js";
 
-export const DISCORD_VOICE_MESSAGE_PROVIDER = "discord-voice";
+const DISCORD_VOICE_MESSAGE_PROVIDER = "discord-voice";
 
 const logger = createSubsystemLogger("discord/voice");
 
 export type DiscordVoiceIngressContext = {
   extraSystemPrompt?: string;
+  isCurrent?: () => boolean;
   senderIsOwner: boolean;
   speakerLabel: string;
 };
 
-export type DiscordVoiceAgentTurnResult = {
+type DiscordVoiceAgentTurnResult = {
   context: DiscordVoiceIngressContext;
   text: string;
 };
@@ -62,11 +66,12 @@ function summarizeAgentTurnPayloads(payloads: readonly unknown[]): string {
 }
 
 export async function resolveDiscordVoiceIngressContext(params: {
+  readPolicy?: DiscordLivePolicyReader;
   entry: VoiceSessionEntry;
   userId: string;
   cfg: OpenClawConfig;
   discordConfig: DiscordAccountConfig;
-  ownerAllowFrom?: string[];
+  admissionAllowFrom?: string[];
   fetchGuildName: (guildId: string) => Promise<string | undefined>;
   speakerContext: DiscordVoiceSpeakerContextResolver;
 }): Promise<DiscordVoiceIngressContext | null> {
@@ -77,6 +82,7 @@ export async function resolveDiscordVoiceIngressContext(params: {
   const speaker = await params.speakerContext.resolveContext(entry.guildId, userId);
   const speakerIdentity = await params.speakerContext.resolveIdentity(entry.guildId, userId);
   const access = await authorizeDiscordVoiceIngress({
+    readPolicy: params.readPolicy,
     cfg: params.cfg,
     discordConfig: params.discordConfig,
     guildName: entry.guildName,
@@ -86,7 +92,7 @@ export async function resolveDiscordVoiceIngressContext(params: {
     channelSlug: entry.channelName ? normalizeDiscordSlug(entry.channelName) : "",
     channelLabel: formatMention({ channelId: entry.channelId }),
     memberRoleIds: speakerIdentity.memberRoleIds,
-    ownerAllowFrom: params.ownerAllowFrom,
+    admissionAllowFrom: params.admissionAllowFrom,
     sender: {
       id: speakerIdentity.id,
       name: speakerIdentity.name,
@@ -98,13 +104,16 @@ export async function resolveDiscordVoiceIngressContext(params: {
   }
   return {
     extraSystemPrompt: buildDiscordGroupSystemPrompt(access.channelConfig),
+    isCurrent: access.isCurrent,
     senderIsOwner: speaker.senderIsOwner,
     speakerLabel: speaker.label,
   };
 }
 
 export async function runDiscordVoiceAgentTurn(params: {
+  readPolicy?: DiscordLivePolicyReader;
   entry: VoiceSessionEntry;
+  accountId: string;
   userId: string;
   message: string;
   cfg: OpenClawConfig;
@@ -112,40 +121,75 @@ export async function runDiscordVoiceAgentTurn(params: {
   runtime: RuntimeEnv;
   context?: DiscordVoiceIngressContext;
   toolsAllow?: string[];
-  ownerAllowFrom?: string[];
+  voiceSelection?: RealtimeVoiceSelectionHandle;
+  signal?: AbortSignal;
+  admissionAllowFrom?: string[];
   fetchGuildName: (guildId: string) => Promise<string | undefined>;
   speakerContext: DiscordVoiceSpeakerContextResolver;
 }): Promise<DiscordVoiceAgentTurnResult | null> {
   const context =
     params.context ??
     (await resolveDiscordVoiceIngressContext({
+      readPolicy: params.readPolicy,
       entry: params.entry,
       userId: params.userId,
       cfg: params.cfg,
       discordConfig: params.discordConfig,
-      ownerAllowFrom: params.ownerAllowFrom,
+      admissionAllowFrom: params.admissionAllowFrom,
       fetchGuildName: params.fetchGuildName,
       speakerContext: params.speakerContext,
     }));
-  if (!context) {
+  if (
+    !context ||
+    params.entry.captureOnly ||
+    params.entry.sessionLifecycle.status !== "active" ||
+    context.isCurrent?.() === false
+  ) {
     return null;
   }
+  params.signal?.throwIfAborted();
   const voiceModel = normalizeOptionalString(params.discordConfig.voice?.model);
-  const result = await agentCommandFromIngress(
-    {
-      message: params.message,
-      sessionKey: params.entry.route.sessionKey,
-      agentId: params.entry.route.agentId,
-      messageChannel: "discord",
-      messageProvider: DISCORD_VOICE_MESSAGE_PROVIDER,
-      extraSystemPrompt: context.extraSystemPrompt,
-      allowModelOverride: Boolean(voiceModel),
-      model: voiceModel,
-      toolsAllow: params.toolsAllow,
-      deliver: false,
-    },
-    params.runtime,
-  );
+  const runId = params.voiceSelection ? randomUUID() : undefined;
+  const unbind = runId
+    ? params.voiceSelection?.bindRun({
+        runId,
+        assertCurrent: () => {
+          params.signal?.throwIfAborted();
+          if (
+            params.entry.sessionLifecycle.status !== "active" ||
+            context.isCurrent?.() === false
+          ) {
+            throw new Error("Discord voice access is no longer valid for this call");
+          }
+        },
+      })
+    : undefined;
+  let result: Awaited<
+    ReturnType<ReturnType<typeof getDiscordRuntime>["agent"]["runCommandFromIngress"]>
+  >;
+  try {
+    result = await getDiscordRuntime().agent.runCommandFromIngress(
+      {
+        message: params.message,
+        sessionKey: params.entry.route.sessionKey,
+        agentId: params.entry.route.agentId,
+        messageChannel: "discord",
+        messageProvider: DISCORD_VOICE_MESSAGE_PROVIDER,
+        accountId: params.accountId,
+        extraSystemPrompt: context.extraSystemPrompt,
+        senderIsOwner: context.senderIsOwner,
+        allowModelOverride: Boolean(voiceModel),
+        model: voiceModel,
+        toolsAllow: params.toolsAllow,
+        deliver: false,
+        ...(runId ? { runId } : {}),
+        ...(params.signal ? { abortSignal: params.signal } : {}),
+      },
+      params.runtime,
+    );
+  } finally {
+    unbind?.();
+  }
   const payloads = result.payloads ?? [];
   const text = payloads
     .map((payload) => payload.text)

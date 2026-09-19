@@ -1,5 +1,10 @@
 {
   "id": "elevenlabs",
+  "categories": ["voice"],
+  "capabilityCatalogEntry": "./capability-catalog.ts",
+  "doctorContract": {
+    "configRepair": true
+  },
   "activation": {
     "onStartup": false
   },

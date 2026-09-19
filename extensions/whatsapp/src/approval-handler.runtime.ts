@@ -1,3 +1,4 @@
+import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
 import {
   buildChannelApprovalExpiredText,
   buildChannelApprovalResolvedText,
@@ -13,8 +14,10 @@ import {
 import type {
   ExecApprovalRequest,
   PluginApprovalRequest,
+  SystemAgentApprovalRequest,
 } from "openclaw/plugin-sdk/approval-runtime";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
+import { resolveDefaultWhatsAppAccountId } from "./accounts.js";
 import {
   registerWhatsAppApprovalReactionTarget,
   unregisterWhatsAppApprovalReactionTarget,
@@ -25,14 +28,14 @@ import { sendMessageWhatsApp, sendTypingWhatsApp } from "./send.js";
 
 const log = createSubsystemLogger("whatsapp/approvals");
 
-type ApprovalRequest = ExecApprovalRequest | PluginApprovalRequest;
+type ApprovalRequest = ExecApprovalRequest | PluginApprovalRequest | SystemAgentApprovalRequest;
 type WhatsAppPendingDelivery = ApprovalReactionPendingContent;
 type PreparedWhatsAppApprovalTarget = {
   to: string;
-  accountId?: string;
+  accountId: string;
 };
 type PendingWhatsAppApprovalEntry = {
-  accountId?: string;
+  accountId: string;
   to: string;
   remoteJid: string;
   messageId: string;
@@ -56,7 +59,7 @@ export const whatsappApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
   true,
   WhatsAppFinalPayload
 >({
-  eventKinds: ["exec", "plugin"],
+  eventKinds: ["exec", "plugin", "system-agent"],
   availability: {
     isConfigured: ({ context }) => Boolean(context),
     shouldHandle: ({ context }) => Boolean(context),
@@ -74,7 +77,7 @@ export const whatsappApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
     }),
   },
   transport: {
-    prepareTarget: ({ plannedTarget, accountId }) => {
+    prepareTarget: ({ cfg, plannedTarget, accountId }) => {
       const to = normalizeWhatsAppMessagingTarget(plannedTarget.target.to);
       if (!to) {
         return null;
@@ -84,6 +87,7 @@ export const whatsappApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
         accountId: resolvePreparedApprovalAccountId({
           plannedAccountId: (plannedTarget.target as { accountId?: string | null }).accountId,
           contextAccountId: accountId,
+          fallbackAccountId: cfg ? resolveDefaultWhatsAppAccountId(cfg) : DEFAULT_ACCOUNT_ID,
         }),
       };
       return {
@@ -97,7 +101,7 @@ export const whatsappApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
       const verbose = getWhatsAppRuntime().logging.shouldLogVerbose();
       await sendTypingWhatsApp(preparedTarget.to, {
         cfg,
-        ...(preparedTarget.accountId ? { accountId: preparedTarget.accountId } : {}),
+        accountId: preparedTarget.accountId,
       }).catch(() => {});
       const result = await sendMessageWhatsApp(
         preparedTarget.to,
@@ -105,8 +109,8 @@ export const whatsappApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
         {
           cfg,
           verbose,
+          accountId: preparedTarget.accountId,
           preserveLeadingWhitespace: true,
-          ...(preparedTarget.accountId ? { accountId: preparedTarget.accountId } : {}),
         },
       );
       if (!result.messageId) {
@@ -124,8 +128,8 @@ export const whatsappApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
       await sendMessageWhatsApp(entry.to, payload.text, {
         cfg,
         verbose,
+        accountId: entry.accountId,
         preserveLeadingWhitespace: true,
-        ...(entry.accountId ? { accountId: entry.accountId } : {}),
         quotedMessageKey: {
           id: entry.messageId,
           remoteJid: entry.remoteJid,
@@ -135,27 +139,28 @@ export const whatsappApprovalNativeRuntime = createChannelApprovalNativeRuntimeA
     },
   },
   interactions: {
-    bindPending: ({ entry, request, view, pendingPayload }) =>
-      registerWhatsAppApprovalReactionTarget({
-        accountId: entry.accountId ?? "",
+    bindPending: async ({ entry, request, view, pendingPayload }) =>
+      (await registerWhatsAppApprovalReactionTarget({
+        accountId: entry.accountId,
         remoteJid: entry.remoteJid,
         messageId: entry.messageId,
         approvalId: request.id,
+        approvalKind: view.approvalKind,
         allowedDecisions: pendingPayload.reactionPayload.allowedDecisions,
         ttlMs: Math.max(1, view.expiresAtMs - Date.now()),
-      })
+      }))
         ? true
         : null,
-    unbindPending: ({ entry }) => {
-      unregisterWhatsAppApprovalReactionTarget({
-        accountId: entry.accountId ?? "",
+    unbindPending: async ({ entry }) => {
+      await unregisterWhatsAppApprovalReactionTarget({
+        accountId: entry.accountId,
         remoteJid: entry.remoteJid,
         messageId: entry.messageId,
       });
     },
-    cancelDelivered: ({ entry }) => {
-      unregisterWhatsAppApprovalReactionTarget({
-        accountId: entry.accountId ?? "",
+    cancelDelivered: async ({ entry }) => {
+      await unregisterWhatsAppApprovalReactionTarget({
+        accountId: entry.accountId,
         remoteJid: entry.remoteJid,
         messageId: entry.messageId,
       });

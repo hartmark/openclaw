@@ -1,4 +1,4 @@
-export type AsyncLock = <T>(fn: () => Promise<T>) => Promise<T>;
+type AsyncLock = <T>(fn: () => Promise<T>) => Promise<T>;
 
 export function createAsyncLock(): AsyncLock {
   let lock: Promise<void> = Promise.resolve();

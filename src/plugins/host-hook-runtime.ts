@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { AgentEventPayload } from "../infra/agent-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -5,6 +6,7 @@ import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { withPluginHostCleanupTimeout } from "./host-hook-cleanup-timeout.js";
 import {
   isPluginJsonValue,
+  type PluginAgentEventSubscriptionRegistration,
   type PluginHostCleanupReason,
   type PluginJsonValue,
   type PluginRunContextGetParams,
@@ -12,10 +14,20 @@ import {
   type PluginSessionSchedulerJobHandle,
   type PluginSessionSchedulerJobRegistration,
 } from "./host-hooks.js";
+import { runPluginCleanup } from "./plugin-instance-scope.js";
 import type { PluginRegistry } from "./registry-types.js";
 
 type PluginRunContextNamespaces = Map<string, PluginJsonValue>;
 type PluginRunContextByPlugin = Map<string, PluginRunContextNamespaces>;
+type PluginRunContexts = Map<string, PluginRunContextByPlugin>;
+type PluginRunContextCleanup = {
+  source: PluginRunContexts;
+  contexts: PluginRunContexts;
+  owners: ReadonlySet<PluginRunContextNamespaces>;
+};
+type PluginAgentEventSubscriptionContext = Parameters<
+  PluginAgentEventSubscriptionRegistration["handle"]
+>[1];
 
 type SchedulerJobRecord = {
   pluginId: string;
@@ -26,7 +38,7 @@ type SchedulerJobRecord = {
 };
 
 type PluginHostRuntimeState = {
-  runContextByRunId: Map<string, PluginRunContextByPlugin>;
+  runContextByRunId: PluginRunContexts;
   schedulerJobsByPlugin: Map<string, Map<string, SchedulerJobRecord>>;
   nextSchedulerJobGeneration: number;
   pendingAgentEventHandlersByRunId: Map<string, Set<Promise<void>>>;
@@ -35,8 +47,8 @@ type PluginHostRuntimeState = {
 };
 
 const PLUGIN_HOST_RUNTIME_STATE_KEY = Symbol.for("openclaw.pluginHostRuntimeState");
-const CLOSED_RUN_IDS_MAX = 512;
-export const PLUGIN_TERMINAL_EVENT_CLEANUP_WAIT_MS = 5_000;
+const TRACKED_RUN_IDS_MAX = 512;
+const PLUGIN_TERMINAL_EVENT_CLEANUP_WAIT_MS = 5_000;
 const log = createSubsystemLogger("plugins/host-hooks");
 
 function getPluginHostRuntimeState(): PluginHostRuntimeState {
@@ -50,46 +62,30 @@ function getPluginHostRuntimeState(): PluginHostRuntimeState {
   }));
 }
 
+const runContextCleanup = resolveGlobalSingleton(
+  Symbol.for("openclaw.pluginRunContextCleanup"),
+  () => new AsyncLocalStorage<PluginRunContextCleanup>(),
+);
+
+function getPluginRunContexts(): PluginRunContexts {
+  return runContextCleanup.getStore()?.contexts ?? getPluginHostRuntimeState().runContextByRunId;
+}
+
 function normalizeNamespace(value: string | undefined): string {
   return (value ?? "").trim();
 }
 
-function copyJsonValue(value: PluginJsonValue): PluginJsonValue {
-  return structuredClone(value);
-}
+function rememberBoundedRunId(runIds: Set<string>, runId: string): void {
+  runIds.delete(runId);
+  runIds.add(runId);
 
-function markPluginRunClosed(runId: string): void {
-  const state = getPluginHostRuntimeState();
-  state.closedRunIds.delete(runId);
-  state.closedRunIds.add(runId);
-  while (state.closedRunIds.size > CLOSED_RUN_IDS_MAX) {
-    const oldest = state.closedRunIds.values().next().value;
+  while (runIds.size > TRACKED_RUN_IDS_MAX) {
+    const oldest = runIds.values().next().value;
     if (oldest === undefined) {
       break;
     }
-    state.closedRunIds.delete(oldest);
+    runIds.delete(oldest);
   }
-}
-
-function isPluginRunClosed(runId: string): boolean {
-  return getPluginHostRuntimeState().closedRunIds.has(runId);
-}
-
-function markTerminalEventCleanupExpired(runId: string): void {
-  const state = getPluginHostRuntimeState();
-  state.terminalEventCleanupExpiredRunIds.delete(runId);
-  state.terminalEventCleanupExpiredRunIds.add(runId);
-  while (state.terminalEventCleanupExpiredRunIds.size > CLOSED_RUN_IDS_MAX) {
-    const oldest = state.terminalEventCleanupExpiredRunIds.values().next().value;
-    if (oldest === undefined) {
-      break;
-    }
-    state.terminalEventCleanupExpiredRunIds.delete(oldest);
-  }
-}
-
-function isTerminalEventCleanupExpired(runId: string): boolean {
-  return getPluginHostRuntimeState().terminalEventCleanupExpiredRunIds.has(runId);
 }
 
 function trackAgentEventHandler(runId: string, pending: Promise<void>): void {
@@ -118,8 +114,7 @@ async function waitForLiveTerminalEventHandlers(runId: string): Promise<"settled
   }
 }
 
-function waitForTerminalEventHandlers(params: { runId: string }): Promise<void> {
-  const { runId } = params;
+function waitForTerminalEventHandlers(runId: string): Promise<void> {
   let timeout: NodeJS.Timeout | undefined;
   const settled = waitForLiveTerminalEventHandlers(runId);
   // Promise.race bounds the host wait; JavaScript cannot cancel the plugin
@@ -127,7 +122,7 @@ function waitForTerminalEventHandlers(params: { runId: string }): Promise<void> 
   // run-context resurrection by handlers that eventually settle.
   const timedOut = new Promise<"timeout">((resolve) => {
     timeout = setTimeout(() => {
-      markTerminalEventCleanupExpired(runId);
+      rememberBoundedRunId(getPluginHostRuntimeState().terminalEventCleanupExpiredRunIds, runId);
       getPluginHostRuntimeState().pendingAgentEventHandlersByRunId.delete(runId);
       log.warn(
         `plugin terminal agent event subscriptions still running after ${PLUGIN_TERMINAL_EVENT_CLEANUP_WAIT_MS}ms; clearing run context without waiting for them to settle`,
@@ -146,28 +141,30 @@ function waitForTerminalEventHandlers(params: { runId: string }): Promise<void> 
   });
 }
 
-function getPluginRunContextNamespaces(params: {
-  runId: string;
-  pluginId: string;
-  create?: boolean;
-}): PluginRunContextNamespaces | undefined {
-  const state = getPluginHostRuntimeState();
-  let byPlugin = state.runContextByRunId.get(params.runId);
-  if (!byPlugin && params.create) {
+function getPluginRunContextNamespaces(
+  runId: string,
+  pluginId: string,
+  create = false,
+): PluginRunContextNamespaces | undefined {
+  const contexts = getPluginRunContexts();
+  let byPlugin = contexts.get(runId);
+  if (!byPlugin && create) {
     byPlugin = new Map();
-    state.runContextByRunId.set(params.runId, byPlugin);
+    contexts.set(runId, byPlugin);
   }
   if (!byPlugin) {
     return undefined;
   }
-  let namespaces = byPlugin.get(params.pluginId);
-  if (!namespaces && params.create) {
-    namespaces = new Map();
-    byPlugin.set(params.pluginId, namespaces);
+  let namespaces = byPlugin.get(pluginId);
+  if (create) {
+    // A new write owns its namespace map, even when it repeats the same value.
+    namespaces = new Map(namespaces);
+    byPlugin.set(pluginId, namespaces);
   }
   return namespaces;
 }
 
+/** Stores JSON-compatible plugin run context for one run/plugin/namespace tuple. */
 export function setPluginRunContext(params: {
   pluginId: string;
   patch: PluginRunContextPatch;
@@ -178,7 +175,7 @@ export function setPluginRunContext(params: {
   if (!runId || !namespace) {
     return false;
   }
-  if (!params.allowClosedRun && isPluginRunClosed(runId)) {
+  if (!params.allowClosedRun && getPluginHostRuntimeState().closedRunIds.has(runId)) {
     return false;
   }
   // Only an explicit `unset: true` deletes the run-context entry — silently
@@ -192,43 +189,75 @@ export function setPluginRunContext(params: {
     });
     return true;
   }
-  if (params.patch.value === undefined) {
+  if (params.patch.value === undefined || !isPluginJsonValue(params.patch.value)) {
     return false;
   }
-  if (!isPluginJsonValue(params.patch.value)) {
-    return false;
-  }
-  const namespaces = getPluginRunContextNamespaces({
-    runId,
-    pluginId: params.pluginId,
-    create: true,
-  });
-  namespaces?.set(namespace, copyJsonValue(params.patch.value));
+  const namespaces = getPluginRunContextNamespaces(runId, params.pluginId, true);
+  namespaces?.set(namespace, structuredClone(params.patch.value));
   return true;
 }
 
-// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Run-context JSON reads are caller-typed by namespace.
-export function getPluginRunContext<T extends PluginJsonValue = PluginJsonValue>(params: {
+/** Reads previously stored plugin run context for one run/plugin/namespace tuple. */
+export function getPluginRunContext(params: {
   pluginId: string;
   get: PluginRunContextGetParams;
-}): T | undefined {
+}): PluginJsonValue | undefined {
   const runId = normalizeOptionalString(params.get.runId);
   const namespace = normalizeNamespace(params.get.namespace);
   if (!runId || !namespace) {
     return undefined;
   }
-  const value = getPluginRunContextNamespaces({
-    runId,
-    pluginId: params.pluginId,
-  })?.get(namespace);
-  return value === undefined ? undefined : (copyJsonValue(value) as T);
+  const value = getPluginRunContextNamespaces(runId, params.pluginId)?.get(namespace);
+  return value === undefined ? undefined : structuredClone(value);
 }
 
-export function clearPluginRunContext(params: {
+type PluginRunContextSelection = {
   pluginId?: string;
   runId?: string;
   namespace?: string;
-}): void {
+};
+
+function capturePluginRunContextCleanup(): PluginRunContextCleanup {
+  const current = runContextCleanup.getStore();
+  if (current) {
+    return current;
+  }
+  const source = getPluginRunContexts();
+  return {
+    source,
+    contexts: new Map(Array.from(source, ([runId, byPlugin]) => [runId, new Map(byPlugin)])),
+    owners: new Set(
+      Array.from(source.values()).flatMap((byPlugin) => Array.from(byPlugin.values())),
+    ),
+  };
+}
+
+/** Capture before publication or drains can replace the retiring namespace bindings. */
+export function preparePluginRunContextCleanup(): <T>(run: () => T) => T {
+  const scope = capturePluginRunContextCleanup();
+  return (run) => runContextCleanup.run(scope, run);
+}
+
+/** Cleanup owns a private view across awaits; later serving writes keep their own bindings. */
+export function withPluginRunContextCleanup<T>(
+  params: PluginRunContextSelection,
+  run: (clear: () => void) => T,
+): T {
+  const scope = capturePluginRunContextCleanup();
+  return runContextCleanup.run(scope, () =>
+    run(() => clearPluginRunContextState(params, scope.owners, scope.source)),
+  );
+}
+
+export function clearPluginRunContext(params: PluginRunContextSelection): void {
+  clearPluginRunContextState(params);
+}
+
+function clearPluginRunContextState(
+  params: PluginRunContextSelection,
+  owners?: ReadonlySet<PluginRunContextNamespaces>,
+  contexts = getPluginRunContexts(),
+): void {
   // Normalize namespace through the same trim() used by set/get so callers that
   // pass whitespace or differently-formatted strings hit the same Map keys and
   // don't leave orphan entries behind.
@@ -238,37 +267,39 @@ export function clearPluginRunContext(params: {
   // than as a literal-empty-string deletion: that matches the set/get rule that
   // empty namespaces are not addressable, and it avoids silently no-op-ing the
   // delete (which would otherwise look like a successful clear).
-  const namespaceFilter =
-    normalizedNamespace !== undefined && normalizedNamespace !== ""
-      ? normalizedNamespace
-      : undefined;
+  const namespaceFilter = normalizedNamespace || undefined;
   const state = getPluginHostRuntimeState();
-  const runIds = params.runId ? [params.runId] : [...state.runContextByRunId.keys()];
+  const runIds = params.runId ? [params.runId] : [...contexts.keys()];
   for (const runId of runIds) {
-    const byPlugin = state.runContextByRunId.get(runId);
+    const byPlugin = contexts.get(runId);
     if (!byPlugin) {
       continue;
     }
     const pluginIds = params.pluginId ? [params.pluginId] : [...byPlugin.keys()];
     for (const pluginId of pluginIds) {
-      const namespaces = byPlugin.get(pluginId);
-      if (!namespaces) {
+      let namespaces = byPlugin.get(pluginId);
+      if (!namespaces || (owners && !owners.has(namespaces))) {
         continue;
       }
       if (namespaceFilter !== undefined) {
+        namespaces = new Map(namespaces);
         namespaces.delete(namespaceFilter);
-      } else {
-        namespaces.clear();
+        byPlugin.set(pluginId, namespaces);
       }
-      if (namespaces.size === 0) {
+      if (namespaceFilter === undefined || namespaces.size === 0) {
         byPlugin.delete(pluginId);
       }
     }
     if (byPlugin.size === 0) {
-      state.runContextByRunId.delete(runId);
+      contexts.delete(runId);
     }
   }
-  if (params.runId && !params.pluginId && namespaceFilter === undefined) {
+  if (
+    contexts === state.runContextByRunId &&
+    params.runId &&
+    !params.pluginId &&
+    namespaceFilter === undefined
+  ) {
     state.pendingAgentEventHandlersByRunId.delete(params.runId);
   }
 }
@@ -278,22 +309,22 @@ function isTerminalAgentRunEvent(event: AgentEventPayload): boolean {
   return event.stream === "lifecycle" && (phase === "end" || phase === "error");
 }
 
-function logAgentEventSubscriptionFailure(params: {
-  pluginId: string;
-  subscriptionId: string;
-  error: unknown;
-}): void {
+function logAgentEventSubscriptionFailure(
+  pluginId: string,
+  subscriptionId: string,
+  error: unknown,
+): void {
   log.warn(
-    `plugin agent event subscription failed: plugin=${params.pluginId} subscription=${params.subscriptionId} error=${String(params.error)}`,
+    `plugin agent event subscription failed: plugin=${pluginId} subscription=${subscriptionId} error=${String(error)}`,
   );
 }
 
 export function dispatchPluginAgentEventSubscriptions(params: {
   registry: PluginRegistry | null | undefined;
   event: AgentEventPayload;
+  isLive: () => boolean;
 }): void {
   const subscriptions = params.registry?.agentEventSubscriptions ?? [];
-  const pendingHandlers: Promise<void>[] = [];
   const isTerminalEvent = isTerminalAgentRunEvent(params.event);
   for (const registration of subscriptions) {
     const streams = registration.subscription.streams;
@@ -303,18 +334,31 @@ export function dispatchPluginAgentEventSubscriptions(params: {
     const pluginId = registration.pluginId;
     const runId = params.event.runId;
     let handlerActive = true;
-    const ctx = {
-      // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Run-context JSON reads are caller-typed by namespace.
-      getRunContext: <T extends PluginJsonValue = PluginJsonValue>(namespace: string) =>
-        getPluginRunContext<T>({ pluginId, get: { runId, namespace } }),
+    const ctx: PluginAgentEventSubscriptionContext = {
+      getRunContext: ((namespace: string) =>
+        params.isLive()
+          ? getPluginRunContext({
+              pluginId,
+              get: { runId, namespace },
+            })
+          : undefined) as PluginAgentEventSubscriptionContext["getRunContext"],
       setRunContext: (namespace: string, value: PluginJsonValue) => {
+        if (!params.isLive()) {
+          return;
+        }
         setPluginRunContext({
           pluginId,
           patch: { runId, namespace, value },
-          allowClosedRun: isTerminalEvent && handlerActive && !isTerminalEventCleanupExpired(runId),
+          allowClosedRun:
+            isTerminalEvent &&
+            handlerActive &&
+            !getPluginHostRuntimeState().terminalEventCleanupExpiredRunIds.has(runId),
         });
       },
       clearRunContext: (namespace?: string) => {
+        if (!params.isLive()) {
+          return;
+        }
         clearPluginRunContext({ pluginId, runId, namespace });
       },
     };
@@ -323,31 +367,20 @@ export function dispatchPluginAgentEventSubscriptions(params: {
         registration.subscription.handle(structuredClone(params.event), ctx),
       )
         .catch((error: unknown) => {
-          logAgentEventSubscriptionFailure({
-            pluginId,
-            subscriptionId: registration.subscription.id,
-            error,
-          });
+          logAgentEventSubscriptionFailure(pluginId, registration.subscription.id, error);
         })
         .finally(() => {
           handlerActive = false;
         });
       trackAgentEventHandler(runId, pending);
-      pendingHandlers.push(pending);
     } catch (error) {
       handlerActive = false;
-      logAgentEventSubscriptionFailure({
-        pluginId,
-        subscriptionId: registration.subscription.id,
-        error,
-      });
+      logAgentEventSubscriptionFailure(pluginId, registration.subscription.id, error);
     }
   }
   if (isTerminalEvent) {
-    markPluginRunClosed(params.event.runId);
-    void waitForTerminalEventHandlers({
-      runId: params.event.runId,
-    }).then(() => {
+    rememberBoundedRunId(getPluginHostRuntimeState().closedRunIds, params.event.runId);
+    void waitForTerminalEventHandlers(params.event.runId).then(() => {
       clearPluginRunContext({ runId: params.event.runId });
     });
   }
@@ -379,6 +412,31 @@ export function registerPluginSessionSchedulerJob(params: {
   return { id, pluginId: params.pluginId, sessionKey, kind };
 }
 
+/** Publish collected jobs and transfer dynamic jobs without rotating retained instances. */
+export function publishPluginSessionSchedulerJobs(registry: PluginRegistry): void {
+  const state = getPluginHostRuntimeState();
+  for (const [pluginId, jobs] of state.schedulerJobsByPlugin) {
+    const retained = registry.plugins.find((record) => record.id === pluginId);
+    for (const job of jobs.values()) {
+      if (retained && job.ownerRegistry?.plugins.includes(retained)) {
+        job.ownerRegistry = registry;
+      }
+    }
+  }
+  for (const registration of registry.sessionSchedulerJobs) {
+    // Retained declarations have already published, even if their live job changed or ended.
+    if (registration.generation !== undefined) {
+      continue;
+    }
+    registerPluginSessionSchedulerJob({ ...registration, ownerRegistry: registry });
+    registration.generation = getPluginSessionSchedulerJobGeneration({
+      pluginId: registration.pluginId,
+      jobId: registration.job.id,
+      sessionKey: registration.job.sessionKey,
+    });
+  }
+}
+
 export function deletePluginSessionSchedulerJob(params: {
   pluginId: string;
   jobId: string;
@@ -403,24 +461,7 @@ export function deletePluginSessionSchedulerJob(params: {
   }
 }
 
-function hasPluginSessionSchedulerJob(params: {
-  pluginId: string;
-  jobId: string;
-  sessionKey?: string;
-  generation?: number;
-}): boolean {
-  const state = getPluginHostRuntimeState();
-  const record = state.schedulerJobsByPlugin.get(params.pluginId)?.get(params.jobId);
-  if (!record) {
-    return false;
-  }
-  if (params.sessionKey && record.job.sessionKey !== params.sessionKey) {
-    return false;
-  }
-  return params.generation === undefined || record.generation === params.generation;
-}
-
-export function getPluginSessionSchedulerJobGeneration(params: {
+function getPluginSessionSchedulerJobGeneration(params: {
   pluginId: string;
   jobId: string;
   sessionKey?: string;
@@ -453,6 +494,7 @@ export async function cleanupPluginSessionSchedulerJobs(params: {
   preserveJobIds?: ReadonlySet<string>;
   excludeJobKeys?: ReadonlySet<string>;
   shouldCleanup?: () => boolean;
+  cleanupOwnerRegistry?: PluginRegistry;
   preserveOwnerRegistry?: PluginRegistry | null;
 }): Promise<Array<{ pluginId: string; hookId: string; error: unknown }>> {
   const state = getPluginHostRuntimeState();
@@ -461,6 +503,37 @@ export async function cleanupPluginSessionSchedulerJobs(params: {
   if (!shouldCleanup()) {
     return failures;
   }
+  const cleanupJob = async (
+    pluginId: string,
+    jobId: string,
+    record: { job: PluginSessionSchedulerJobRegistration; generation?: number },
+    registeredSessionKey?: string,
+  ): Promise<void> => {
+    const hookId = `scheduler:${jobId}`;
+    try {
+      await withPluginHostCleanupTimeout(hookId, () =>
+        runPluginCleanup(record.job.cleanup ?? record.job, () =>
+          record.job.cleanup?.({
+            reason: params.reason,
+            sessionKey: registeredSessionKey ?? record.job.sessionKey,
+            jobId,
+          }),
+        ),
+      );
+    } catch (error) {
+      failures.push({ pluginId, hookId, error });
+      return;
+    }
+    if (shouldCleanup()) {
+      // A replacement may now own this id; delete only the generation we cleaned.
+      deletePluginSessionSchedulerJob({
+        pluginId,
+        jobId,
+        sessionKey: registeredSessionKey,
+        expectedGeneration: record.generation,
+      });
+    }
+  };
   const registryRecordKeys = new Set<string>();
   const schedulerJobKey = (pluginId: string, jobId: string, sessionKey: string) =>
     `${pluginId}\0${jobId}\0${sessionKey}`;
@@ -480,23 +553,13 @@ export async function cleanupPluginSessionSchedulerJobs(params: {
       if (params.sessionKey && sessionKey !== params.sessionKey) {
         continue;
       }
-      registryRecordKeys.add(schedulerJobKey(record.pluginId, jobId, sessionKey));
       const liveGeneration = getPluginSessionSchedulerJobGeneration({
         pluginId: record.pluginId,
         jobId,
         sessionKey,
       });
-      if (record.generation !== undefined && liveGeneration === undefined) {
-        continue;
-      }
-      if (
-        record.generation === undefined &&
-        !hasPluginSessionSchedulerJob({
-          pluginId: record.pluginId,
-          jobId,
-          sessionKey,
-        })
-      ) {
+      // Unpublished candidates have no generation and must never clean a live predecessor.
+      if (record.generation === undefined || liveGeneration === undefined) {
         continue;
       }
       const preserveJob = params.preserveJobIds?.has(jobId) ?? false;
@@ -508,35 +571,13 @@ export async function cleanupPluginSessionSchedulerJobs(params: {
         // newer-generation registration that took over this jobId.
         continue;
       }
+      if (liveGeneration === record.generation) {
+        registryRecordKeys.add(schedulerJobKey(record.pluginId, jobId, sessionKey));
+      }
       // A newer generation may already own this id. The old cleanup callback can
       // still release plugin-owned resources, while deletion below is generation
       // matched so it cannot remove the newer live record.
-      const hookId = `scheduler:${jobId}`;
-      try {
-        await withPluginHostCleanupTimeout(hookId, () =>
-          record.job.cleanup?.({
-            reason: params.reason,
-            sessionKey,
-            jobId,
-          }),
-        );
-      } catch (error) {
-        failures.push({
-          pluginId: record.pluginId,
-          hookId,
-          error,
-        });
-        continue;
-      }
-      if (!shouldCleanup()) {
-        continue;
-      }
-      deletePluginSessionSchedulerJob({
-        pluginId: record.pluginId,
-        jobId,
-        sessionKey,
-        expectedGeneration: record.generation,
-      });
+      await cleanupJob(record.pluginId, jobId, record, sessionKey);
     }
   }
   const pluginIds = params.pluginId ? [params.pluginId] : [...state.schedulerJobsByPlugin.keys()];
@@ -555,6 +596,14 @@ export async function cleanupPluginSessionSchedulerJobs(params: {
       if (params.sessionKey && record.job.sessionKey !== params.sessionKey) {
         continue;
       }
+      // Dynamic jobs share a process-global index. Registry retirement must only
+      // clean its own records or it can delete jobs owned by another live surface.
+      if (
+        params.cleanupOwnerRegistry !== undefined &&
+        record.ownerRegistry !== params.cleanupOwnerRegistry
+      ) {
+        continue;
+      }
       if (registryRecordKeys.has(schedulerJobKey(pluginId, jobId, record.job.sessionKey))) {
         continue;
       }
@@ -570,30 +619,7 @@ export async function cleanupPluginSessionSchedulerJobs(params: {
       if (params.preserveJobIds?.has(jobId)) {
         continue;
       }
-      const hookId = `scheduler:${jobId}`;
-      try {
-        await withPluginHostCleanupTimeout(hookId, () =>
-          record.job.cleanup?.({
-            reason: params.reason,
-            sessionKey: record.job.sessionKey,
-            jobId,
-          }),
-        );
-      } catch (error) {
-        failures.push({
-          pluginId,
-          hookId,
-          error,
-        });
-        continue;
-      }
-      if (!shouldCleanup()) {
-        continue;
-      }
-      jobs.delete(jobId);
-    }
-    if (jobs.size === 0) {
-      state.schedulerJobsByPlugin.delete(pluginId);
+      await cleanupJob(pluginId, jobId, record);
     }
   }
   return failures;
@@ -610,27 +636,4 @@ export function clearPluginHostRuntimeState(params?: { pluginId?: string; runId?
     state.closedRunIds.clear();
     state.terminalEventCleanupExpiredRunIds.clear();
   }
-}
-
-export function listPluginSessionSchedulerJobs(
-  pluginId?: string,
-): PluginSessionSchedulerJobHandle[] {
-  const state = getPluginHostRuntimeState();
-  const records: PluginSessionSchedulerJobHandle[] = [];
-  const pluginIds = pluginId ? [pluginId] : [...state.schedulerJobsByPlugin.keys()];
-  for (const currentPluginId of pluginIds) {
-    const jobs = state.schedulerJobsByPlugin.get(currentPluginId);
-    if (!jobs) {
-      continue;
-    }
-    for (const record of jobs.values()) {
-      records.push({
-        id: record.job.id,
-        pluginId: currentPluginId,
-        sessionKey: record.job.sessionKey,
-        kind: record.job.kind,
-      });
-    }
-  }
-  return records.toSorted((left, right) => left.id.localeCompare(right.id));
 }

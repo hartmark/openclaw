@@ -1,32 +1,34 @@
+// Imessage helper module supports normalize behavior.
 import { normalizeE164 } from "openclaw/plugin-sdk/account-resolution";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  isIMessagePhoneLikeHandle,
+  normalizeBareIMessageChatIdentifier,
+} from "./target-identifiers.js";
 
 const SERVICE_PREFIXES = ["imessage:", "sms:", "auto:"] as const;
 const CHAT_TARGET_PREFIX_RE =
   /^(chat_id:|chatid:|chat:|chat_guid:|chatguid:|guid:|chat_identifier:|chatidentifier:|chatident:)/i;
 
-function looksLikeHandleOrPhoneTarget(params: {
-  raw: string;
-  prefixPattern: RegExp;
-  phonePattern?: RegExp;
-}): boolean {
-  const trimmed = params.raw.trim();
-  if (!trimmed) {
-    return false;
-  }
-  if (params.prefixPattern.test(trimmed)) {
-    return true;
-  }
+export function normalizeIMessageHandleValue(trimmed: string): string | undefined {
   if (trimmed.includes("@")) {
-    return true;
+    return normalizeLowercaseStringOrEmpty(trimmed);
   }
-  return (params.phonePattern ?? /^\+?\d{3,}$/).test(trimmed);
+  const bareChatIdentifier = normalizeBareIMessageChatIdentifier(trimmed);
+  if (bareChatIdentifier) {
+    return `chat_identifier:${bareChatIdentifier}`;
+  }
+  const normalized = isIMessagePhoneLikeHandle(trimmed) ? normalizeE164(trimmed) : "";
+  if (normalized) {
+    return normalized;
+  }
+  return undefined;
 }
 
-function normalizeIMessageHandle(raw: string): string {
+function normalizeIMessageHandle(raw: string, allowContactName = false): string {
   const trimmed = raw.trim();
   if (!trimmed) {
     return "";
@@ -49,14 +51,9 @@ function normalizeIMessageHandle(raw: string): string {
     const value = trimmed.slice(prefix.length).trim();
     return `${normalizeLowercaseStringOrEmpty(prefix)}${value}`;
   }
-  if (trimmed.includes("@")) {
-    return normalizeLowercaseStringOrEmpty(trimmed);
-  }
-  const normalized = normalizeE164(trimmed);
-  if (normalized) {
-    return normalized;
-  }
-  return trimmed.replace(/\s+/g, "");
+  return (
+    normalizeIMessageHandleValue(trimmed) ?? (allowContactName ? trimmed.replace(/\s+/g, "") : "")
+  );
 }
 
 export function normalizeIMessageMessagingTarget(raw: string): string | undefined {
@@ -69,7 +66,7 @@ export function normalizeIMessageMessagingTarget(raw: string): string | undefine
   for (const prefix of SERVICE_PREFIXES) {
     if (lower.startsWith(prefix)) {
       const remainder = trimmed.slice(prefix.length).trim();
-      const normalizedHandle = normalizeIMessageHandle(remainder);
+      const normalizedHandle = normalizeIMessageHandle(remainder, true);
       if (!normalizedHandle) {
         return undefined;
       }
@@ -92,8 +89,12 @@ export function looksLikeIMessageTargetId(raw: string): boolean {
   if (CHAT_TARGET_PREFIX_RE.test(trimmed)) {
     return true;
   }
-  return looksLikeHandleOrPhoneTarget({
-    raw: trimmed,
-    prefixPattern: /^(imessage:|sms:|auto:)/i,
-  });
+  if (normalizeBareIMessageChatIdentifier(trimmed)) {
+    return true;
+  }
+  return (
+    /^(imessage:|sms:|auto:)/i.test(trimmed) ||
+    trimmed.includes("@") ||
+    (isIMessagePhoneLikeHandle(trimmed) && Boolean(normalizeE164(trimmed)))
+  );
 }

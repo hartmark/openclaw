@@ -1,18 +1,22 @@
+// Builds lazy native approval runtime adapters.
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import type {
   ChannelApprovalNativeAvailabilityAdapter,
   ChannelApprovalNativeRuntimeAdapter,
 } from "./approval-handler-runtime-types.js";
-import type { ExecApprovalChannelRuntimeEventKind } from "./exec-approval-channel-runtime.types.js";
+import type { ChannelApprovalKind } from "./approval-types.js";
 
+/** Runtime-context capability key used by channels to register native approval resources. */
 export const CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY = "approval.native";
 
+/** Creates an approval runtime adapter that loads heavy channel code only when delivery hooks run. */
 export function createLazyChannelApprovalNativeRuntimeAdapter<
   TPendingPayload = unknown,
   TPreparedTarget = unknown,
   TPendingEntry = unknown,
   TBinding = unknown,
   TFinalPayload = unknown,
+  TCapabilityBoundary extends boolean = false,
 >(params: {
   load: () => Promise<
     ChannelApprovalNativeRuntimeAdapter<
@@ -25,15 +29,20 @@ export function createLazyChannelApprovalNativeRuntimeAdapter<
   >;
   isConfigured: ChannelApprovalNativeAvailabilityAdapter["isConfigured"];
   shouldHandle: ChannelApprovalNativeAvailabilityAdapter["shouldHandle"];
-  eventKinds?: readonly ExecApprovalChannelRuntimeEventKind[];
+  eventKinds?: readonly ChannelApprovalKind[];
+  /** Erases payload types only when registering with the non-generic channel capability. */
+  capabilityBoundary?: TCapabilityBoundary;
+  /** @deprecated Trusted compatibility override; omit to derive ownership from the payload. */
   resolveApprovalKind?: ChannelApprovalNativeRuntimeAdapter["resolveApprovalKind"];
-}): ChannelApprovalNativeRuntimeAdapter<
-  TPendingPayload,
-  TPreparedTarget,
-  TPendingEntry,
-  TBinding,
-  TFinalPayload
-> {
+}): TCapabilityBoundary extends true
+  ? ChannelApprovalNativeRuntimeAdapter
+  : ChannelApprovalNativeRuntimeAdapter<
+      TPendingPayload,
+      TPreparedTarget,
+      TPendingEntry,
+      TBinding,
+      TFinalPayload
+    > {
   const loadRuntime = createLazyRuntimeModule(params.load);
   let loadedRuntime: ChannelApprovalNativeRuntimeAdapter<
     TPendingPayload,
@@ -132,5 +141,14 @@ export function createLazyChannelApprovalNativeRuntimeAdapter<
         loadedRuntime?.observe?.onDuplicateSkipped?.(runtimeParams),
       onDelivered: (runtimeParams) => loadedRuntime?.observe?.onDelivered?.(runtimeParams),
     },
-  };
+    // `capabilityBoundary` opts into the non-generic registration contract;
+    // otherwise this object preserves every type inferred from `load`.
+    // SAFETY: the conditional return type selects exactly those two representations.
+  } satisfies ChannelApprovalNativeRuntimeAdapter<
+    TPendingPayload,
+    TPreparedTarget,
+    TPendingEntry,
+    TBinding,
+    TFinalPayload
+  > as never; // SAFETY: the conditional return selects typed or capability-boundary form.
 }

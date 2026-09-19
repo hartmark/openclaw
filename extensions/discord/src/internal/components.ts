@@ -1,16 +1,10 @@
 export {
-  BaseComponent,
   BaseMessageInteractiveComponent,
-  BaseModalComponent,
-  clean,
-  colorToNumber,
   parseCustomId,
   type ComponentData,
   type ComponentParserResult,
-  type ConditionalComponentOption,
 } from "./components.base.js";
 export {
-  AnySelectMenu,
   Button,
   ChannelSelectMenu,
   Container,

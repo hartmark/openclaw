@@ -1,10 +1,16 @@
-import { spawn, spawnSync, type SpawnOptions, type SpawnSyncReturns } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+// Host Command script supports OpenClaw repository automation.
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveNpmRunner } from "../../npm-runner.mjs";
-import { resolvePnpmRunner } from "../../pnpm-runner.mjs";
-import { buildCmdExeCommandLine } from "../../windows-cmd-helpers.mjs";
+import {
+  addTimerTimeoutGraceMs,
+  clampTimerTimeoutMs,
+} from "@openclaw/normalization-core/number-coercion";
+import { terminateManagedChild } from "../../lib/managed-child-process.mts";
+import { resolveNpmRunner } from "../../npm-runner.mts";
+import { resolvePnpmRunner } from "../../pnpm-runner.mts";
+import { buildCmdExeCommandLine, resolveWindowsCmdExePath } from "../../windows-cmd-helpers.mjs";
 import type { CommandResult, RunOptions } from "./types.ts";
 
 export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -12,9 +18,11 @@ export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 const HOST_COMMAND_MAX_BUFFER_BYTES = 50 * 1024 * 1024;
 const HOST_COMMAND_WRAPPER_EXTRA_BUFFER_BYTES = 1024 * 1024;
 const HOST_COMMAND_WRAPPER_BACKSTOP_MS = 5_000;
+const HOST_COMMAND_TIMEOUT_KILL_GRACE_MS = 100;
 const HOST_COMMAND_CHILD_PID_PREFIX = "__OPENCLAW_HOST_COMMAND_CHILD_PID__";
 const HOST_COMMAND_SPAWN_ERROR_PREFIX = "__OPENCLAW_HOST_COMMAND_SPAWN_ERROR__";
 const HOST_COMMAND_TIMEOUT_PREFIX = "__OPENCLAW_HOST_COMMAND_TIMEOUT__";
+let progressStderrDepth = 0;
 
 type HostCommandInvocation = {
   args: string[];
@@ -42,11 +50,21 @@ function hostInvocationFromRunner(runner: HostCommandInvocation): HostCommandInv
 }
 
 export function say(message: string): void {
-  process.stdout.write(`==> ${message}\n`);
+  const stream = progressStderrDepth > 0 ? process.stderr : process.stdout;
+  stream.write(`==> ${message}\n`);
 }
 
 export function warn(message: string): void {
   process.stderr.write(`warn: ${message}\n`);
+}
+
+export async function withProgressOnStderr<T>(fn: () => Promise<T>): Promise<T> {
+  progressStderrDepth++;
+  try {
+    return await fn();
+  } finally {
+    progressStderrDepth--;
+  }
 }
 
 export function die(message: string): never {
@@ -58,22 +76,31 @@ function signalHostCommandProcess(pid: number | undefined, signal: NodeJS.Signal
   if (!pid) {
     return;
   }
-  try {
-    if (process.platform === "win32") {
-      process.kill(pid, signal);
-    } else {
-      process.kill(-pid, signal);
-    }
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ESRCH") {
-      warn(
-        `failed to send ${signal} to timed host command process ${pid}: ${
-          code ?? String(error)
-        }`,
-      );
-    }
-  }
+  let processGroupError: NodeJS.ErrnoException | undefined;
+  terminateManagedChild(
+    {
+      kill: (childSignal) => process.kill(pid, childSignal),
+      pid,
+    },
+    signal,
+    {
+      onChildSignalError(error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ESRCH") {
+          return;
+        }
+        const reason = processGroupError
+          ? `group ${processGroupError.code ?? processGroupError.toString()}, leader ${code ?? String(error)}`
+          : (code ?? String(error));
+        warn(`failed to send ${signal} to host command process ${pid}: ${reason}`);
+      },
+      onProcessGroupSignalError(error) {
+        processGroupError = error as NodeJS.ErrnoException;
+      },
+      processGroupFallback: "nonmissing",
+      useWindowsTaskkill: false,
+    },
+  );
 }
 
 const POSIX_TIMEOUT_WRAPPER = String.raw`
@@ -81,6 +108,8 @@ const { spawn } = require("node:child_process");
 const { readFileSync, writeSync } = require("node:fs");
 
 const payload = JSON.parse(readFileSync(0, "utf8"));
+const writeControl = (prefix, value) =>
+  writeSync(payload.controlFd, payload.controlPrefix + prefix + value + "\n");
 const child = spawn(payload.command, payload.args, {
   cwd: payload.cwd,
   detached: true,
@@ -88,16 +117,20 @@ const child = spawn(payload.command, payload.args, {
   shell: payload.shell,
   stdio: ["pipe", "pipe", "pipe"],
 });
-writeSync(
-  3,
-  ${JSON.stringify(HOST_COMMAND_CHILD_PID_PREFIX)} + JSON.stringify({
+writeControl(
+  ${JSON.stringify(HOST_COMMAND_CHILD_PID_PREFIX)},
+  JSON.stringify({
     pid: child.pid || null,
-  }) + "\n",
+  }),
 );
 
 let timedOut = false;
-let killTimer;
+let killDeadlineAt = 0;
+let timedOutCleanupStarted = false;
 let outputExceeded = false;
+let forwardedSignal;
+let forwardedSignalKillTimer;
+let forwardedSignalPostForceTimer;
 let stderrBytes = 0;
 let stdoutBytes = 0;
 
@@ -114,11 +147,120 @@ function signalGroup(signal) {
   }
   try {
     process.kill(-child.pid, signal);
+    return;
   } catch (error) {
-    if (error && error.code !== "ESRCH") {
-      process.stderr.write("failed to send " + signal + " to timed host command process " + child.pid + ": " + (error.code || String(error)) + "\n");
+    if (error && error.code === "ESRCH") {
+      return;
+    }
+    try {
+      process.kill(child.pid, signal);
+    } catch (fallbackError) {
+      if (!fallbackError || fallbackError.code !== "ESRCH") {
+        process.stderr.write("failed to send " + signal + " to host command process " + child.pid + ": group " + ((error && error.code) || String(error)) + ", leader " + ((fallbackError && fallbackError.code) || String(fallbackError)) + "\n");
+      }
     }
   }
+}
+
+function groupAlive() {
+  if (!child.pid) {
+    return false;
+  }
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    if (!error || error.code !== "EPERM") {
+      return false;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return false;
+    }
+    try {
+      process.kill(child.pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function finishTimedOut() {
+  writeControl(${JSON.stringify(HOST_COMMAND_TIMEOUT_PREFIX)}, "{}");
+  process.exit(124);
+}
+
+function finishTimedOutAfterCleanup() {
+  if (timedOutCleanupStarted) {
+    return;
+  }
+  timedOutCleanupStarted = true;
+  if (!groupAlive()) {
+    finishTimedOut();
+    return;
+  }
+  const pollMs = Math.max(1, Math.min(25, payload.timeoutKillGraceMs));
+  let pollTimer;
+  let forceFinishTimer;
+  let postForceFinishTimer;
+  const finish = () => {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+    }
+    if (forceFinishTimer) {
+      clearTimeout(forceFinishTimer);
+    }
+    if (postForceFinishTimer) {
+      clearTimeout(postForceFinishTimer);
+    }
+    finishTimedOut();
+  };
+  pollTimer = setInterval(() => {
+    if (!groupAlive()) {
+      finish();
+    }
+  }, pollMs);
+  forceFinishTimer = setTimeout(() => {
+    signalGroup("SIGKILL");
+    postForceFinishTimer = setTimeout(finish, pollMs);
+  }, Math.max(0, killDeadlineAt - Date.now()));
+}
+
+function finishForwardedSignal() {
+  if (!forwardedSignal) {
+    return;
+  }
+  if (forwardedSignalKillTimer) {
+    clearTimeout(forwardedSignalKillTimer);
+  }
+  if (forwardedSignalPostForceTimer) {
+    clearTimeout(forwardedSignalPostForceTimer);
+  }
+  process.kill(process.pid, forwardedSignal);
+}
+
+function finishForwardedSignalAfterCleanup() {
+  if (!forwardedSignal) {
+    return;
+  }
+  if (!groupAlive()) {
+    finishForwardedSignal();
+    return;
+  }
+  if (forwardedSignalKillTimer) {
+    return;
+  }
+  forwardedSignalKillTimer = setTimeout(() => {
+    if (groupAlive()) {
+      signalGroup("SIGKILL");
+      forwardedSignalPostForceTimer = setTimeout(
+        finishForwardedSignal,
+        Math.max(1, Math.min(25, payload.timeoutKillGraceMs)),
+      );
+    } else {
+      finishForwardedSignal();
+    }
+  }, payload.timeoutKillGraceMs);
 }
 
 function forwardBounded(stream, chunk) {
@@ -151,16 +293,17 @@ function forwardBounded(stream, chunk) {
 
 for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
   process.once(signal, () => {
+    forwardedSignal ||= signal;
     signalGroup(signal);
-    process.kill(process.pid, signal);
+    finishForwardedSignalAfterCleanup();
   });
 }
 
 const timeout = setTimeout(() => {
   timedOut = true;
   signalGroup("SIGTERM");
-  killTimer = setTimeout(() => signalGroup("SIGKILL"), 100);
-  killTimer.unref();
+  killDeadlineAt = Date.now() + payload.timeoutKillGraceMs;
+  finishTimedOutAfterCleanup();
 }, payload.timeoutMs);
 timeout.unref();
 
@@ -173,28 +316,25 @@ child.stdin.on("error", (error) => {
 });
 child.on("error", (error) => {
   clearTimeout(timeout);
-  if (killTimer) {
-    clearTimeout(killTimer);
-  }
-  writeSync(
-    3,
-    ${JSON.stringify(HOST_COMMAND_SPAWN_ERROR_PREFIX)} + JSON.stringify({
+  writeControl(
+    ${JSON.stringify(HOST_COMMAND_SPAWN_ERROR_PREFIX)},
+    JSON.stringify({
       code: error.code || null,
       message: error.message,
-    }) + "\n",
+    }),
   );
   process.stderr.write(error.message + "\n");
   process.exit(127);
 });
 child.on("close", (code, signal) => {
   clearTimeout(timeout);
-  if (killTimer) {
-    clearTimeout(killTimer);
+  if (forwardedSignal) {
+    finishForwardedSignalAfterCleanup();
+    return;
   }
   if (timedOut) {
-    signalGroup("SIGKILL");
-    writeSync(3, ${JSON.stringify(HOST_COMMAND_TIMEOUT_PREFIX)} + "{}\n");
-    process.exit(124);
+    finishTimedOutAfterCleanup();
+    return;
   }
   if (outputExceeded) {
     process.exit(1);
@@ -225,9 +365,12 @@ function isBareCommand(command: string, name: "npm" | "pnpm"): boolean {
   return portableBasename(command) === command && command.toLowerCase() === name;
 }
 
-function resolveEnvValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
-  return key === undefined ? undefined : env[key];
+function resolveHostCommandTimeoutMs(timeoutMs: number): number {
+  return clampTimerTimeoutMs(timeoutMs) ?? 1;
+}
+
+function resolveOptionalHostCommandTimeoutMs(timeoutMs: number | undefined): number | undefined {
+  return timeoutMs === undefined ? undefined : resolveHostCommandTimeoutMs(timeoutMs);
 }
 
 export function resolveHostCommandInvocation(
@@ -237,11 +380,12 @@ export function resolveHostCommandInvocation(
 ): HostCommandInvocation {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
-  const comSpec = options.comSpec ?? resolveEnvValue(env, "ComSpec") ?? "cmd.exe";
+  const comSpec = options.comSpec ?? resolveWindowsCmdExePath(env);
 
   if (isBareCommand(command, "pnpm")) {
     const runner = resolvePnpmRunner({
       comSpec,
+      env,
       npmExecPath: env.npm_execpath,
       nodeExecPath: options.execPath ?? process.execPath,
       platform,
@@ -278,26 +422,43 @@ export function resolveHostCommandInvocation(
 export function run(command: string, args: string[], options: RunOptions = {}): CommandResult {
   const env = { ...process.env, ...options.env };
   const invocation = resolveHostCommandInvocation(command, args, { env });
-  const usesPosixTimedWrapper = process.platform !== "win32" && options.timeoutMs !== undefined;
+  const timeoutMs = resolveOptionalHostCommandTimeoutMs(options.timeoutMs);
+  const usesPosixTimedWrapper = process.platform !== "win32" && timeoutMs !== undefined;
+  const timedResult = usesPosixTimedWrapper
+    ? runPosixTimedCommandSync(invocation, env, options, timeoutMs)
+    : undefined;
   const result =
-    usesPosixTimedWrapper
-      ? runPosixTimedCommandSync(invocation, env, options)
-      : spawnSync(invocation.command, invocation.args, {
-          cwd: options.cwd ?? repoRoot,
-          encoding: "utf8",
-          env: invocation.env ?? env,
-          input: options.input,
-          killSignal: "SIGKILL",
-          maxBuffer: HOST_COMMAND_MAX_BUFFER_BYTES,
-          stdio: options.quiet ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
-          shell: invocation.shell,
-          timeout: options.timeoutMs,
-          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-        });
+    timedResult?.result ??
+    spawnSync(invocation.command, invocation.args, {
+      cwd: options.cwd ?? repoRoot,
+      encoding: "utf8",
+      env: invocation.env ?? env,
+      input: options.input,
+      killSignal: "SIGKILL",
+      maxBuffer: HOST_COMMAND_MAX_BUFFER_BYTES,
+      stdio: options.quiet ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+      shell: invocation.shell,
+      timeout: timeoutMs,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    });
 
   let wrapperTimedOut = false;
+  let commandStderr = result.stderr ?? "";
   if (usesPosixTimedWrapper) {
-    const wrapperControl = typeof result.output[3] === "string" ? result.output[3] : "";
+    let wrapperControl = typeof result.output[3] === "string" ? result.output[3] : "";
+    if (timedResult?.controlPrefix) {
+      const controlLines: string[] = [];
+      const stderrLines: string[] = [];
+      for (const line of commandStderr.split("\n")) {
+        if (line.startsWith(timedResult.controlPrefix)) {
+          controlLines.push(line.slice(timedResult.controlPrefix.length));
+        } else {
+          stderrLines.push(line);
+        }
+      }
+      wrapperControl = controlLines.join("\n");
+      commandStderr = stderrLines.join("\n");
+    }
     const outerWrapperTimedOut =
       (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
     if (outerWrapperTimedOut) {
@@ -313,7 +474,7 @@ export function run(command: string, args: string[], options: RunOptions = {}): 
     wrapperTimedOut || (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
   if (wrapperTimedOut && options.check !== false) {
     const error = new Error(
-      `${command} ${args.join(" ")} timed out after ${options.timeoutMs}ms`,
+      `${command} ${args.join(" ")} timed out after ${timeoutMs}ms`,
     ) as NodeJS.ErrnoException;
     error.code = "ETIMEDOUT";
     throw error;
@@ -324,7 +485,7 @@ export function run(command: string, args: string[], options: RunOptions = {}): 
 
   const status = timedOut ? 124 : (result.status ?? (result.signal ? 128 : 1));
   const commandResult = {
-    stderr: result.stderr ?? "",
+    stderr: commandStderr,
     stdout: result.stdout ?? "",
     status,
   };
@@ -387,131 +548,42 @@ function runPosixTimedCommandSync(
   invocation: HostCommandInvocation,
   env: NodeJS.ProcessEnv,
   options: RunOptions,
-): SpawnSyncReturns<string> {
+  timeoutMs: number,
+): { controlPrefix: string; result: SpawnSyncReturns<string> } {
+  const wrapperTimeoutMs = addTimerTimeoutGraceMs(timeoutMs, HOST_COMMAND_WRAPPER_BACKSTOP_MS) ?? 1;
+  // oxlint-disable-next-line no-warning-comments -- remove after the upstream Bun stdio fix ships.
+  // TODO(bun): Bun omits extra stdio pipe output from spawnSync results. Use a
+  // nonce-prefixed stderr control channel until it exposes fd 3 like Node.
+  const controlPrefix = process.versions.bun
+    ? `__OPENCLAW_HOST_COMMAND_CONTROL_${randomUUID()}__`
+    : "";
   const payload = JSON.stringify({
     args: invocation.args,
     command: invocation.command,
+    controlFd: controlPrefix ? 2 : 3,
+    controlPrefix,
     cwd: options.cwd ?? repoRoot,
     env: invocation.env ?? env,
     input: options.input,
     maxBufferBytes: HOST_COMMAND_MAX_BUFFER_BYTES,
     shell: invocation.shell,
-    timeoutMs: options.timeoutMs,
+    timeoutKillGraceMs: HOST_COMMAND_TIMEOUT_KILL_GRACE_MS,
+    timeoutMs,
   });
-  return spawnSync(process.execPath, ["-e", POSIX_TIMEOUT_WRAPPER], {
+  const wrapperExecPath = process.versions.bun ? "node" : process.execPath;
+  const result = spawnSync(wrapperExecPath, ["-e", POSIX_TIMEOUT_WRAPPER], {
     cwd: options.cwd ?? repoRoot,
     encoding: "utf8",
     env,
     input: payload,
     killSignal: "SIGKILL",
     maxBuffer: HOST_COMMAND_MAX_BUFFER_BYTES * 2 + HOST_COMMAND_WRAPPER_EXTRA_BUFFER_BYTES,
-    stdio: ["pipe", "pipe", "pipe", "pipe"],
-    timeout: (options.timeoutMs ?? 0) + HOST_COMMAND_WRAPPER_BACKSTOP_MS,
+    stdio: controlPrefix ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "pipe"],
+    timeout: wrapperTimeoutMs,
   });
+  return { controlPrefix, result };
 }
 
 export function sh(script: string, options: RunOptions = {}): CommandResult {
   return run("bash", ["-lc", script], options);
-}
-
-export async function runStreaming(
-  command: string,
-  args: string[],
-  options: RunOptions & { logPath?: string } = {},
-): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const env = { ...process.env, ...options.env };
-    const invocation = resolveHostCommandInvocation(command, args, { env });
-    const child = spawn(invocation.command, invocation.args, {
-      cwd: options.cwd ?? repoRoot,
-      detached: process.platform !== "win32" && options.timeoutMs != null,
-      env: invocation.env ?? env,
-      shell: invocation.shell,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-    } satisfies SpawnOptions);
-    const childPid = child.pid;
-    const parentSignalHandlers = new Map<NodeJS.Signals, () => void>();
-    const removeParentSignalHandlers = (): void => {
-      for (const [signal, handler] of parentSignalHandlers) {
-        process.off(signal, handler);
-      }
-      parentSignalHandlers.clear();
-    };
-    if (process.platform !== "win32" && options.timeoutMs != null) {
-      for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"] as const) {
-        const handler = (): void => {
-          signalHostCommandProcess(childPid, signal);
-          removeParentSignalHandlers();
-          process.kill(process.pid, signal);
-        };
-        parentSignalHandlers.set(signal, handler);
-        process.once(signal, handler);
-      }
-    }
-
-    let log = "";
-    const append = (chunk: Buffer): void => {
-      const text = chunk.toString("utf8");
-      log += text;
-      if (!options.quiet) {
-        process.stdout.write(text);
-      }
-    };
-    child.stdout?.on("data", append);
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      log += text;
-      if (!options.quiet) {
-        process.stderr.write(text);
-      }
-    });
-    if (options.input != null) {
-      child.stdin?.end(options.input);
-    } else {
-      child.stdin?.end();
-    }
-
-    let timedOut = false;
-    let killTimer: NodeJS.Timeout | undefined;
-    const timer =
-      options.timeoutMs == null
-        ? undefined
-        : setTimeout(() => {
-            timedOut = true;
-            signalHostCommandProcess(childPid, "SIGTERM");
-            killTimer = setTimeout(() => signalHostCommandProcess(childPid, "SIGKILL"), 2_000);
-            killTimer.unref();
-          }, options.timeoutMs);
-
-    child.on("error", (error) => {
-      if (killTimer) {
-        clearTimeout(killTimer);
-      }
-      removeParentSignalHandlers();
-      reject(error);
-    });
-    child.on("close", (code, signal) => {
-      void (async () => {
-        if (timer) {
-          clearTimeout(timer);
-        }
-        if (killTimer) {
-          clearTimeout(killTimer);
-        }
-        removeParentSignalHandlers();
-        if (timedOut) {
-          signalHostCommandProcess(childPid, "SIGKILL");
-        }
-        if (options.logPath) {
-          await writeFile(options.logPath, log, "utf8");
-        }
-        if (timedOut) {
-          resolve(124);
-        } else {
-          resolve(code ?? (signal ? 128 : 1));
-        }
-      })();
-    });
-  });
 }

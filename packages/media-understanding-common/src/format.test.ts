@@ -1,40 +1,11 @@
+// Media Understanding Common tests cover format behavior.
 import { describe, expect, it } from "vitest";
 import { formatMediaUnderstandingBody } from "./format.js";
 
 describe("formatMediaUnderstandingBody", () => {
-  it("replaces placeholder body with transcript", () => {
-    const body = formatMediaUnderstandingBody({
-      body: "<media:audio>",
-      outputs: [
-        {
-          kind: "audio.transcription",
-          attachmentIndex: 0,
-          text: "hello world",
-          provider: "groq",
-        },
-      ],
-    });
-    expect(body).toBe("[Audio]\nTranscript:\nhello world");
-  });
-
   it("includes user text when body is meaningful", () => {
     const body = formatMediaUnderstandingBody({
       body: "caption here",
-      outputs: [
-        {
-          kind: "audio.transcription",
-          attachmentIndex: 0,
-          text: "transcribed",
-          provider: "groq",
-        },
-      ],
-    });
-    expect(body).toBe("[Audio]\nUser text:\ncaption here\nTranscript:\ntranscribed");
-  });
-
-  it("strips leading media placeholders from user text", () => {
-    const body = formatMediaUnderstandingBody({
-      body: "<media:audio> caption here",
       outputs: [
         {
           kind: "audio.transcription",
@@ -76,7 +47,6 @@ describe("formatMediaUnderstandingBody", () => {
 
   it("formats image outputs", () => {
     const body = formatMediaUnderstandingBody({
-      body: "<media:image>",
       outputs: [
         {
           kind: "image.description",

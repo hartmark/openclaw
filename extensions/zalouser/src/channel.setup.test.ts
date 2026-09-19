@@ -1,3 +1,4 @@
+// Zalouser tests cover channel.setup plugin behavior.
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,10 @@ import { zalouserSetupPlugin } from "./setup-test-helpers.js";
 const zalouserSetupGetStatus = createPluginSetupWizardStatus(zalouserSetupPlugin);
 
 describe("zalouser setup plugin", () => {
+  it("exposes config-promotion declarations on the setup adapter", () => {
+    expect(zalouserSetupPlugin.setupContract.singleAccountKeysToMove).toEqual([]);
+  });
+
   it("builds setup status without an initialized runtime", async () => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-zalouser-setup-"));
 

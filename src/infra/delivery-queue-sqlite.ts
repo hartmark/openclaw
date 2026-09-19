@@ -1,239 +1,208 @@
-import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
-import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+// Stores durable delivery queue entries through their connection-bound owner.
+import { withExistingOpenClawStateDatabaseArtifactPreservingReadOnlyAsync } from "../state/openclaw-state-db-readonly.js";
 import {
-  executeSqliteQuerySync,
-  executeSqliteQueryTakeFirstSync,
-  getNodeSqliteKysely,
-} from "./kysely-sync.js";
+  openOpenClawStateDatabase,
+  runOpenClawStateWriteTransaction,
+} from "../state/openclaw-state-db.js";
+import {
+  loadDeliveryQueueEntryInDatabase,
+  type DeliveryQueueReadMode,
+  type UpsertDeliveryQueueEntryParams,
+} from "./delivery-queue-sqlite-bound.js";
+import {
+  countPendingDeliveryQueueEntriesInDatabase,
+  deleteDeliveryQueueEntryInDatabase,
+  getDeliveryQueueEntryOwnersInDatabase,
+  loadDeliveryQueueEntriesInDatabase,
+  prepareDeliveryQueueTerminalEntry,
+  pruneExpiredDeliveryQueueTombstonesInDatabase,
+  reserveDeliveryQueueEntryAttemptInDatabase,
+  terminalizePendingDeliveryQueueEntryInDatabase,
+  updateDeliveryQueueEntryInDatabase,
+  upsertDeliveryQueueEntryInDatabase,
+  type DeliveryQueueStoredStatus,
+  type ReserveDeliveryQueueAttemptResult,
+  type TerminalizePendingDeliveryQueueEntryParams,
+  type TerminalizePendingDeliveryQueueEntryResult,
+} from "./delivery-queue-sqlite.kernel.js";
+import type { DeliveryQueueEntryState } from "./delivery-queue-sqlite.types.js";
+import {
+  resolveDeliveryQueueStateEnv,
+  type DeliveryQueueStateContext,
+} from "./delivery-queue-state-context.js";
+import { executeDeliveryQueueOperation } from "./delivery-queue-worker-store.js";
 
-type QueueStatus = "pending" | "failed";
-type DeliveryQueueDatabase = Pick<OpenClawStateKyselyDatabase, "delivery_queue_entries">;
+export type {
+  DeliveryQueueCompletionRetention,
+  DeliveryQueueEntryState,
+} from "./delivery-queue-sqlite.types.js";
 
-export type DeliveryQueueRowMetadata = {
-  entryKind?: string;
-  sessionKey?: string;
-  channel?: string;
-  target?: string;
-  accountId?: string;
-};
+export {
+  captureDeliveryQueueStateContext,
+  resolveDeliveryQueueStateEnv,
+  type DeliveryQueueStateContext,
+} from "./delivery-queue-state-context.js";
 
-export type DeliveryQueueEntryState = {
-  id: string;
-  enqueuedAt: number;
-  retryCount: number;
-  lastAttemptAt?: number;
-  lastError?: string;
-  platformSendStartedAt?: number;
-  recoveryState?: string;
-};
-
-type QueueRow = {
-  id: string;
-  entry_json: string;
-  enqueued_at: number | bigint;
-  retry_count: number | bigint;
-  last_attempt_at: number | bigint | null;
-  last_error: string | null;
-  platform_send_started_at: number | bigint | null;
-  recovery_state: string | null;
-};
-
-function openStateDatabase(stateDir?: string) {
+function openStateDatabase(stateDir?: string, context?: DeliveryQueueStateContext) {
   return openOpenClawStateDatabase({
-    env: stateDir ? { ...process.env, OPENCLAW_STATE_DIR: stateDir } : process.env,
+    env: resolveDeliveryQueueStateEnv(stateDir, context),
   });
 }
 
-function enoent(queueName: string, id: string): Error & { code: string } {
-  const err = new Error(`No pending ${queueName} delivery queue entry ${id}`) as Error & {
-    code: string;
-  };
-  err.code = "ENOENT";
-  return err;
+/** Insert or replace a delivery queue entry under a queue namespace. */
+export function upsertDeliveryQueueEntry(
+  params: UpsertDeliveryQueueEntryParams,
+  context?: DeliveryQueueStateContext,
+): boolean {
+  return upsertDeliveryQueueEntryInDatabase(params, openStateDatabase(params.stateDir, context));
 }
 
-function inflate(row: QueueRow): DeliveryQueueEntryState {
-  return {
-    ...(JSON.parse(row.entry_json) as DeliveryQueueEntryState),
-    id: row.id,
-    enqueuedAt: Number(row.enqueued_at),
-    retryCount: Number(row.retry_count),
-    ...(row.last_attempt_at == null ? {} : { lastAttemptAt: Number(row.last_attempt_at) }),
-    ...(row.last_error == null ? {} : { lastError: row.last_error }),
-    ...(row.platform_send_started_at == null
-      ? {}
-      : { platformSendStartedAt: Number(row.platform_send_started_at) }),
-    ...(row.recovery_state == null ? {} : { recoveryState: row.recovery_state }),
-  };
-}
-
-function metadata(entry: DeliveryQueueEntryState): DeliveryQueueRowMetadata {
-  const item = entry as DeliveryQueueEntryState & {
-    kind?: string;
-    sessionKey?: string;
-    channel?: string;
-    to?: string;
-    accountId?: string;
-    session?: { key?: string };
-    route?: { channel?: string; to?: string; accountId?: string };
-    deliveryContext?: { channel?: string; to?: string; accountId?: string };
-  };
-  return {
-    entryKind: item.kind,
-    sessionKey: item.sessionKey ?? item.session?.key,
-    channel: item.channel ?? item.route?.channel ?? item.deliveryContext?.channel,
-    target: item.to ?? item.route?.to ?? item.deliveryContext?.to,
-    accountId: item.accountId ?? item.route?.accountId ?? item.deliveryContext?.accountId,
-  };
-}
-
-export function upsertDeliveryQueueEntry(params: {
-  queueName: string;
-  entry: DeliveryQueueEntryState;
-  metadata?: DeliveryQueueRowMetadata;
-  status?: QueueStatus;
-  stateDir?: string;
-}): void {
-  const now = Date.now();
-  const status = params.status ?? "pending";
-  const meta = params.metadata ?? metadata(params.entry);
-  const database = openStateDatabase(params.stateDir);
-  const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
-  executeSqliteQuerySync(
-    database.db,
-    queueDb
-      .insertInto("delivery_queue_entries")
-      .values({
-        queue_name: params.queueName,
-        id: params.entry.id,
-        status,
-        entry_kind: meta.entryKind ?? null,
-        session_key: meta.sessionKey ?? null,
-        channel: meta.channel ?? null,
-        target: meta.target ?? null,
-        account_id: meta.accountId ?? null,
-        retry_count: params.entry.retryCount,
-        last_attempt_at: params.entry.lastAttemptAt ?? null,
-        last_error: params.entry.lastError ?? null,
-        recovery_state: params.entry.recoveryState ?? null,
-        platform_send_started_at: params.entry.platformSendStartedAt ?? null,
-        entry_json: JSON.stringify(params.entry),
-        enqueued_at: params.entry.enqueuedAt,
-        updated_at: now,
-        failed_at: status === "failed" ? now : null,
-      })
-      .onConflict((conflict) =>
-        conflict.columns(["queue_name", "id"]).doUpdateSet({
-          status: (eb) => eb.ref("excluded.status"),
-          entry_kind: (eb) => eb.ref("excluded.entry_kind"),
-          session_key: (eb) => eb.ref("excluded.session_key"),
-          channel: (eb) => eb.ref("excluded.channel"),
-          target: (eb) => eb.ref("excluded.target"),
-          account_id: (eb) => eb.ref("excluded.account_id"),
-          retry_count: (eb) => eb.ref("excluded.retry_count"),
-          last_attempt_at: (eb) => eb.ref("excluded.last_attempt_at"),
-          last_error: (eb) => eb.ref("excluded.last_error"),
-          recovery_state: (eb) => eb.ref("excluded.recovery_state"),
-          platform_send_started_at: (eb) => eb.ref("excluded.platform_send_started_at"),
-          entry_json: (eb) => eb.ref("excluded.entry_json"),
-          enqueued_at: (eb) => eb.ref("excluded.enqueued_at"),
-          updated_at: (eb) => eb.ref("excluded.updated_at"),
-          failed_at: (eb) => eb.ref("excluded.failed_at"),
-        }),
-      ),
-  );
-}
-
+/** Load a single pending delivery queue entry. */
 export function loadDeliveryQueueEntry(
   queueName: string,
   id: string,
   stateDir?: string,
+  mode: DeliveryQueueReadMode = "pending",
+  context?: DeliveryQueueStateContext,
 ): DeliveryQueueEntryState | null {
-  const database = openStateDatabase(stateDir);
-  const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
-  const row = executeSqliteQueryTakeFirstSync(
-    database.db,
-    queueDb
-      .selectFrom("delivery_queue_entries")
-      .select([
-        "id",
-        "entry_json",
-        "enqueued_at",
-        "retry_count",
-        "last_attempt_at",
-        "last_error",
-        "platform_send_started_at",
-        "recovery_state",
-      ])
-      .where("queue_name", "=", queueName)
-      .where("id", "=", id)
-      .where("status", "=", "pending"),
-  ) as QueueRow | undefined;
-  return row ? inflate(row) : null;
-}
-
-export function loadDeliveryQueueEntries(
-  queueName: string,
-  stateDir?: string,
-): DeliveryQueueEntryState[] {
-  const database = openStateDatabase(stateDir);
-  const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
-  const rows = executeSqliteQuerySync(
-    database.db,
-    queueDb
-      .selectFrom("delivery_queue_entries")
-      .select([
-        "id",
-        "entry_json",
-        "enqueued_at",
-        "retry_count",
-        "last_attempt_at",
-        "last_error",
-        "platform_send_started_at",
-        "recovery_state",
-      ])
-      .where("queue_name", "=", queueName)
-      .where("status", "=", "pending")
-      .orderBy("enqueued_at", "asc")
-      .orderBy("id", "asc"),
-  ).rows as QueueRow[];
-  return rows.map(inflate);
-}
-
-export function deleteDeliveryQueueEntry(queueName: string, id: string, stateDir?: string): void {
-  const database = openStateDatabase(stateDir);
-  const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
-  executeSqliteQuerySync(
-    database.db,
-    queueDb
-      .deleteFrom("delivery_queue_entries")
-      .where("queue_name", "=", queueName)
-      .where("id", "=", id)
-      .where("status", "=", "pending"),
+  return loadDeliveryQueueEntryInDatabase(
+    openStateDatabase(stateDir, context),
+    queueName,
+    id,
+    mode,
   );
 }
 
+/** Read row status without hiding dead-lettered entries. */
+export function getDeliveryQueueEntryStatus(
+  queueName: string,
+  id: string,
+  stateDir?: string,
+): DeliveryQueueStoredStatus | undefined {
+  return getDeliveryQueueEntryOwners([queueName], id, stateDir).get(queueName)?.status;
+}
+
+/** Read one exact ID across physical namespaces from a single ownership snapshot. */
+export function getDeliveryQueueEntryOwners(
+  queueNames: readonly string[],
+  id: string,
+  stateDir?: string,
+  context?: DeliveryQueueStateContext,
+): Map<string, { status: DeliveryQueueStoredStatus; settlementPending?: true }> {
+  if (queueNames.length === 0) {
+    return new Map();
+  }
+  return getDeliveryQueueEntryOwnersInDatabase(
+    openStateDatabase(stateDir, context),
+    queueNames,
+    id,
+  );
+}
+
+/** Load all pending entries for a queue namespace in database order. */
+export function loadDeliveryQueueEntries(
+  queueName: string,
+  stateDir?: string,
+  mode: DeliveryQueueReadMode = "pending",
+  context?: DeliveryQueueStateContext,
+): DeliveryQueueEntryState[] {
+  return loadDeliveryQueueEntriesInDatabase(openStateDatabase(stateDir, context), queueName, mode);
+}
+
+/** Delete a pending delivery queue entry after successful delivery. */
+export function deleteDeliveryQueueEntry(
+  queueName: string,
+  id: string,
+  stateDir?: string,
+  context?: DeliveryQueueStateContext,
+): void {
+  deleteDeliveryQueueEntryInDatabase(openStateDatabase(stateDir, context), queueName, id);
+}
+
+/** Load, transform, and persist a pending delivery queue entry. */
 export function updateDeliveryQueueEntry(
   queueName: string,
   id: string,
   stateDir: string | undefined,
   update: (entry: DeliveryQueueEntryState) => DeliveryQueueEntryState,
+  context?: DeliveryQueueStateContext,
 ): void {
-  const current = loadDeliveryQueueEntry(queueName, id, stateDir);
-  if (!current) {
-    throw enoent(queueName, id);
-  }
-  upsertDeliveryQueueEntry({ queueName, entry: update(current), stateDir });
+  updateDeliveryQueueEntryInDatabase(openStateDatabase(stateDir, context), queueName, id, update);
 }
 
-export function moveDeliveryQueueEntryToFailed(
-  queueName: string,
-  id: string,
-  stateDir?: string,
-): void {
-  const current = loadDeliveryQueueEntry(queueName, id, stateDir);
-  if (!current) {
-    throw enoent(queueName, id);
+/** Atomically reserve one provider-delivery call before executing it. */
+export function reserveDeliveryQueueEntryAttempt(
+  params: {
+    queueName: string;
+    id: string;
+    maxAttempts: number;
+    stateDir?: string;
+    expectedPlatformSendAttemptId?: string;
+  },
+  context?: DeliveryQueueStateContext,
+): ReserveDeliveryQueueAttemptResult {
+  if (!Number.isInteger(params.maxAttempts) || params.maxAttempts <= 0) {
+    throw new Error(`Invalid delivery attempt budget: ${params.maxAttempts}`);
   }
-  upsertDeliveryQueueEntry({ queueName, entry: current, status: "failed", stateDir });
+  return runOpenClawStateWriteTransaction(
+    (database) => reserveDeliveryQueueEntryAttemptInDatabase(database, params),
+    {
+      env: resolveDeliveryQueueStateEnv(params.stateDir, context),
+    },
+    {
+      operationLabel: `reserve ${params.queueName} delivery attempt`,
+    },
+  );
+}
+
+/** Count dead-lettered entries per queue namespace for coarse health reporting. */
+export async function countFailedDeliveryQueueEntries(
+  stateDir?: string,
+  context?: DeliveryQueueStateContext,
+): Promise<Array<{ queueName: string; count: number; oldestFailedAt?: number }>> {
+  return executeDeliveryQueueOperation(context, stateDir, {
+    type: "deliveryQueue.countFailed",
+    input: undefined,
+  });
+}
+
+/** Count pending entries across an exact set of queue namespaces. */
+export function countPendingDeliveryQueueEntries(
+  queueNames: readonly string[],
+  stateDir?: string,
+): number {
+  if (queueNames.length === 0) {
+    return 0;
+  }
+  return countPendingDeliveryQueueEntriesInDatabase(openStateDatabase(stateDir), queueNames);
+}
+
+/** Inventory retired custody without opening a writer or creating state. */
+export async function countPendingDeliveryQueueEntriesReadOnly(
+  queueNames: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<number> {
+  return (
+    (await withExistingOpenClawStateDatabaseArtifactPreservingReadOnlyAsync(
+      (database) => countPendingDeliveryQueueEntriesInDatabase(database, queueNames),
+      { env },
+    )) ?? 0
+  );
+}
+
+/** Physically expire age-bounded delivery queue tombstones. */
+export function pruneExpiredDeliveryQueueTombstones(stateDir?: string): void {
+  pruneExpiredDeliveryQueueTombstonesInDatabase(openStateDatabase(stateDir));
+}
+
+/** Atomically delete or tombstone a pending row only while its value is unchanged. */
+export function terminalizePendingDeliveryQueueEntry(
+  params: TerminalizePendingDeliveryQueueEntryParams & { stateDir?: string },
+  context?: DeliveryQueueStateContext,
+): TerminalizePendingDeliveryQueueEntryResult {
+  const prepared = prepareDeliveryQueueTerminalEntry(params);
+  return terminalizePendingDeliveryQueueEntryInDatabase(
+    openStateDatabase(params.stateDir, context),
+    prepared,
+  );
 }

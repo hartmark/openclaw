@@ -1,16 +1,21 @@
-import fs from "node:fs";
+// Loads dotenv files while blocking unsafe workspace env keys.
 import path from "node:path";
-import dotenv from "dotenv";
-import { createSubsystemLogger } from "../logging/subsystem.js";
-import { listKnownProviderAuthEnvVarNames } from "../secrets/provider-env-vars.js";
-import { loadGlobalRuntimeDotEnvFiles } from "./dotenv-global.js";
+import {
+  listKnownProviderAuthEnvVarNamesCore,
+  listKnownProviderAuthEnvVarNamesAsync,
+} from "../secrets/provider-env-vars.js";
+import {
+  loadGlobalRuntimeDotEnvFiles,
+  loadGlobalRuntimeDotEnvFilesAsync,
+  readDotEnvFile,
+  readDotEnvFileAsync,
+} from "./dotenv-global.js";
 import {
   isDangerousHostEnvOverrideVarName,
   isDangerousHostEnvVarName,
   normalizeEnvVarKey,
 } from "./host-env-security.js";
-
-const logger = createSubsystemLogger("infra:dotenv");
+import { tryProcessCwd } from "./safe-cwd.js";
 
 const BLOCKED_PROVIDER_AUTH_WORKSPACE_DOTENV_KEYS = [
   "AI_GATEWAY_API_KEY",
@@ -61,6 +66,7 @@ const BLOCKED_PROVIDER_AUTH_WORKSPACE_DOTENV_KEYS = [
   "MINIMAX_CODING_API_KEY",
   "MINIMAX_OAUTH_TOKEN",
   "MISTRAL_API_KEY",
+  "MODEL_API_KEY",
   "MODELSTUDIO_API_KEY",
   "MOONSHOT_API_KEY",
   "NVIDIA_API_KEY",
@@ -72,6 +78,7 @@ const BLOCKED_PROVIDER_AUTH_WORKSPACE_DOTENV_KEYS = [
   "PERPLEXITY_API_KEY",
   "QIANFAN_API_KEY",
   "QWEN_API_KEY",
+  "QWEN_TOKEN_PLAN_API_KEY",
   "RUNWAY_API_KEY",
   "RUNWAYML_API_SECRET",
   "SENSEAUDIO_API_KEY",
@@ -83,6 +90,7 @@ const BLOCKED_PROVIDER_AUTH_WORKSPACE_DOTENV_KEYS = [
   "TAVILY_API_KEY",
   "TOGETHER_API_KEY",
   "TOKENHUB_API_KEY",
+  "TOKENPLAN_API_KEY",
   "VENICE_API_KEY",
   "VLLM_API_KEY",
   "VOLCANO_ENGINE_API_KEY",
@@ -106,20 +114,25 @@ const BLOCKED_WORKSPACE_DOTENV_KEYS = new Set([
   "CLAWHUB_CONFIG_PATH",
   "CLAWHUB_TOKEN",
   "CLAWHUB_URL",
-  "CLOUDSDK_PYTHON",
   "COMSPEC",
+  "DISCORD_API_URL",
   "HTTP_PROXY",
   "HTTPS_PROXY",
   "HOMEBREW_BREW_FILE",
+  "HOMEBREW_CURL_PATH",
+  "HOMEBREW_GIT_PATH",
   "HOMEBREW_PREFIX",
   "IRC_HOST",
+  "APPDATA",
   "LOCALAPPDATA",
   "MATTERMOST_URL",
   "MATRIX_HOMESERVER",
   "MINIMAX_API_HOST",
   "NODE_TLS_REJECT_UNAUTHORIZED",
   "NO_PROXY",
+  "NPM_CONFIG_PREFIX",
   "NPM_EXECPATH",
+  "PNPM_HOME",
   "OPENAI_API_KEYS",
   "OPENCLAW_AGENT_DIR",
   "OPENCLAW_ALLOW_PLUGIN_INSTALL_OVERRIDES",
@@ -168,23 +181,65 @@ const BLOCKED_WORKSPACE_DOTENV_KEYS = new Set([
   "PROGRAMFILES(X86)",
   "PROGRAMW6432",
   "STATE_DIRECTORY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_ACCOUNT_ID",
+  "AWS_ACCOUNT_ID_ENDPOINT_MODE",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "AWS_BEDROCK_SKIP_AUTH",
+  "AWS_CONFIG_FILE",
+  "AWS_CREDENTIAL_EXPIRATION",
+  "AWS_CREDENTIAL_SCOPE",
+  "AWS_EC2_METADATA_DISABLED",
+  "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+  "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+  "AWS_EC2_METADATA_V1_DISABLED",
+  "AWS_ENDPOINT_URL",
+  "AWS_PROFILE",
+  "AWS_ROLE_ARN",
+  "AWS_ROLE_SESSION_NAME",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "AWS_WEB_IDENTITY_TOKEN_FILE",
+  "BUZZ_RELAY_URL",
+  "SMS_ALLOWED_USERS",
+  "SMS_DANGEROUSLY_DISABLE_SIGNATURE_VALIDATION",
+  "SMS_PUBLIC_WEBHOOK_URL",
+  "SLACK_API_URL",
   "SYNOLOGY_CHAT_INCOMING_URL",
+  "SYNOLOGY_ALLOWED_USER_IDS",
   "SYNOLOGY_NAS_HOST",
   "UV_PYTHON",
+  "ZALO_API_URL",
 ]);
 
 // Block endpoint redirection for any service without overfitting per-provider names.
 // `_HOMESERVER` covers Matrix's per-account scoped keys (MATRIX_<ACCOUNT>_HOMESERVER)
 // in addition to the bare MATRIX_HOMESERVER listed above.
-const BLOCKED_WORKSPACE_DOTENV_SUFFIXES = ["_API_HOST", "_BASE_URL", "_HOMESERVER"];
+const BLOCKED_WORKSPACE_DOTENV_SUFFIXES = ["_API_HOST", "_BASE_URL", "_ENDPOINT", "_HOMESERVER"];
+const BLOCKED_WORKSPACE_DOTENV_TOKEN_SEQUENCES = [
+  ["DANGEROUSLY"],
+  ["DISABLE", "AUTH"],
+  ["DISABLE", "CERT"],
+  ["DISABLE", "SIGNATURE"],
+  ["DISABLE", "SSL"],
+  ["DISABLE", "TLS"],
+  ["SKIP", "AUTH"],
+];
 const BLOCKED_WORKSPACE_DOTENV_PREFIXES = [
   "ANTHROPIC_API_KEY_",
   "CLAWHUB_",
+  // Google Cloud SDK launchers treat CLOUDSDK_* values as runtime controls.
+  // Workspace .env must not steer gcloud subprocess interpreters or args.
+  "CLOUDSDK_",
+  // AWS container credentials can redirect credential fetches and auth-token reads.
+  "AWS_CONTAINER_",
+  // AWS SDK endpoint overrides redirect signed provider traffic by service id.
+  "AWS_ENDPOINT_URL_",
   "OPENAI_API_KEY_",
   // Workspace .env is untrusted; reserve the full OpenClaw runtime namespace
   // for shell/global config so new OPENCLAW_* controls are fail-closed by default.
   "OPENCLAW_",
-  "OPENCLAW_CLAWHUB_",
   "OPENCLAW_DISABLE_",
   "OPENCLAW_SKIP_",
   "OPENCLAW_UPDATE_",
@@ -194,11 +249,23 @@ function shouldBlockWorkspaceRuntimeDotEnvKey(key: string): boolean {
   return isDangerousHostEnvVarName(key) || isDangerousHostEnvOverrideVarName(key);
 }
 
-function buildProviderAuthWorkspaceDotEnvBlocklist(): ReadonlySet<string> {
+function hasBlockedWorkspaceDotEnvTokenSequence(key: string): boolean {
+  const tokens = key.split("_").filter(Boolean);
+  return BLOCKED_WORKSPACE_DOTENV_TOKEN_SEQUENCES.some((sequence) => {
+    for (let index = 0; index <= tokens.length - sequence.length; index += 1) {
+      if (sequence.every((token, offset) => tokens[index + offset] === token)) {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+function buildProviderAuthWorkspaceDotEnvBlocklist(
+  providerEnvNames: readonly string[],
+): ReadonlySet<string> {
   const keys = new Set<string>(BLOCKED_PROVIDER_AUTH_WORKSPACE_DOTENV_KEYS);
-  for (const rawKey of listKnownProviderAuthEnvVarNames({
-    includeUntrustedWorkspacePlugins: false,
-  })) {
+  for (const rawKey of providerEnvNames) {
     const key = normalizeEnvVarKey(rawKey, { portable: true });
     if (key) {
       keys.add(key.toUpperCase());
@@ -207,97 +274,93 @@ function buildProviderAuthWorkspaceDotEnvBlocklist(): ReadonlySet<string> {
   return keys;
 }
 
-function shouldBlockWorkspaceDotEnvKey(
-  key: string,
-  getProviderAuthBlockedKeys: () => ReadonlySet<string>,
-): boolean {
+function shouldBlockWorkspaceStaticDotEnvKey(key: string): boolean {
   const upper = key.toUpperCase();
   return (
     shouldBlockWorkspaceRuntimeDotEnvKey(upper) ||
     BLOCKED_WORKSPACE_DOTENV_KEYS.has(upper) ||
     BLOCKED_WORKSPACE_DOTENV_PREFIXES.some((prefix) => upper.startsWith(prefix)) ||
     BLOCKED_WORKSPACE_DOTENV_SUFFIXES.some((suffix) => upper.endsWith(suffix)) ||
-    getProviderAuthBlockedKeys().has(upper)
+    hasBlockedWorkspaceDotEnvTokenSequence(upper)
   );
 }
 
-type DotEnvEntry = {
-  key: string;
-  value: string;
-};
-
-type LoadedDotEnvFile = {
-  filePath: string;
-  entries: DotEnvEntry[];
-};
-
-function readDotEnvFile(params: {
-  filePath: string;
-  shouldBlockKey: (key: string) => boolean;
-  quiet?: boolean;
-}): LoadedDotEnvFile | null {
-  let content: string;
-  try {
-    content = fs.readFileSync(params.filePath, "utf8");
-  } catch (error) {
-    if (!params.quiet) {
-      const code =
-        error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
-      if (code !== "ENOENT") {
-        logger.warn(`Failed to read ${params.filePath}: ${String(error)}`, { error });
-      }
-    }
-    return null;
-  }
-
-  let parsed: Record<string, string>;
-  try {
-    parsed = dotenv.parse(content);
-  } catch (error) {
-    if (!params.quiet) {
-      logger.warn(`Failed to parse ${params.filePath}: ${String(error)}`, { error });
-    }
-    return null;
-  }
-  const entries: DotEnvEntry[] = [];
-  for (const [rawKey, value] of Object.entries(parsed)) {
-    const key = normalizeEnvVarKey(rawKey, { portable: true });
-    if (!key || params.shouldBlockKey(key)) {
-      continue;
-    }
-    entries.push({ key, value });
-  }
-  return { filePath: params.filePath, entries };
-}
-
-export function loadWorkspaceDotEnvFile(filePath: string, opts?: { quiet?: boolean }) {
+export function loadWorkspaceDotEnvFile(
+  filePath: string,
+  opts?: { quiet?: boolean; env?: NodeJS.ProcessEnv },
+) {
+  const env = opts?.env ?? process.env;
   let providerAuthBlockedKeys: ReadonlySet<string> | undefined;
   const getProviderAuthBlockedKeys = () => {
-    providerAuthBlockedKeys ??= buildProviderAuthWorkspaceDotEnvBlocklist();
+    providerAuthBlockedKeys ??= buildProviderAuthWorkspaceDotEnvBlocklist(
+      listKnownProviderAuthEnvVarNamesCore({ env, includeUntrustedWorkspacePlugins: false }),
+    );
     return providerAuthBlockedKeys;
   };
   const parsed = readDotEnvFile({
     filePath,
-    shouldBlockKey: (key) => shouldBlockWorkspaceDotEnvKey(key, getProviderAuthBlockedKeys),
+    entryFilter: (key) =>
+      !shouldBlockWorkspaceStaticDotEnvKey(key) &&
+      !getProviderAuthBlockedKeys().has(key.toUpperCase()),
     quiet: opts?.quiet ?? true,
   });
   if (!parsed) {
     return;
   }
   for (const { key, value } of parsed.entries) {
-    if (process.env[key] !== undefined) {
+    if (env[key] !== undefined) {
       continue;
     }
-    process.env[key] = value;
+    env[key] = value;
   }
+}
+
+async function loadWorkspaceDotEnvFileAsync(
+  filePath: string,
+  opts: { env: NodeJS.ProcessEnv; quiet?: boolean },
+): Promise<void> {
+  const parsed = await readDotEnvFileAsync({
+    filePath,
+    entryFilter: (key) => !shouldBlockWorkspaceStaticDotEnvKey(key),
+    quiet: opts.quiet ?? true,
+  });
+  if (!parsed?.entries.length) {
+    return;
+  }
+  const blocked = buildProviderAuthWorkspaceDotEnvBlocklist(
+    await listKnownProviderAuthEnvVarNamesAsync({
+      env: opts.env,
+      includeUntrustedWorkspacePlugins: false,
+    }),
+  );
+  for (const { key, value } of parsed.entries) {
+    if (!blocked.has(key.toUpperCase()) && opts.env[key] === undefined) {
+      opts.env[key] = value;
+    }
+  }
+}
+
+export async function loadDotEnvAsync(opts: {
+  env: NodeJS.ProcessEnv;
+  quiet?: boolean;
+  cwd?: string;
+}): Promise<void> {
+  const quiet = opts.quiet ?? true;
+  const cwd = Object.hasOwn(opts, "cwd") ? opts.cwd : tryProcessCwd();
+  if (cwd) {
+    await loadWorkspaceDotEnvFileAsync(path.join(cwd, ".env"), { env: opts.env, quiet });
+  }
+  await loadGlobalRuntimeDotEnvFilesAsync({ env: opts.env, quiet });
 }
 
 export { loadGlobalRuntimeDotEnvFiles };
 
 export function loadDotEnv(opts?: { quiet?: boolean }) {
   const quiet = opts?.quiet ?? true;
-  const cwdEnvPath = path.join(process.cwd(), ".env");
-  loadWorkspaceDotEnvFile(cwdEnvPath, { quiet });
+  const cwd = tryProcessCwd();
+  if (cwd) {
+    loadWorkspaceDotEnvFile(path.join(cwd, ".env"), { quiet });
+  }
 
   // Then load global fallback: ~/.openclaw/.env (or OPENCLAW_STATE_DIR/.env),
   // without overriding any env vars already present.

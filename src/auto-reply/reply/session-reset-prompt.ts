@@ -1,10 +1,14 @@
+// Builds reset prompts that preserve session context and bootstrap mode.
 import { resolveBootstrapMode, type BootstrapMode } from "../../agents/bootstrap-mode.js";
 import {
   buildFullBootstrapPromptLines,
   buildLimitedBootstrapPromptLines,
 } from "../../agents/bootstrap-prompt.js";
 import { appendCronStyleCurrentTimeLine } from "../../agents/current-time.js";
-import { resolveEffectiveToolInventory } from "../../agents/tools-effective-inventory.js";
+import {
+  resolveEffectiveToolInventory,
+  acquireEffectiveToolInventoryRuntimeModelContext,
+} from "../../agents/tools-effective-inventory.js";
 import { isWorkspaceBootstrapPending } from "../../agents/workspace.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 
@@ -35,26 +39,42 @@ const BARE_SESSION_RESET_PROMPT_BOOTSTRAP_LIMITED = [
   "Do not mention internal steps, files, tools, or reasoning.",
 ].join(" ");
 
-export function resolveBareResetBootstrapFileAccess(params: {
+export async function resolveBareResetBootstrapFileAccess(params: {
   cfg?: OpenClawConfig;
   agentId?: string;
   sessionKey?: string;
   workspaceDir?: string;
   modelProvider?: string;
   modelId?: string;
-}): boolean {
-  if (!params.cfg) {
+}): Promise<boolean> {
+  const cfg = params.cfg;
+  if (!cfg) {
     return false;
   }
-  const inventory = resolveEffectiveToolInventory({
-    cfg: params.cfg,
+  const acquired = await acquireEffectiveToolInventoryRuntimeModelContext({
+    cfg,
     agentId: params.agentId,
-    sessionKey: params.sessionKey,
     workspaceDir: params.workspaceDir,
     modelProvider: params.modelProvider,
     modelId: params.modelId,
   });
-  return inventory.groups.some((group) => group.tools.some((tool) => tool.id === "read"));
+  try {
+    return acquired.run((runtimeModelContext) => {
+      const inventory = resolveEffectiveToolInventory({
+        cfg,
+        agentId: params.agentId,
+        sessionKey: params.sessionKey,
+        workspaceDir: params.workspaceDir,
+        modelProvider: params.modelProvider,
+        modelId: params.modelId,
+        modelApi: runtimeModelContext.modelApi,
+        runtimeModel: runtimeModelContext.runtimeModel,
+      });
+      return inventory.groups.some((group) => group.tools.some((tool) => tool.id === "read"));
+    });
+  } finally {
+    await acquired[Symbol.asyncDispose]();
+  }
 }
 
 export async function resolveBareSessionResetPromptState(params: {
@@ -63,7 +83,7 @@ export async function resolveBareSessionResetPromptState(params: {
   nowMs?: number;
   isPrimaryRun?: boolean;
   isCanonicalWorkspace?: boolean;
-  hasBootstrapFileAccess?: boolean | (() => boolean);
+  hasBootstrapFileAccess?: boolean | (() => boolean | Promise<boolean>);
 }): Promise<{
   bootstrapMode: BootstrapMode;
   prompt: string;
@@ -74,7 +94,7 @@ export async function resolveBareSessionResetPromptState(params: {
     : false;
   const hasBootstrapFileAccess = bootstrapPending
     ? typeof params.hasBootstrapFileAccess === "function"
-      ? params.hasBootstrapFileAccess()
+      ? await params.hasBootstrapFileAccess()
       : (params.hasBootstrapFileAccess ?? true)
     : true;
   const bootstrapMode = resolveBootstrapMode({
@@ -97,7 +117,7 @@ export async function resolveBareSessionResetPromptState(params: {
  * know which daily memory files to read during their Session Startup sequence.
  * Without this, agents on /new or /reset guess the date from their training cutoff.
  */
-export function buildBareSessionResetPrompt(
+function buildBareSessionResetPrompt(
   cfg?: OpenClawConfig,
   nowMs?: number,
   bootstrapMode?: BootstrapMode,
@@ -112,6 +132,3 @@ export function buildBareSessionResetPrompt(
     nowMs ?? Date.now(),
   );
 }
-
-/** @deprecated Use buildBareSessionResetPrompt(cfg) instead */
-export const BARE_SESSION_RESET_PROMPT = BARE_SESSION_RESET_PROMPT_BASE;

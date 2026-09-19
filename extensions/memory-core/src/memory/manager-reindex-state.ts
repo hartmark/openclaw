@@ -1,8 +1,17 @@
 import {
   hashText,
-  normalizeExtraMemoryPaths,
+  MEMORY_CHUNKING_VERSION,
+  normalizeExtraMemoryPathEntries,
+  type MemoryExtraPath,
+  type MemoryIndexIdentityState as HostMemoryIndexIdentityState,
   type MemorySource,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+
+export type MemoryIndexIdentityState =
+  | Exclude<HostMemoryIndexIdentityState, { status: "mismatched"; owner: "openclaw" }>
+  | (Extract<HostMemoryIndexIdentityState, { status: "mismatched"; owner: "openclaw" }> & {
+      versionOrder: "older" | "newer";
+    });
 
 export type MemoryIndexMeta = {
   model: string;
@@ -12,9 +21,50 @@ export type MemoryIndexMeta = {
   scopeHash?: string;
   chunkTokens: number;
   chunkOverlap: number;
+  chunkingVersion?: number;
   vectorDims?: number;
   ftsTokenizer?: string;
+  provenanceVersion?: number;
 };
+
+export const MEMORY_INDEX_PROVENANCE_VERSION = 1;
+
+export type MemoryIndexProviderIdentity = {
+  provider: string;
+  model: string;
+  providerKey: string;
+};
+
+export function resolveMemoryIndexProviderIdentities(params: {
+  provider: { id: string; model: string } | null;
+  cacheKeyData?: Record<string, unknown>;
+  aliases?: Array<{ model: string; cacheKeyData: Record<string, unknown> }>;
+}): MemoryIndexProviderIdentity[] {
+  const provider = params.provider ?? { id: "none", model: "fts-only" };
+  const candidates = [
+    {
+      model: provider.model,
+      cacheKeyData: params.cacheKeyData ?? { provider: provider.id, model: provider.model },
+    },
+    ...(params.provider ? (params.aliases ?? []) : []),
+  ];
+  const seen = new Set<string>();
+  const identities: MemoryIndexProviderIdentity[] = [];
+  for (const [index, candidate] of candidates.entries()) {
+    const providerKey = hashText(JSON.stringify(candidate.cacheKeyData));
+    const key = `${candidate.model}\u0000${providerKey}`;
+    if ((index > 0 && !candidate.model) || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    identities.push({
+      provider: provider.id,
+      model: candidate.model,
+      providerKey,
+    });
+  }
+  return identities;
+}
 
 export function resolveConfiguredSourcesForMeta(sources: Iterable<MemorySource>): MemorySource[] {
   const normalized = Array.from(sources)
@@ -49,18 +99,44 @@ function configuredMetaSourcesDiffer(params: {
   return metaSources.some((source, index) => source !== params.configuredSources[index]);
 }
 
+function openClawIndexMismatch(
+  code: "provenance_version" | "chunking_version",
+  reason: string,
+  versionOrder: "older" | "newer",
+): MemoryIndexIdentityState {
+  return { status: "mismatched", reason, code, owner: "openclaw", versionOrder };
+}
+
+function configuredIndexMismatch(
+  code:
+    | "model"
+    | "provider"
+    | "provider_settings"
+    | "sources"
+    | "scope"
+    | "chunking"
+    | "vector_dims"
+    | "fts_tokenizer",
+  reason: string,
+): MemoryIndexIdentityState {
+  return { status: "mismatched", reason, code, owner: "configuration" };
+}
+
 export function resolveConfiguredScopeHash(params: {
   workspaceDir: string;
-  extraPaths?: string[];
+  extraPaths?: MemoryExtraPath[];
   multimodal: {
     enabled: boolean;
     modalities: string[];
     maxFileBytes: number;
   };
 }): string {
-  const extraPaths = normalizeExtraMemoryPaths(params.workspaceDir, params.extraPaths)
-    .map((value) => value.replace(/\\/g, "/"))
-    .toSorted();
+  const extraPaths = normalizeExtraMemoryPathEntries(params.workspaceDir, params.extraPaths)
+    .map((entry) => {
+      const path = entry.path.replaceAll("\\", "/");
+      return entry.pattern ? { path, pattern: entry.pattern } : path;
+    })
+    .toSorted((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
   return hashText(
     JSON.stringify({
       extraPaths,
@@ -73,31 +149,103 @@ export function resolveConfiguredScopeHash(params: {
   );
 }
 
-export function shouldRunFullMemoryReindex(params: {
+export function resolveMemoryIndexIdentityState(params: {
   meta: MemoryIndexMeta | null;
-  provider: { id: string; model: string } | null;
+  provider: { id: string; model?: string } | null;
   providerKey?: string;
+  providerAliases?: Array<Pick<MemoryIndexProviderIdentity, "model" | "providerKey">>;
+  providerKeyKnown?: boolean;
   configuredSources: MemorySource[];
   configuredScopeHash: string;
   chunkTokens: number;
   chunkOverlap: number;
   vectorReady: boolean;
+  hasIndexedChunks?: boolean;
   ftsTokenizer: string;
-}): boolean {
+}): MemoryIndexIdentityState {
   const { meta } = params;
-  return (
-    !meta ||
-    (params.provider ? meta.model !== params.provider.model : meta.model !== "fts-only") ||
-    (params.provider ? meta.provider !== params.provider.id : meta.provider !== "none") ||
-    meta.providerKey !== params.providerKey ||
+  if (!meta) {
+    return {
+      status: "missing",
+      reason: "index metadata is missing",
+      code: "metadata_missing",
+      owner: "openclaw",
+    };
+  }
+  // A newer dimension wins over an older one: a rollback cannot rewrite that index.
+  if (
+    (meta.provenanceVersion ?? 0) > MEMORY_INDEX_PROVENANCE_VERSION ||
+    (meta.chunkingVersion ?? 0) > MEMORY_CHUNKING_VERSION
+  ) {
+    return openClawIndexMismatch(
+      (meta.provenanceVersion ?? 0) > MEMORY_INDEX_PROVENANCE_VERSION
+        ? "provenance_version"
+        : "chunking_version",
+      "the index was written by a newer OpenClaw version; upgrade OpenClaw or reindex explicitly",
+      "newer",
+    );
+  }
+  if ((meta.provenanceVersion ?? 0) < MEMORY_INDEX_PROVENANCE_VERSION) {
+    return openClawIndexMismatch(
+      "provenance_version",
+      "index provenance classifier changed",
+      "older",
+    );
+  }
+  if ((meta.chunkingVersion ?? 0) < MEMORY_CHUNKING_VERSION) {
+    return openClawIndexMismatch(
+      "chunking_version",
+      "index chunking implementation changed",
+      "older",
+    );
+  }
+  const expectedModel =
+    params.provider && params.provider.model === undefined
+      ? undefined
+      : params.provider?.model?.trim() || "fts-only";
+  const matchingModelIdentities = [
+    { model: expectedModel, providerKey: params.providerKey },
+    ...(params.providerAliases ?? []),
+  ].filter((identity) => identity.model === meta.model);
+  if (expectedModel !== undefined && matchingModelIdentities.length === 0) {
+    return configuredIndexMismatch(
+      "model",
+      `index was built for model ${meta.model}, expected ${expectedModel}`,
+    );
+  }
+  const expectedProvider = params.provider ? params.provider.id : "none";
+  if (meta.provider !== expectedProvider) {
+    return configuredIndexMismatch(
+      "provider",
+      `index was built for provider ${meta.provider}, expected ${expectedProvider}`,
+    );
+  }
+  if (
+    expectedModel !== undefined &&
+    params.providerKeyKnown !== false &&
+    !matchingModelIdentities.some((identity) => identity.providerKey === meta.providerKey)
+  ) {
+    return configuredIndexMismatch("provider_settings", "index provider settings changed");
+  }
+  if (
     configuredMetaSourcesDiffer({
       meta,
       configuredSources: params.configuredSources,
-    }) ||
-    meta.scopeHash !== params.configuredScopeHash ||
-    meta.chunkTokens !== params.chunkTokens ||
-    meta.chunkOverlap !== params.chunkOverlap ||
-    (params.vectorReady && !meta.vectorDims) ||
-    (meta.ftsTokenizer ?? "unicode61") !== params.ftsTokenizer
-  );
+    })
+  ) {
+    return configuredIndexMismatch("sources", "index sources changed");
+  }
+  if (meta.scopeHash !== params.configuredScopeHash) {
+    return configuredIndexMismatch("scope", "index scope changed");
+  }
+  if (meta.chunkTokens !== params.chunkTokens || meta.chunkOverlap !== params.chunkOverlap) {
+    return configuredIndexMismatch("chunking", "index chunking changed");
+  }
+  if (params.vectorReady && params.hasIndexedChunks !== false && !meta.vectorDims) {
+    return configuredIndexMismatch("vector_dims", "index vector dimensions are missing");
+  }
+  if ((meta.ftsTokenizer ?? "unicode61") !== params.ftsTokenizer) {
+    return configuredIndexMismatch("fts_tokenizer", "index FTS tokenizer changed");
+  }
+  return { status: "valid" };
 }

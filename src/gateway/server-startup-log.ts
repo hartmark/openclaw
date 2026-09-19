@@ -1,32 +1,31 @@
+// Gateway startup logging helpers.
+// Produces the compact ready banner with resolved model and safety state.
 import { normalizeSortedUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
 import chalk from "chalk";
-import { resolveDefaultAgentId, resolveAgentConfig } from "../agents/agent-scope.js";
+import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
+import { tryResolveAmbientOwnerAgentId } from "../agents/agent-scope-config.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
-import { resolveFastModeState } from "../agents/fast-mode.js";
+import { formatFastModeValue, resolveFastModeState } from "../agents/fast-mode.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.types.js";
-import { legacyModelKey, modelKey } from "../agents/model-selection-normalize.js";
 import {
   buildConfiguredModelCatalog,
   resolveConfiguredModelRef,
 } from "../agents/model-selection-shared.js";
+import { resolveConfiguredThinkingDefaultCore } from "../agents/model-thinking-default-core.js";
 import { resolveThinkingDefault } from "../agents/model-thinking-default.js";
+import type { AmbientEnvTriggerPolicy } from "../channels/config-presence.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { ensureSqliteLibrarySelected } from "../infra/bun-sqlite-library.js";
 import { getResolvedLoggerSettings } from "../logging.js";
+import type { PluginManifestRecord } from "../plugins/manifest-registry.js";
 import { collectEnabledInsecureOrDangerousFlagsFromCurrentSnapshot } from "../security/dangerous-config-flags-current.js";
-
-type StartupThinkLevel =
-  | "off"
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "adaptive"
-  | "max";
 
 /** Emit startup summary lines after Gateway bind and plugin loading complete. */
 export async function logGatewayStartup(params: {
   cfg: OpenClawConfig;
+  activationSourceConfig?: OpenClawConfig;
+  env: NodeJS.ProcessEnv;
+  manifestRecords: readonly PluginManifestRecord[];
   bindHost: string;
   bindHosts?: string[];
   port: number;
@@ -35,20 +34,21 @@ export async function logGatewayStartup(params: {
   tlsEnabled?: boolean;
   log: { info: (msg: string, meta?: Record<string, unknown>) => void; warn: (msg: string) => void };
   isNixMode: boolean;
+  ambientEnvTriggers?: AmbientEnvTriggerPolicy;
 }) {
   const { provider: agentProvider, model: agentModel } = resolveConfiguredModelRef({
     cfg: params.cfg,
+    agentId: tryResolveAmbientOwnerAgentId(params.cfg),
     defaultProvider: DEFAULT_PROVIDER,
     defaultModel: DEFAULT_MODEL,
   });
-  const modelRef = `${agentProvider}/${agentModel}`;
-  const modelDetails = formatAgentModelStartupDetails({
+  const agentModelLog = formatAgentModelStartupLogLine({
     cfg: params.cfg,
     provider: agentProvider,
     model: agentModel,
   });
-  params.log.info(`agent model: ${modelRef} (${modelDetails})`, {
-    consoleMessage: `agent model: ${chalk.whiteBright(modelRef)} (${modelDetails})`,
+  params.log.info(agentModelLog.message, {
+    consoleMessage: agentModelLog.consoleMessage,
   });
   const startupDurationMs =
     typeof params.startupStartedAt === "number" ? Date.now() - params.startupStartedAt : null;
@@ -58,8 +58,26 @@ export async function logGatewayStartup(params: {
     `http server listening (${formatReadyDetails(params.loadedPluginIds, startupDurationLabel)})`,
   );
   params.log.info(`log file: ${getResolvedLoggerSettings().file}`);
+  const sqliteLibrary = ensureSqliteLibrarySelected();
+  if (sqliteLibrary.source !== "runtime") {
+    params.log.info(
+      `SQLite: using ${sanitizeForLog(sqliteLibrary.path)} (${sqliteLibrary.version}, extension loading enabled)`,
+    );
+  } else if (sqliteLibrary.ignoredOverride) {
+    params.log.warn(`SQLite: ${sqliteLibrary.ignoredOverride}; override ignored`);
+  }
   if (params.isNixMode) {
     params.log.info("gateway: running in Nix mode (config managed externally)");
+  }
+
+  for (const warning of await collectConfiguredChannelStartupWarnings({
+    cfg: params.cfg,
+    activationSourceConfig: params.activationSourceConfig,
+    ambientEnvTriggers: params.ambientEnvTriggers,
+    env: params.env,
+    manifestRecords: params.manifestRecords,
+  })) {
+    params.log.warn(warning);
   }
 
   const enabledDangerousFlags =
@@ -75,36 +93,18 @@ export async function logGatewayStartup(params: {
   }
 }
 
-/** Normalize model thinking values that are useful in the compact startup log. */
-function normalizeStartupThinkLevel(value: unknown): StartupThinkLevel | undefined {
-  return value === "off" ||
-    value === "minimal" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high" ||
-    value === "xhigh" ||
-    value === "adaptive" ||
-    value === "max"
-    ? value
-    : undefined;
-}
-
-/** Resolve explicit thinking overrides from agent defaults and per-model config. */
-function resolveExplicitStartupThinking(params: {
+/** Format the startup model line from the model ref already selected by the caller. */
+export function formatAgentModelStartupLogLine(params: {
   cfg: OpenClawConfig;
   provider: string;
   model: string;
-  defaultAgentThinking: unknown;
-}): StartupThinkLevel | undefined {
-  const models = params.cfg.agents?.defaults?.models;
-  const canonicalKey = modelKey(params.provider, params.model);
-  const legacyKey = legacyModelKey(params.provider, params.model);
-  return (
-    normalizeStartupThinkLevel(params.defaultAgentThinking) ??
-    normalizeStartupThinkLevel(models?.[canonicalKey]?.params?.thinking) ??
-    normalizeStartupThinkLevel(legacyKey ? models?.[legacyKey]?.params?.thinking : undefined) ??
-    normalizeStartupThinkLevel(params.cfg.agents?.defaults?.thinkingDefault)
-  );
+}): { message: string; consoleMessage: string } {
+  const modelRef = `${params.provider}/${params.model}`;
+  const modelDetails = formatAgentModelStartupDetails(params);
+  return {
+    message: `agent model: ${modelRef} (${modelDetails})`,
+    consoleMessage: `agent model: ${chalk.whiteBright(modelRef)} (${modelDetails})`,
+  };
 }
 
 /** True when a configured catalog entry disables reasoning for the startup model. */
@@ -125,42 +125,115 @@ export function formatAgentModelStartupDetails(params: {
   provider: string;
   model: string;
 }): string {
-  const configuredCatalog = buildConfiguredModelCatalog({ cfg: params.cfg });
-  const defaultAgentId = resolveDefaultAgentId(params.cfg);
-  const defaultAgentConfig = resolveAgentConfig(params.cfg, defaultAgentId);
-  const explicitThinking = resolveExplicitStartupThinking({
-    cfg: params.cfg,
-    provider: params.provider,
-    model: params.model,
-    defaultAgentThinking: defaultAgentConfig?.thinkingDefault,
-  });
-  const resolvedThinking =
-    explicitThinking ??
-    resolveThinkingDefault({
-      cfg: params.cfg,
-      provider: params.provider,
-      model: params.model,
-      catalog: configuredCatalog,
-    });
-  const thinking =
-    explicitThinking ??
-    (isConfiguredReasoningDisabled({
-      catalog: configuredCatalog,
-      provider: params.provider,
-      model: params.model,
-    })
-      ? "off"
-      : resolvedThinking === "off"
-        ? "medium"
-        : resolvedThinking);
+  const soleAgentId = tryResolveAmbientOwnerAgentId(params.cfg);
+  let thinking = resolveConfiguredThinkingDefaultCore({ ...params, agentId: soleAgentId });
+  if (thinking === undefined) {
+    const configuredCatalog = buildConfiguredModelCatalog({ cfg: params.cfg });
+    // Catalog reasoning=false is authoritative; avoid loading provider policy artifacts
+    // only to discard their default below.
+    if (
+      isConfiguredReasoningDisabled({
+        catalog: configuredCatalog,
+        provider: params.provider,
+        model: params.model,
+      })
+    ) {
+      thinking = "off";
+    } else {
+      const resolvedThinking = resolveThinkingDefault({
+        cfg: params.cfg,
+        agentId: soleAgentId,
+        provider: params.provider,
+        model: params.model,
+        catalog: configuredCatalog,
+      });
+      thinking = resolvedThinking === "off" ? "medium" : resolvedThinking;
+    }
+  }
   const fast = resolveFastModeState({
     cfg: params.cfg,
     provider: params.provider,
     model: params.model,
-    agentId: defaultAgentId,
+    agentId: soleAgentId,
   });
 
-  return `thinking=${thinking}, fast=${fast.enabled ? "on" : "off"}`;
+  return `thinking=${thinking}, fast=${formatFastModeValue(fast.mode)}`;
+}
+
+async function collectConfiguredChannelStartupWarnings(params: {
+  cfg: OpenClawConfig;
+  activationSourceConfig?: OpenClawConfig;
+  ambientEnvTriggers?: AmbientEnvTriggerPolicy;
+  env: NodeJS.ProcessEnv;
+  manifestRecords: readonly PluginManifestRecord[];
+}): Promise<string[]> {
+  const [blockerModule, presencePolicyModule] = await Promise.all([
+    import("../commands/doctor/shared/channel-plugin-blockers.js"),
+    import("../plugins/channel-presence-policy.js"),
+  ]);
+  const hits = blockerModule.scanConfiguredChannelPluginBlockers(
+    params.cfg,
+    params.env,
+    params.activationSourceConfig,
+    {
+      manifestRecords: params.manifestRecords,
+      ambientEnvTriggers: params.ambientEnvTriggers,
+    },
+  );
+  const blockerWarnings = blockerModule
+    .collectConfiguredChannelPluginBlockerWarnings(hits)
+    .map((warning) => `configured channel warning: ${warning.replace(/^[-]\s*/u, "")}`);
+  const missingOwnerWarnings = presencePolicyModule
+    .resolveConfiguredChannelPresencePolicy({
+      config: params.cfg,
+      activationSourceConfig: params.activationSourceConfig,
+      env: params.env,
+      includePersistedAuthState: false,
+      ambientEnvTriggers: params.ambientEnvTriggers,
+      manifestRecords: params.manifestRecords,
+    })
+    .filter((entry) => !entry.effective && entry.blockedReasons.includes("no-channel-owner"))
+    .map(formatConfiguredChannelMissingOwnerStartupWarning);
+  const suppressedAmbientChannelIds =
+    params.ambientEnvTriggers === "suppress"
+      ? presencePolicyModule.listAmbientOnlyConfiguredChannelIds({
+          config: params.cfg,
+          activationSourceConfig: params.activationSourceConfig,
+          env: params.env,
+          includePersistedAuthState: false,
+          manifestRecords: params.manifestRecords,
+        })
+      : [];
+  const suppressionWarning =
+    suppressedAmbientChannelIds.length > 0
+      ? [formatSuppressedAmbientChannelsStartupWarning(suppressedAmbientChannelIds)]
+      : [];
+  return [...suppressionWarning, ...blockerWarnings, ...missingOwnerWarnings];
+}
+
+function formatSuppressedAmbientChannelsStartupWarning(channelIds: readonly string[]): string {
+  const safeChannelIds = normalizeSortedUniqueStringEntries(channelIds).map((channelId) =>
+    sanitizeForLog(channelId),
+  );
+  return (
+    `gateway suppressed ambient channel auto-configuration for ${safeChannelIds.length} ` +
+    `${safeChannelIds.length === 1 ? "channel" : "channels"}: ${safeChannelIds.join(", ")}. ` +
+    "Configure channels.<id> (openclaw channels add <id>) to enable the channel, or pass " +
+    "--ambient-channels to allow ambient env credentials."
+  );
+}
+
+function formatConfiguredChannelMissingOwnerStartupWarning(entry: {
+  channelId: string;
+  blockedReasons: readonly string[];
+}): string {
+  const channelId = sanitizeForLog(entry.channelId);
+  const reasons = normalizeSortedUniqueStringEntries(entry.blockedReasons).join(", ");
+  return (
+    `configured channel warning: channels.${channelId} is configured but no channel plugin ` +
+    `is installed or loadable (${reasons}). Run \`openclaw doctor --fix\` or install the ` +
+    "channel plugin before relying on this channel."
+  );
 }
 
 /** Format plugin count/list and optional startup duration for the ready log line. */

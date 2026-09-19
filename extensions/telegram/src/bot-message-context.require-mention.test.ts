@@ -1,28 +1,9 @@
-import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const { defaultRouteConfig } = vi.hoisted(() => ({
-  defaultRouteConfig: {
-    agents: {
-      list: [{ id: "main", default: true }],
-    },
-    channels: { telegram: {} },
-    messages: { groupChat: { mentionPatterns: [] } },
-  },
-}));
-
-vi.mock("openclaw/plugin-sdk/runtime-config-snapshot", async () => {
-  const actual = await vi.importActual<
-    typeof import("openclaw/plugin-sdk/runtime-config-snapshot")
-  >("openclaw/plugin-sdk/runtime-config-snapshot");
-  return {
-    ...actual,
-    getRuntimeConfig: vi.fn(() => defaultRouteConfig),
-  };
-});
+// Telegram tests cover bot message context.require mention plugin behavior.
+import { describe, expect, it, vi } from "vitest";
 
 const { buildTelegramMessageContextForTest } =
   await import("./bot-message-context.test-harness.js");
+const { buildTelegramSelfSenderName } = await import("./group-history-window.js");
 
 describe("buildTelegramMessageContext requireMention precedence", () => {
   function buildForumMessage(threadId = 99) {
@@ -41,10 +22,6 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
     };
   }
 
-  beforeEach(() => {
-    vi.mocked(getRuntimeConfig).mockReturnValue(defaultRouteConfig as never);
-  });
-
   it("lets explicit topic requireMention=false override group requireMention=true", async () => {
     const ctx = await buildTelegramMessageContextForTest({
       message: buildForumMessage(),
@@ -56,9 +33,7 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
       }),
     });
 
-    if (!ctx) {
-      throw new Error("expected Telegram context when topic disables requireMention");
-    }
+    expect(ctx?.ctxPayload.InboundEventKind).toBe("user_request");
   });
 
   it("keeps unmentioned always-on group messages as user requests by default", async () => {
@@ -90,6 +65,27 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
     expect(ctx?.ctxPayload.InboundEventKind).toBe("room_event");
   });
 
+  it("keeps explicit bot mentions as user requests in always-on room-event groups", async () => {
+    const ctx = await buildTelegramMessageContextForTest({
+      cfg: { messages: { groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] } } },
+      message: {
+        ...buildForumMessage(),
+        text: "@bot status",
+        entities: [{ type: "mention", offset: 0, length: "@bot".length }],
+      },
+      resolveGroupActivation: () => false,
+      resolveGroupRequireMention: () => false,
+      resolveTelegramGroupConfig: () => ({
+        groupConfig: { requireMention: false },
+        topicConfig: undefined,
+      }),
+    });
+
+    expect(ctx?.ctxPayload.InboundEventKind).toBe("user_request");
+    expect(ctx?.ctxPayload.WasMentioned).toBe(true);
+    expect(ctx?.ctxPayload.ExplicitlyMentionedBot).toBe(true);
+  });
+
   it("keeps ambient abort phrases as user requests", async () => {
     const ctx = await buildTelegramMessageContextForTest({
       cfg: { messages: { groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] } } },
@@ -105,46 +101,56 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
     expect(ctx?.ctxPayload.InboundEventKind).toBe("user_request");
   });
 
-  it("keeps room events as context for the next direct group request", async () => {
-    const groupHistories = new Map();
-    await buildTelegramMessageContextForTest({
-      cfg: { messages: { groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] } } },
-      message: { ...buildForumMessage(99), text: "side chatter" },
-      historyLimit: 10,
-      groupHistories,
-      resolveGroupActivation: () => false,
-      resolveGroupRequireMention: () => false,
-      resolveTelegramGroupConfig: () => ({
-        groupConfig: { requireMention: false },
-        topicConfig: undefined,
-      }),
-    });
-
-    const ctx = await buildTelegramMessageContextForTest({
-      message: {
-        ...buildForumMessage(99),
-        message_id: 2,
-        text: "replying directly",
-        reply_to_message: {
-          message_id: 10,
-          chat: { id: -1001234567890, type: "supergroup", title: "Forum", is_forum: true },
-          from: { id: 7, first_name: "Bot", username: "bot", is_bot: true },
-          text: "previous bot message",
+  it.each([
+    { text: "@bot answer after watermark", kind: "user_request", expected: ["after watermark"] },
+    {
+      text: "ambient after watermark",
+      kind: "room_event",
+      expected: ["before self marker", "self marker body", "after watermark"],
+    },
+  ])(
+    "selects retained context for $kind without mutating history",
+    async ({ text, kind, expected }) => {
+      const context = await buildTelegramMessageContextForTest({
+        cfg: { messages: { groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] } } },
+        message: {
+          ...buildForumMessage(99),
+          message_id: 4,
+          text,
+          ...(kind === "user_request"
+            ? { entities: [{ type: "mention", offset: 0, length: 4 }] }
+            : {}),
         },
-      },
-      historyLimit: 10,
-      groupHistories,
-      resolveGroupActivation: () => false,
-      resolveGroupRequireMention: () => false,
-      resolveTelegramGroupConfig: () => ({
-        groupConfig: { requireMention: false },
-        topicConfig: undefined,
-      }),
-    });
+        historyLimit: 10,
+        promptContext: [
+          {
+            label: "Conversation context",
+            source: "telegram",
+            type: "chat_window",
+            payload: {
+              messages: [
+                { sender: "Alice", body: "before self marker", timestamp_ms: 1, message_id: "1" },
+                {
+                  sender: buildTelegramSelfSenderName("OpenClaw"),
+                  body: "self marker body",
+                  timestamp_ms: 2,
+                  message_id: "2",
+                },
+                { sender: "Riley", body: "after watermark", timestamp_ms: 3, message_id: "3" },
+              ],
+            },
+          },
+        ],
+        resolveGroupActivation: () => false,
+        resolveGroupRequireMention: () => false,
+        resolveTelegramGroupConfig: () => ({ groupConfig: { requireMention: false } }),
+      });
 
-    expect(ctx?.ctxPayload.InboundEventKind).toBe("user_request");
-    expect(ctx?.ctxPayload.Body).toContain("side chatter");
-  });
+      expect(context?.ctxPayload.InboundEventKind).toBe(kind);
+      expect(context?.ctxPayload.InboundHistory?.map((entry) => entry.body)).toEqual(expected);
+      expect(context?.ctxPayload.Body).not.toContain("before self marker");
+    },
+  );
 
   it("lets explicit topic requireMention=false override mention activation", async () => {
     const resolveGroupActivation = vi.fn(() => true);
@@ -162,13 +168,11 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
     if (!ctx?.ctxPayload) {
       throw new Error("expected Telegram context payload when topic disables requireMention");
     }
-    const activationCalls = resolveGroupActivation.mock.calls as unknown as Array<
-      [{ chatId: number; messageThreadId?: number; sessionKey: string }]
-    >;
-    const [activationOptions] = activationCalls[0] ?? [];
-    expect(activationOptions?.chatId).toBe(-1001234567890);
-    expect(activationOptions?.messageThreadId).toBe(99);
-    expect(activationOptions?.sessionKey).toBe("agent:main:telegram:group:-1001234567890:topic:99");
+    expect(resolveGroupActivation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "agent:main:telegram:group:-1001234567890:topic:99",
+      }),
+    );
   });
 
   it("lets explicit topic requireMention=true override always activation", async () => {

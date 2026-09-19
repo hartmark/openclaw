@@ -1,3 +1,4 @@
+// Runtime task-flow types describe task-flow hooks and options for plugin runtimes.
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { JsonValue, TaskFlowRecord } from "../../tasks/task-flow-registry.types.js";
 import type {
@@ -15,7 +16,7 @@ export type ManagedTaskFlowRecord = TaskFlowRecord & {
   controllerId: string;
 };
 
-export type ManagedTaskFlowMutationErrorCode =
+type ManagedTaskFlowMutationErrorCode =
   | "not_found"
   | "not_managed"
   | "revision_conflict"
@@ -32,7 +33,7 @@ export type ManagedTaskFlowMutationResult =
       current?: TaskFlowRecord;
     };
 
-export type ManagedTaskFlowCreateParams = {
+type ManagedTaskFlowCreateParams = {
   controllerId: string;
   goal: string;
   status?: ManagedTaskFlowRecord["status"];
@@ -46,7 +47,7 @@ export type ManagedTaskFlowCreateParams = {
   endedAt?: number | null;
 };
 
-export type BoundTaskFlowTaskRunResult =
+type BoundTaskFlowTaskRunResult =
   | {
       created: true;
       flow: ManagedTaskFlowRecord;
@@ -59,7 +60,7 @@ export type BoundTaskFlowTaskRunResult =
       flow?: TaskFlowRecord;
     };
 
-export type BoundTaskFlowCancelResult = {
+type BoundTaskFlowCancelResult = {
   found: boolean;
   cancelled: boolean;
   reason?: string;
@@ -70,13 +71,21 @@ export type BoundTaskFlowCancelResult = {
 export type BoundTaskFlowRuntime = {
   readonly sessionKey: string;
   readonly requesterOrigin?: TaskDeliveryState["requesterOrigin"];
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   createManaged: (params: ManagedTaskFlowCreateParams) => ManagedTaskFlowRecord;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   tryCreateManaged: (params: ManagedTaskFlowCreateParams) => ManagedTaskFlowRecord | null;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   get: (flowId: string) => TaskFlowRecord | undefined;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   list: () => TaskFlowRecord[];
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   findLatest: () => TaskFlowRecord | undefined;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   resolve: (token: string) => TaskFlowRecord | undefined;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   getTaskSummary: (flowId: string) => TaskRegistrySummary | undefined;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   setWaiting: (params: {
     flowId: string;
     expectedRevision: number;
@@ -87,6 +96,7 @@ export type BoundTaskFlowRuntime = {
     blockedSummary?: string | null;
     updatedAt?: number;
   }) => ManagedTaskFlowMutationResult;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   resume: (params: {
     flowId: string;
     expectedRevision: number;
@@ -95,6 +105,7 @@ export type BoundTaskFlowRuntime = {
     stateJson?: JsonValue | null;
     updatedAt?: number;
   }) => ManagedTaskFlowMutationResult;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   finish: (params: {
     flowId: string;
     expectedRevision: number;
@@ -102,6 +113,7 @@ export type BoundTaskFlowRuntime = {
     updatedAt?: number;
     endedAt?: number;
   }) => ManagedTaskFlowMutationResult;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   fail: (params: {
     flowId: string;
     expectedRevision: number;
@@ -111,12 +123,14 @@ export type BoundTaskFlowRuntime = {
     updatedAt?: number;
     endedAt?: number;
   }) => ManagedTaskFlowMutationResult;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   requestCancel: (params: {
     flowId: string;
     expectedRevision: number;
     cancelRequestedAt?: number;
   }) => ManagedTaskFlowMutationResult;
   cancel: (params: { flowId: string; cfg: OpenClawConfig }) => Promise<BoundTaskFlowCancelResult>;
+  /** @deprecated Use the same method on api.runtime.tasks.async.managedFlows. */
   runTask: (params: {
     flowId: string;
     runtime: TaskRuntime;

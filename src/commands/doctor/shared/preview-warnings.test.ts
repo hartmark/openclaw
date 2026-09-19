@@ -1,19 +1,90 @@
+// Preview warning tests cover doctor warnings for preview or experimental config state.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../../config/config.js";
-import {
-  collectDoctorPreviewNotes,
-  collectChannelBoundMessageToolPolicyWarnings,
-  collectDoctorPreviewWarnings,
-  collectProfileConfiguredToolSectionWarnings,
-  collectVisibleReplyToolPolicyWarnings,
-} from "./preview-warnings.js";
+import type { AgentToolsConfig } from "../../../config/types.tools.js";
+import { collectDoctorPreviewNotes } from "./preview-warnings.js";
+
+async function collectDoctorPreviewWarnings(
+  params: Parameters<typeof collectDoctorPreviewNotes>[0],
+): Promise<string[]> {
+  return (await collectDoctorPreviewNotes(params)).warningNotes;
+}
+
+async function collectProfileConfiguredToolSectionWarningsThroughDoctor(
+  cfg: OpenClawConfig,
+): Promise<string[]> {
+  const warnings = await collectDoctorPreviewWarnings({
+    cfg,
+    doctorFixCommand: "openclaw doctor --fix",
+  });
+  return warnings.filter((warning) => warning.includes("is configured, but configured sections"));
+}
+
+const agentRosterCases = [
+  {
+    name: "list",
+    path: "agents.list[0]",
+    otherPath: "agents.entries",
+    agents: (tools: AgentToolsConfig) => ({ list: [{ id: "sage", tools }] }),
+  },
+  {
+    name: "keyed",
+    path: "agents.entries.sage",
+    otherPath: "agents.list",
+    agents: (tools: AgentToolsConfig) => ({
+      entries: { main: { default: true }, sage: { tools } },
+    }),
+  },
+];
+
+async function collectVisibleReplyToolPolicyWarningsThroughDoctor(
+  cfg: OpenClawConfig,
+): Promise<string[]> {
+  const warnings = await collectDoctorPreviewWarnings({
+    cfg,
+    doctorFixCommand: "openclaw doctor --fix",
+  });
+  return warnings.filter((warning) => warning.includes("visibleReplies is set"));
+}
+
+async function collectChannelBoundMessageToolPolicyWarningsThroughDoctor(
+  cfg: OpenClawConfig,
+): Promise<string[]> {
+  const warnings = await collectDoctorPreviewWarnings({
+    cfg,
+    doctorFixCommand: "openclaw doctor --fix",
+  });
+  return warnings.filter((warning) => warning.includes("is routed from channel"));
+}
+
+function createMessagePolicyAgents(routedAgentId: string): NonNullable<OpenClawConfig["agents"]> {
+  return {
+    list: [
+      {
+        id: "main",
+        default: true,
+        tools: {
+          allow: ["read"],
+        },
+      },
+      {
+        id: routedAgentId,
+        tools: {
+          profile: "messaging",
+        },
+      },
+    ],
+  };
+}
 
 type TestManifestRecord = {
   id: string;
   channels: string[];
+  origin?: "bundled" | "global";
 };
 
 const manifestState = vi.hoisted(
@@ -31,11 +102,36 @@ const staleOAuthShadowState = vi.hoisted(() => ({
   warnings: [] as string[],
 }));
 
-const activeToolSchemaState = vi.hoisted(() => ({
+const staleAuthOrderState = vi.hoisted(() => ({
   warnings: [] as string[],
 }));
 
+const repairMergedGatewayOwnerProfile = vi.hoisted(() => vi.fn());
+
+vi.mock("../../../state/user-profiles-owner-migration.js", () => ({
+  repairMergedGatewayOwnerProfile,
+}));
+
+const commandSecretState = vi.hoisted(() => ({
+  targetIds: new Set<string>(),
+  resolvedConfig: undefined as OpenClawConfig | undefined,
+  diagnostics: [] as string[],
+}));
+
 const tempRoots = new Set<string>();
+
+vi.mock("../../../cli/command-secret-gateway.js", () => ({
+  resolveCommandSecretRefsViaGateway: vi.fn(async (params: { config: OpenClawConfig }) => ({
+    resolvedConfig: commandSecretState.resolvedConfig ?? params.config,
+    diagnostics: commandSecretState.diagnostics,
+    targetStatesByPath: {},
+    hadUnresolvedTargets: false,
+  })),
+}));
+
+vi.mock("../../../cli/command-secret-targets.js", () => ({
+  getConfiguredChannelsCommandSecretTargetIds: vi.fn(() => commandSecretState.targetIds),
+}));
 
 vi.mock("../channel-capabilities.js", () => {
   const fallback = {
@@ -46,11 +142,11 @@ vi.mock("../channel-capabilities.js", () => {
   };
   return {
     getDoctorChannelCapabilities: () => fallback,
+    resolveDoctorChannelAccountIds: () => undefined,
   };
 });
 
 vi.mock("./channel-doctor.js", () => ({
-  collectChannelDoctorEmptyAllowlistExtraWarnings: vi.fn(() => []),
   collectChannelDoctorPreviewWarnings: vi.fn(
     async ({ cfg }: { cfg: { channels?: Record<string, unknown> } }) => {
       const telegram = cfg.channels?.telegram as { allowFrom?: unknown } | undefined;
@@ -77,15 +173,44 @@ vi.mock("./channel-doctor.js", () => ({
 }));
 
 vi.mock("./channel-plugin-blockers.js", () => ({
-  scanConfiguredChannelPluginBlockers: (cfg: {
-    channels?: Record<string, unknown>;
-    plugins?: { enabled?: boolean; entries?: Record<string, { enabled?: boolean }> };
-  }) => {
+  scanConfiguredChannelPluginBlockers: (
+    cfg: {
+      channels?: Record<string, unknown>;
+      plugins?: {
+        allow?: string[];
+        enabled?: boolean;
+        entries?: Record<string, { enabled?: boolean }>;
+      };
+    },
+    env: NodeJS.ProcessEnv = process.env,
+    activationSourceConfig = cfg,
+  ) => {
     const configuredChannels = new Set(Object.keys(cfg.channels ?? {}));
-    return manifestState.plugins.flatMap((plugin) => {
-      const disabledByEntry = cfg.plugins?.entries?.[plugin.id]?.enabled === false;
-      const pluginsDisabled = cfg.plugins?.enabled === false;
-      if (!disabledByEntry && !pluginsDisabled) {
+    if (Object.keys(env).some((key) => key.startsWith("TELEGRAM_"))) {
+      configuredChannels.add("telegram");
+    }
+    if (Object.keys(env).some((key) => key.startsWith("DISCORD_"))) {
+      configuredChannels.add("discord");
+    }
+    const hits: Array<{
+      channelId: string;
+      pluginId: string;
+      reason: string;
+      channelAvailable?: boolean;
+    }> = manifestState.plugins.flatMap((plugin) => {
+      const sourcePlugins = activationSourceConfig.plugins;
+      const disabledByEntry = sourcePlugins?.entries?.[plugin.id]?.enabled === false;
+      const pluginsDisabled = sourcePlugins?.enabled === false;
+      const isExternal = plugin.origin === "global";
+      const omittedFromAllowlist =
+        isExternal &&
+        (sourcePlugins?.allow ?? []).length > 0 &&
+        !(sourcePlugins?.allow ?? []).includes(plugin.id);
+      const missingExplicitTrust =
+        isExternal &&
+        sourcePlugins?.entries?.[plugin.id]?.enabled !== true &&
+        !(sourcePlugins?.allow ?? []).includes(plugin.id);
+      if (!disabledByEntry && !pluginsDisabled && !omittedFromAllowlist && !missingExplicitTrust) {
         return [];
       }
       return plugin.channels
@@ -93,9 +218,29 @@ vi.mock("./channel-plugin-blockers.js", () => ({
         .map((channelId) => ({
           channelId,
           pluginId: plugin.id,
-          reason: disabledByEntry ? "disabled in config" : "plugins disabled",
+          reason: disabledByEntry
+            ? "disabled in config"
+            : pluginsDisabled
+              ? "plugins disabled"
+              : omittedFromAllowlist
+                ? "not in allowlist"
+                : "missing explicit enablement",
         }));
     });
+    const blockedPluginIds = new Set(hits.map((hit) => hit.pluginId));
+    const availableChannelIds = new Set(
+      manifestState.plugins
+        .filter((plugin) => !blockedPluginIds.has(plugin.id))
+        .flatMap((plugin) =>
+          plugin.channels.filter((channelId) => configuredChannels.has(channelId)),
+        ),
+    );
+    for (const hit of hits) {
+      if (availableChannelIds.has(hit.channelId)) {
+        hit.channelAvailable = true;
+      }
+    }
+    return hits;
   },
   collectConfiguredChannelPluginBlockerWarnings: (
     hits: Array<{ channelId: string; pluginId: string; reason: string }>,
@@ -104,14 +249,22 @@ vi.mock("./channel-plugin-blockers.js", () => ({
       const reason =
         hit.reason === "disabled in config"
           ? `plugin "${hit.pluginId}" is disabled by plugins.entries.${hit.pluginId}.enabled=false.`
-          : "plugins.enabled=false blocks channel plugins globally.";
+          : hit.reason === "plugins disabled"
+            ? "plugins.enabled=false blocks channel plugins globally."
+            : hit.reason === "not in allowlist"
+              ? `external plugin "${hit.pluginId}" is installed but omitted from plugins.allow. Include "${hit.pluginId}" in plugins.allow.`
+              : `external plugin "${hit.pluginId}" is installed without explicit trust. Add plugins.entries.${hit.pluginId}.enabled=true.`;
       return `- channels.${hit.channelId}: channel is configured, but ${reason}`;
     }),
-  isWarningBlockedByChannelPlugin: (warning: string, hits: Array<{ channelId: string }>) =>
+  isWarningBlockedByChannelPlugin: (
+    warning: string,
+    hits: Array<{ channelId: string; channelAvailable?: boolean }>,
+  ) =>
     hits.some(
       (hit) =>
-        warning.includes(`channels.${hit.channelId}:`) ||
-        warning.includes(`channels.${hit.channelId}.`),
+        !hit.channelAvailable &&
+        (warning.includes(`channels.${hit.channelId}:`) ||
+          warning.includes(`channels.${hit.channelId}.`)),
     ),
 }));
 
@@ -121,14 +274,18 @@ vi.mock("./stale-plugin-config.js", () => ({
     channels?: Record<string, unknown>;
   }) => {
     const knownIds = new Set(manifestState.plugins.map((plugin) => plugin.id));
-    const hits = [...(cfg.plugins?.allow ?? []), ...Object.keys(cfg.plugins?.entries ?? {})]
-      .filter((id) => !knownIds.has(id))
-      .map((id) => ({ id, surface: "plugin" }));
+    const hits = [
+      ...(cfg.plugins?.allow ?? []).map((id) => ({ id, surface: "allow" })),
+      ...Object.keys(cfg.plugins?.entries ?? {}).map((id) => ({ id, surface: "entries" })),
+    ].filter((hit) => !knownIds.has(hit.id));
     if (cfg.channels?.["openclaw-weixin"]) {
       hits.push({ id: "openclaw-weixin", surface: "channel" });
     }
     return hits.filter(
-      (hit, index) => hits.findIndex((candidate) => candidate.id === hit.id) === index,
+      (hit, index) =>
+        hits.findIndex(
+          (candidate) => candidate.id === hit.id && candidate.surface === hit.surface,
+        ) === index,
     );
   },
   isStalePluginAutoRepairBlocked: () =>
@@ -137,22 +294,36 @@ vi.mock("./stale-plugin-config.js", () => ({
     autoRepairBlocked,
     doctorFixCommand,
     hits,
+    surfacePreservePluginIds,
   }: {
     autoRepairBlocked: boolean;
     doctorFixCommand: string;
     hits: Array<{ id: string; surface: string }>;
-  }) =>
-    hits.map((hit) => {
-      const prefix =
-        hit.surface === "channel"
-          ? `channels.${hit.id}: dangling channel config.`
-          : `plugins.allow: stale plugin reference "${hit.id}". plugins.entries.${hit.id} is unused.`;
-      return `${prefix} ${
-        autoRepairBlocked
-          ? `Auto-removal is paused; rerun "${doctorFixCommand}".`
-          : `Run "${doctorFixCommand}".`
-      }`;
-    }),
+    surfacePreservePluginIds?: Record<string, ReadonlySet<string>>;
+  }) => {
+    const actionableHits = hits.filter(
+      (hit) => !surfacePreservePluginIds?.[hit.surface]?.has(hit.id),
+    );
+    if (actionableHits.length === 0) {
+      return [];
+    }
+    const pluginIds = actionableHits
+      .filter((hit) => hit.surface !== "channel")
+      .map((hit) => hit.id)
+      .toSorted();
+    const lines = [
+      pluginIds.length > 0
+        ? `Stale plugin references (plugins.allow/deny/entries): ${pluginIds.join(", ")}.`
+        : null,
+      ...actionableHits
+        .filter((hit) => hit.surface === "channel")
+        .map((hit) => `channels.${hit.id}: dangling channel config.`),
+      autoRepairBlocked
+        ? `Auto-removal is paused; rerun "${doctorFixCommand}".`
+        : `Run "${doctorFixCommand}".`,
+    ];
+    return lines.filter((line): line is string => line !== null);
+  },
 }));
 
 vi.mock("./bundled-plugin-load-paths.js", () => ({
@@ -178,8 +349,26 @@ vi.mock("./stale-oauth-profile-shadows.js", () => ({
     hits.map((hit) => hit.warning),
 }));
 
-vi.mock("./active-tool-schema-warnings.js", () => ({
-  collectActiveToolSchemaProjectionWarnings: () => activeToolSchemaState.warnings,
+vi.mock("./stale-auth-order.js", () => ({
+  collectStaleConfiguredAuthOrderWarnings: () => staleAuthOrderState.warnings,
+}));
+
+vi.mock("./codex-route-warnings.js", () => ({
+  collectCodexRouteWarnings: vi.fn(() => []),
+}));
+
+async function useRealCodexRouteWarningsOnce(): Promise<void> {
+  const mocked = await import("./codex-route-warnings.js");
+  const actual = await vi.importActual<typeof import("./codex-route-warnings.js")>(
+    "./codex-route-warnings.js",
+  );
+  vi.mocked(mocked.collectCodexRouteWarnings).mockImplementationOnce(
+    actual.collectCodexRouteWarnings,
+  );
+}
+
+vi.mock("./context-engine-host-compat.js", () => ({
+  collectContextEngineHostCompatibilityWarnings: vi.fn(async () => []),
 }));
 
 function manifest(id: string): TestManifestRecord {
@@ -193,6 +382,13 @@ function channelManifest(id: string, channelId: string): TestManifestRecord {
   return {
     ...manifest(id),
     channels: [channelId],
+  };
+}
+
+function externalChannelManifest(id: string, channelId: string): TestManifestRecord {
+  return {
+    ...channelManifest(id, channelId),
+    origin: "global",
   };
 }
 
@@ -211,7 +407,7 @@ function expectSingleWarningContaining(warnings: string[], text: string): string
   expect(warnings).toHaveLength(1);
   const warning = warnings[0];
   expect(warning).toContain(text);
-  return warning;
+  return expectDefined(warning, "warning test invariant");
 }
 
 function expectWarningsContaining(warnings: string[], texts: string[]): void {
@@ -226,7 +422,15 @@ describe("doctor preview warnings", () => {
     manifestState.plugins = [manifest("discord")];
     manifestState.diagnostics = [];
     staleOAuthShadowState.warnings = [];
-    activeToolSchemaState.warnings = [];
+    staleAuthOrderState.warnings = [];
+    repairMergedGatewayOwnerProfile.mockReset().mockReturnValue({
+      repaired: false,
+      changes: [],
+      warnings: [],
+    });
+    commandSecretState.targetIds = new Set<string>();
+    commandSecretState.resolvedConfig = undefined;
+    commandSecretState.diagnostics = [];
   });
 
   afterEach(() => {
@@ -238,6 +442,26 @@ describe("doctor preview warnings", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
     tempRoots.clear();
+  });
+
+  it("reports merged gateway owner profiles without applying the repair", async () => {
+    const env = { OPENCLAW_STATE_DIR: "/tmp/openclaw-doctor-preview" };
+    const warning = 'Gateway owner profile is merged. Run "openclaw doctor --fix" to repair it.';
+    repairMergedGatewayOwnerProfile.mockReturnValue({
+      repaired: false,
+      changes: [],
+      warnings: [warning],
+    });
+
+    const notes = await collectDoctorPreviewNotes({
+      cfg: {},
+      doctorFixCommand: "openclaw doctor --fix",
+      env,
+    });
+
+    expect(repairMergedGatewayOwnerProfile).toHaveBeenCalledWith({ env, shouldRepair: false });
+    expect(notes.warningNotes).toContain(warning);
+    expect(notes.infoNotes).toEqual([]);
   });
 
   it("routes personal Codex asset notices to info instead of warnings", async () => {
@@ -261,13 +485,13 @@ describe("doctor preview warnings", () => {
             },
           },
         },
-      } as OpenClawConfig,
+      } as unknown as OpenClawConfig,
       doctorFixCommand: "openclaw doctor --fix",
       env: { CODEX_HOME: codexHome, HOME: root },
     });
 
-    expect(notes.infoNotes.join("\n")).toContain("Personal Codex CLI assets were found");
-    expect(notes.warningNotes.join("\n")).not.toContain("Personal Codex CLI assets were found");
+    expect(notes.infoNotes.join("\n")).toContain("Personal Codex CLI assets found");
+    expect(notes.warningNotes.join("\n")).not.toContain("Personal Codex CLI assets found");
   });
 
   it("collects provider and shared preview warnings", async () => {
@@ -294,6 +518,110 @@ describe("doctor preview warnings", () => {
     expect(
       warnings.some((warning) => warning.includes('channels.signal.allowFrom: set to ["*"]')),
     ).toBe(true);
+  });
+
+  it("resolves configured channel SecretRefs before collecting channel preview warnings", async () => {
+    const rawConfig = {
+      channels: {
+        telegram: {
+          botToken: { source: "env", provider: "default", id: "TELEGRAM_BOT_TOKEN" },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const resolvedConfig = {
+      channels: {
+        telegram: {
+          botToken: "resolved-token",
+          allowFrom: ["@alice"],
+        },
+      },
+    } as unknown as OpenClawConfig;
+    commandSecretState.targetIds = new Set(["channels.telegram.botToken"]);
+    commandSecretState.resolvedConfig = resolvedConfig;
+    commandSecretState.diagnostics = [
+      "doctor preview: gateway secrets.resolve unavailable (gateway closed); resolved command secrets locally.",
+    ];
+
+    const { resolveCommandSecretRefsViaGateway } =
+      await import("../../../cli/command-secret-gateway.js");
+    const notes = await collectDoctorPreviewNotes({
+      cfg: rawConfig,
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+    });
+
+    expect(resolveCommandSecretRefsViaGateway).toHaveBeenCalledWith({
+      config: rawConfig,
+      commandName: "doctor preview",
+      targetIds: commandSecretState.targetIds,
+      mode: "read_only_status",
+      allowLocalExecSecretRefs: false,
+      scrubUnresolvedSecretRefs: false,
+    });
+    expect(notes.warningNotes).toContain(commandSecretState.diagnostics[0]);
+    expect(
+      notes.warningNotes.some(
+        (warning) =>
+          warning.includes("Telegram allowFrom contains 1") && warning.includes("(e.g. @alice)"),
+      ),
+    ).toBe(true);
+  });
+
+  it("allows doctor preview to opt into local exec SecretRef resolution", async () => {
+    commandSecretState.targetIds = new Set(["channels.telegram.botToken"]);
+    const { resolveCommandSecretRefsViaGateway } =
+      await import("../../../cli/command-secret-gateway.js");
+
+    await collectDoctorPreviewNotes({
+      cfg: {
+        channels: {
+          telegram: {
+            botToken: { source: "exec", provider: "default", id: "telegram/bot-token" },
+          },
+        },
+      } as unknown as OpenClawConfig,
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+      allowExec: true,
+    });
+
+    expect(resolveCommandSecretRefsViaGateway).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        allowLocalExecSecretRefs: true,
+        scrubUnresolvedSecretRefs: false,
+      }),
+    );
+  });
+
+  it("warns when a normalized legacy Codex provider cannot be auto-merged", async () => {
+    await useRealCodexRouteWarningsOnce();
+    const warnings = await collectDoctorPreviewWarnings({
+      cfg: {
+        models: {
+          providers: {
+            openai: {
+              api: "openai-chatgpt-responses",
+              baseUrl: "https://api.openai.com/v1",
+              params: { store: true },
+              models: [{ id: "text-embedding-3-small" }],
+            },
+            "openai-codex": {
+              api: "openai-chatgpt-responses",
+              baseUrl: "https://chatgpt.com/backend-api",
+              models: [{ id: "gpt-5.5", api: "openai-chatgpt-responses" }],
+            },
+          },
+        },
+      } as unknown as OpenClawConfig,
+      doctorFixCommand: "openclaw doctor --fix",
+    });
+
+    const warning = expectSingleWarningContaining(
+      warnings,
+      "models.providers.openai-codex cannot be merged automatically",
+    );
+    expect(warning).toContain("models.providers.openai.params");
+    expect(warning).toContain("remove the legacy provider entry");
   });
 
   it("sanitizes empty-allowlist warning paths before returning preview output", async () => {
@@ -328,11 +656,23 @@ describe("doctor preview warnings", () => {
 
     const warning = expectSingleWarningContaining(
       warnings,
-      'plugins.allow: stale plugin reference "acpx"',
+      "Stale plugin references (plugins.allow/deny/entries): acpx",
     );
-    expect(warning).toContain("plugins.entries.acpx");
     expect(warning).toContain('Run "openclaw doctor --fix"');
     expect(warning).not.toContain("Auto-removal is paused");
+  });
+
+  it("omits stale cleanup warnings for version-bound Codex policy", async () => {
+    const warnings = await collectDoctorPreviewWarnings({
+      cfg: {
+        plugins: {
+          allow: ["codex"],
+        },
+      },
+      doctorFixCommand: "openclaw doctor --fix",
+    });
+
+    expect(warnings.join("\n")).not.toContain("Stale plugin references");
   });
 
   it("includes stale channel config warnings without plugin config", async () => {
@@ -386,19 +726,20 @@ describe("doctor preview warnings", () => {
     expectSingleWarningContaining(warnings, "stale OAuth auth profile openai-codex:default");
   });
 
-  it("includes active tool schema projection warnings", async () => {
-    activeToolSchemaState.warnings = [
-      '- agents.main: active tool "fuzzplugin_move_angles" from plugin "fuzzplugin" has unsupported runtime input schema.',
+  it("includes stale configured auth-order warnings", async () => {
+    staleAuthOrderState.warnings = [
+      "- auth.order.anthropic references only missing profiles while compatible stored credentials exist; run openclaw doctor --fix to remove the stale override and restore automatic selection.",
     ];
 
     const warnings = await collectDoctorPreviewWarnings({
-      cfg: { tools: { allow: ["fuzzplugin_move_angles"] } },
+      cfg: {},
       doctorFixCommand: "openclaw doctor --fix",
     });
 
-    expect(
-      warnings.some((warning) => warning.includes('active tool "fuzzplugin_move_angles"')),
-    ).toBe(true);
+    expectSingleWarningContaining(
+      warnings,
+      "auth.order.anthropic references only missing profiles",
+    );
   });
 
   it("warns but skips auto-removal when plugin discovery has errors", async () => {
@@ -414,7 +755,7 @@ describe("doctor preview warnings", () => {
 
     const warning = expectSingleWarningContaining(
       warnings,
-      'plugins.allow: stale plugin reference "acpx"',
+      "Stale plugin references (plugins.allow/deny/entries): acpx",
     );
     expect(warning).toContain("Auto-removal is paused");
     expect(warning).toContain('rerun "openclaw doctor --fix"');
@@ -446,6 +787,117 @@ describe("doctor preview warnings", () => {
       warnings,
       'channels.telegram: channel is configured, but plugin "telegram" is disabled by plugins.entries.telegram.enabled=false.',
     );
+    expect(warning).not.toContain("first-time setup mode");
+  });
+
+  it("warns when a configured external channel plugin lacks explicit trust", async () => {
+    manifestState.plugins = [externalChannelManifest("discord", "discord")];
+
+    const warnings = await collectDoctorPreviewWarnings({
+      cfg: {
+        channels: {
+          discord: {
+            enabled: true,
+            token: {
+              source: "env",
+              provider: "default",
+              id: "DISCORD_BOT_TOKEN",
+            },
+          },
+        },
+      },
+      doctorFixCommand: "openclaw doctor --fix",
+    });
+
+    const warning = expectSingleWarningContaining(
+      warnings,
+      'channels.discord: channel is configured, but external plugin "discord" is installed without explicit trust.',
+    );
+    expect(warning).toContain("plugins.entries.discord.enabled=true");
+    expect(warning).not.toContain("plugins.allow");
+    expect(warning).not.toContain("first-time setup mode");
+  });
+
+  it("preserves empty-allowlist warnings when a blocked plugin has an active co-owner", async () => {
+    manifestState.plugins = [
+      channelManifest("bundled-chat", "shared-chat"),
+      externalChannelManifest("external-chat", "shared-chat"),
+    ];
+
+    const warnings = await collectDoctorPreviewWarnings({
+      cfg: {
+        channels: {
+          "shared-chat": {
+            groupPolicy: "allowlist",
+          },
+        },
+      },
+      doctorFixCommand: "openclaw doctor --fix",
+    });
+
+    expect(warnings.join("\n")).toContain(
+      'channels.shared-chat: channel is configured, but external plugin "external-chat" is installed without explicit trust.',
+    );
+    expect(warnings.join("\n")).toContain("channels.shared-chat.groupPolicy");
+  });
+
+  it("warns for an external-only manifest env channel whose effective owner lacks source trust", async () => {
+    manifestState.plugins = [externalChannelManifest("discord", "discord")];
+
+    const notes = await collectDoctorPreviewNotes({
+      cfg: {
+        plugins: {
+          entries: {
+            discord: {
+              enabled: true,
+            },
+          },
+        },
+      },
+      activationSourceConfig: {},
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {
+        DISCORD_BOT_TOKEN: "configured",
+      } as NodeJS.ProcessEnv,
+    });
+
+    const warning = expectSingleWarningContaining(
+      notes.warningNotes,
+      'channels.discord: channel is configured, but external plugin "discord" is installed without explicit trust.',
+    );
+    expect(warning).toContain("plugins.entries.discord.enabled=true");
+  });
+
+  it("warns when a configured external channel plugin is omitted from plugins.allow", async () => {
+    manifestState.plugins = [
+      externalChannelManifest("discord", "discord"),
+      channelManifest("brave", "brave"),
+    ];
+
+    const warnings = await collectDoctorPreviewWarnings({
+      cfg: {
+        plugins: {
+          allow: ["brave"],
+        },
+        channels: {
+          discord: {
+            enabled: true,
+            token: {
+              source: "env",
+              provider: "default",
+              id: "DISCORD_BOT_TOKEN",
+            },
+          },
+        },
+      },
+      doctorFixCommand: "openclaw doctor --fix",
+    });
+
+    const warning = expectSingleWarningContaining(
+      warnings,
+      'channels.discord: channel is configured, but external plugin "discord" is installed but omitted from plugins.allow.',
+    );
+    expect(warning).toContain('Include "discord" in plugins.allow');
     expect(warning).not.toContain("first-time setup mode");
   });
 
@@ -509,7 +961,7 @@ describe("doctor preview warnings", () => {
         tools: {
           profile: "messaging",
           exec: {
-            security: "allowlist",
+            mode: "allowlist",
           },
         },
       },
@@ -522,67 +974,53 @@ describe("doctor preview warnings", () => {
     expect(warning).not.toContain("doctor --fix");
   });
 
-  it("does not suggest alsoAllow when configured section warnings already have allow", () => {
-    const warnings = collectProfileConfiguredToolSectionWarnings({
-      tools: {
-        profile: "messaging",
-      },
-      agents: {
-        list: [
-          {
-            id: "sage",
-            tools: {
-              allow: ["message"],
-              exec: {
-                security: "allowlist",
-              },
-            },
-          },
-        ],
-      },
-    });
+  it.each(agentRosterCases)(
+    "uses $name agent paths for restrictive tool profile advice",
+    async (testCase) => {
+      const warnings = await collectProfileConfiguredToolSectionWarningsThroughDoctor({
+        tools: {
+          profile: "messaging",
+        },
+        agents: testCase.agents({
+          allow: ["message"],
+          exec: { mode: "allowlist" },
+        }),
+      });
 
-    const warning = expectSingleWarningContaining(warnings, "agents.list[0].tools.profile");
-    expect(warning).toContain("Add these grants to agents.list[0].tools.allow");
-    expect(warning).toContain('set agents.list[0].tools.profile to "full"');
-    expect(warning).not.toContain("agents.list[0].tools.alsoAllow");
-  });
+      const warning = expectSingleWarningContaining(warnings, `${testCase.path}.tools.profile`);
+      expect(warning).toContain(`Add these grants to ${testCase.path}.tools.allow`);
+      expect(warning).toContain(`set ${testCase.path}.tools.profile to "full"`);
+      expect(warning).not.toContain(`${testCase.path}.tools.alsoAllow`);
+      expect(warning).not.toContain(testCase.otherPath);
+    },
+  );
 
-  it("warns when an agent tool section inherits a restrictive provider profile", () => {
-    const warnings = collectProfileConfiguredToolSectionWarnings({
-      tools: {
-        byProvider: {
-          openai: {
-            profile: "messaging",
+  it.each(agentRosterCases)(
+    "uses $name agent paths for inherited provider profile advice",
+    async (testCase) => {
+      const warnings = await collectProfileConfiguredToolSectionWarningsThroughDoctor({
+        tools: {
+          byProvider: {
+            openai: { profile: "messaging" },
           },
         },
-      },
-      agents: {
-        list: [
-          {
-            id: "sage",
-            tools: {
-              exec: {
-                security: "allowlist",
-              },
-            },
-          },
-        ],
-      },
-    });
+        agents: testCase.agents({ exec: { mode: "allowlist" } }),
+      });
 
-    const warning = expectSingleWarningContaining(
-      warnings,
-      'tools.byProvider.openai.profile is "messaging"',
-    );
-    expect(warning).toContain("agents.list[0].tools.exec is configured");
-    expect(warning).toContain(
-      'agents.list[0].tools.byProvider.openai.alsoAllow: ["exec", "process"]',
-    );
-  });
+      const warning = expectSingleWarningContaining(
+        warnings,
+        'tools.byProvider.openai.profile is "messaging"',
+      );
+      expect(warning).toContain(`${testCase.path}.tools.exec is configured`);
+      expect(warning).toContain(
+        `${testCase.path}.tools.byProvider.openai.alsoAllow: ["exec", "process"]`,
+      );
+      expect(warning).not.toContain(testCase.otherPath);
+    },
+  );
 
-  it("uses inherited provider alsoAllow for agent provider profile warnings", () => {
-    const warnings = collectProfileConfiguredToolSectionWarnings({
+  it("uses inherited provider alsoAllow for agent provider profile warnings", async () => {
+    const warnings = await collectProfileConfiguredToolSectionWarningsThroughDoctor({
       tools: {
         byProvider: {
           openai: {
@@ -596,7 +1034,7 @@ describe("doctor preview warnings", () => {
             id: "sage",
             tools: {
               exec: {
-                security: "allowlist",
+                mode: "allowlist",
               },
               byProvider: {
                 "openai/gpt-5": {
@@ -612,8 +1050,8 @@ describe("doctor preview warnings", () => {
     expect(warnings).toStrictEqual([]);
   });
 
-  it("uses model-scoped agent provider overrides for inherited provider warnings", () => {
-    const warnings = collectProfileConfiguredToolSectionWarnings({
+  it("uses model-scoped agent provider overrides for inherited provider warnings", async () => {
+    const warnings = await collectProfileConfiguredToolSectionWarningsThroughDoctor({
       tools: {
         byProvider: {
           openai: {
@@ -630,7 +1068,7 @@ describe("doctor preview warnings", () => {
             },
             tools: {
               exec: {
-                security: "allowlist",
+                mode: "allowlist",
               },
               byProvider: {
                 "openai/gpt-5": {
@@ -646,8 +1084,8 @@ describe("doctor preview warnings", () => {
     expect(warnings).toStrictEqual([]);
   });
 
-  it("treats empty provider alsoAllow as an explicit inherited-profile override", () => {
-    const warnings = collectProfileConfiguredToolSectionWarnings({
+  it("treats empty provider alsoAllow as an explicit inherited-profile override", async () => {
+    const warnings = await collectProfileConfiguredToolSectionWarningsThroughDoctor({
       tools: {
         byProvider: {
           openai: {
@@ -662,7 +1100,7 @@ describe("doctor preview warnings", () => {
             id: "sage",
             tools: {
               exec: {
-                security: "allowlist",
+                mode: "allowlist",
               },
               byProvider: {
                 openai: {
@@ -684,13 +1122,13 @@ describe("doctor preview warnings", () => {
     );
   });
 
-  it("does not warn for configured tool sections already granted by explicit alsoAllow", () => {
-    const warnings = collectProfileConfiguredToolSectionWarnings({
+  it("does not warn for configured tool sections already granted by explicit alsoAllow", async () => {
+    const warnings = await collectProfileConfiguredToolSectionWarningsThroughDoctor({
       tools: {
         profile: "messaging",
         alsoAllow: ["exec", "process"],
         exec: {
-          security: "allowlist",
+          mode: "allowlist",
         },
       },
     });
@@ -698,8 +1136,46 @@ describe("doctor preview warnings", () => {
     expect(warnings).toStrictEqual([]);
   });
 
-  it("does not warn when default group visible replies are automatic", () => {
-    const warnings = collectVisibleReplyToolPolicyWarnings({
+  it("does not warn for configured tool sections when the profile id is unknown", async () => {
+    const malformedConfig = {
+      tools: {
+        profile: "custom-profile",
+        exec: {
+          mode: "allowlist",
+        },
+        byProvider: {
+          openai: {
+            profile: "custom-provider-profile",
+          },
+        },
+      },
+      agents: {
+        list: [
+          {
+            id: "sage",
+            tools: {
+              exec: {
+                mode: "allowlist",
+              },
+              byProvider: {
+                openai: {
+                  profile: "custom-agent-provider-profile",
+                },
+              },
+            },
+          },
+        ],
+      },
+    } as unknown as OpenClawConfig;
+
+    const warnings =
+      await collectProfileConfiguredToolSectionWarningsThroughDoctor(malformedConfig);
+
+    expect(warnings).toStrictEqual([]);
+  });
+
+  it("does not warn when default group visible replies are automatic", async () => {
+    const warnings = await collectVisibleReplyToolPolicyWarningsThroughDoctor({
       channels: {
         slack: {},
       },
@@ -711,8 +1187,8 @@ describe("doctor preview warnings", () => {
     expect(warnings).toStrictEqual([]);
   });
 
-  it("warns strongly when explicit group visible replies require an unavailable message tool", () => {
-    const warnings = collectVisibleReplyToolPolicyWarnings({
+  it("warns strongly when explicit group visible replies require an unavailable message tool", async () => {
+    const warnings = await collectVisibleReplyToolPolicyWarningsThroughDoctor({
       messages: {
         groupChat: {
           visibleReplies: "message_tool",
@@ -731,7 +1207,7 @@ describe("doctor preview warnings", () => {
     expect(warning).toContain('set messages.groupChat.visibleReplies to "automatic"');
   });
 
-  it("does not warn when source reply delivery grants message at runtime", () => {
+  it("does not warn when source reply delivery grants message at runtime", async () => {
     const cfg = {
       agents: {
         defaults: {
@@ -759,11 +1235,11 @@ describe("doctor preview warnings", () => {
       },
     } satisfies OpenClawConfig;
 
-    expect(collectVisibleReplyToolPolicyWarnings(cfg)).toStrictEqual([]);
-    expect(collectChannelBoundMessageToolPolicyWarnings(cfg)).toStrictEqual([]);
+    expect(await collectVisibleReplyToolPolicyWarningsThroughDoctor(cfg)).toStrictEqual([]);
+    expect(await collectChannelBoundMessageToolPolicyWarningsThroughDoctor(cfg)).toStrictEqual([]);
   });
 
-  it("still warns when provider policy blocks the runtime message grant", () => {
+  it("still warns when provider policy blocks the runtime message grant", async () => {
     const cfg = {
       agents: {
         defaults: {
@@ -795,15 +1271,15 @@ describe("doctor preview warnings", () => {
       },
     } satisfies OpenClawConfig;
 
-    expectWarningsContaining(collectVisibleReplyToolPolicyWarnings(cfg), [
+    expectWarningsContaining(await collectVisibleReplyToolPolicyWarningsThroughDoctor(cfg), [
       'messages.groupChat.visibleReplies is set to "message_tool"',
     ]);
-    expect(collectChannelBoundMessageToolPolicyWarnings(cfg)).toEqual([
+    expect(await collectChannelBoundMessageToolPolicyWarningsThroughDoctor(cfg)).toEqual([
       '- Agent "main" is routed from channel "discord", but the message tool is unavailable for that agent; explicit channel actions such as sendAttachment, upload-file, thread-reply, or reply can fail. Add "message" to the agent tool allowlist, add "group:messaging", or switch the agent to a profile that includes messaging tools.',
     ]);
   });
 
-  it("keeps provider-specific message grants when checking provider policy", () => {
+  it("keeps provider-specific message grants when checking provider policy", async () => {
     const cfg = {
       agents: {
         defaults: {
@@ -835,12 +1311,12 @@ describe("doctor preview warnings", () => {
       },
     } satisfies OpenClawConfig;
 
-    expect(collectVisibleReplyToolPolicyWarnings(cfg)).toStrictEqual([]);
-    expect(collectChannelBoundMessageToolPolicyWarnings(cfg)).toStrictEqual([]);
+    expect(await collectVisibleReplyToolPolicyWarningsThroughDoctor(cfg)).toStrictEqual([]);
+    expect(await collectChannelBoundMessageToolPolicyWarningsThroughDoctor(cfg)).toStrictEqual([]);
   });
 
-  it("warns for direct chats when global visible replies are tool-only but groups override automatic", () => {
-    const warnings = collectVisibleReplyToolPolicyWarnings({
+  it("warns for direct chats when global visible replies are tool-only but groups override automatic", async () => {
+    const warnings = await collectVisibleReplyToolPolicyWarningsThroughDoctor({
       messages: {
         visibleReplies: "message_tool",
         groupChat: {
@@ -859,8 +1335,8 @@ describe("doctor preview warnings", () => {
     expect(warning).toContain("automatic direct-chat replies");
   });
 
-  it("warns separately for explicit global and group visible reply policy mismatches", () => {
-    const warnings = collectVisibleReplyToolPolicyWarnings({
+  it("warns separately for explicit global and group visible reply policy mismatches", async () => {
+    const warnings = await collectVisibleReplyToolPolicyWarningsThroughDoctor({
       messages: {
         visibleReplies: "message_tool",
         groupChat: {
@@ -878,9 +1354,9 @@ describe("doctor preview warnings", () => {
     ]);
   });
 
-  it("skips visible reply tool warnings when the message tool is available or default groups are unused", () => {
+  it("skips visible reply tool warnings when the message tool is available or default groups are unused", async () => {
     expect(
-      collectVisibleReplyToolPolicyWarnings({
+      await collectVisibleReplyToolPolicyWarningsThroughDoctor({
         channels: {
           slack: {},
         },
@@ -890,7 +1366,7 @@ describe("doctor preview warnings", () => {
       }),
     ).toStrictEqual([]);
     expect(
-      collectVisibleReplyToolPolicyWarnings({
+      await collectVisibleReplyToolPolicyWarningsThroughDoctor({
         tools: {
           allow: ["read"],
         },
@@ -898,8 +1374,8 @@ describe("doctor preview warnings", () => {
     ).toStrictEqual([]);
   });
 
-  it("warns when a channel route targets an agent without the message tool", () => {
-    const warnings = collectChannelBoundMessageToolPolicyWarnings({
+  it("warns when a channel route targets an agent without the message tool", async () => {
+    const warnings = await collectChannelBoundMessageToolPolicyWarningsThroughDoctor({
       agents: {
         list: [
           {
@@ -938,8 +1414,8 @@ describe("doctor preview warnings", () => {
     expect(warnings.join("\n")).not.toContain("support");
   });
 
-  it("warns for the default agent when configured channels have no explicit routes", () => {
-    const warnings = collectChannelBoundMessageToolPolicyWarnings({
+  it("warns for the default agent when configured channels have no explicit routes", async () => {
+    const warnings = await collectChannelBoundMessageToolPolicyWarningsThroughDoctor({
       channels: {
         defaults: {
           groupPolicy: "allowlist",
@@ -962,29 +1438,13 @@ describe("doctor preview warnings", () => {
     expect(warnings.join("\n")).not.toContain("defaults");
   });
 
-  it("warns only for configured channels not covered by channel routes", () => {
-    const warnings = collectChannelBoundMessageToolPolicyWarnings({
+  it("warns only for configured channels not covered by channel routes", async () => {
+    const warnings = await collectChannelBoundMessageToolPolicyWarningsThroughDoctor({
       channels: {
         discord: {},
         telegram: {},
       },
-      agents: {
-        list: [
-          {
-            id: "main",
-            default: true,
-            tools: {
-              allow: ["read"],
-            },
-          },
-          {
-            id: "commander",
-            tools: {
-              profile: "messaging",
-            },
-          },
-        ],
-      },
+      agents: createMessagePolicyAgents("commander"),
       bindings: [
         {
           agentId: "commander",
@@ -1002,28 +1462,12 @@ describe("doctor preview warnings", () => {
     expect(warnings.join("\n")).not.toContain("commander");
   });
 
-  it("warns for default-routed traffic when a channel only has scoped routes", () => {
-    const warnings = collectChannelBoundMessageToolPolicyWarnings({
+  it("warns for default-routed traffic when a channel only has scoped routes", async () => {
+    const warnings = await collectChannelBoundMessageToolPolicyWarningsThroughDoctor({
       channels: {
         discord: {},
       },
-      agents: {
-        list: [
-          {
-            id: "main",
-            default: true,
-            tools: {
-              allow: ["read"],
-            },
-          },
-          {
-            id: "commander",
-            tools: {
-              profile: "messaging",
-            },
-          },
-        ],
-      },
+      agents: createMessagePolicyAgents("commander"),
       bindings: [
         {
           agentId: "commander",
@@ -1041,28 +1485,12 @@ describe("doctor preview warnings", () => {
     expect(warnings.join("\n")).not.toContain("commander");
   });
 
-  it("skips the default-agent warning when a wildcard account route covers the channel", () => {
-    const warnings = collectChannelBoundMessageToolPolicyWarnings({
+  it("skips the default-agent warning when a wildcard account route covers the channel", async () => {
+    const warnings = await collectChannelBoundMessageToolPolicyWarningsThroughDoctor({
       channels: {
         discord: {},
       },
-      agents: {
-        list: [
-          {
-            id: "main",
-            default: true,
-            tools: {
-              allow: ["read"],
-            },
-          },
-          {
-            id: "commander",
-            tools: {
-              profile: "messaging",
-            },
-          },
-        ],
-      },
+      agents: createMessagePolicyAgents("commander"),
       bindings: [
         {
           agentId: "commander",
@@ -1077,8 +1505,8 @@ describe("doctor preview warnings", () => {
     expect(warnings).toStrictEqual([]);
   });
 
-  it("skips the default-agent warning when configured accounts are fully covered", () => {
-    const warnings = collectChannelBoundMessageToolPolicyWarnings({
+  it("skips the default-agent warning when configured accounts are fully covered", async () => {
+    const warnings = await collectChannelBoundMessageToolPolicyWarningsThroughDoctor({
       channels: {
         discord: {
           accounts: {
@@ -1131,28 +1559,12 @@ describe("doctor preview warnings", () => {
     expect(warnings).toStrictEqual([]);
   });
 
-  it("does not treat channel aliases as route coverage when runtime would not match them", () => {
-    const warnings = collectChannelBoundMessageToolPolicyWarnings({
+  it("does not treat channel aliases as route coverage when runtime would not match them", async () => {
+    const warnings = await collectChannelBoundMessageToolPolicyWarningsThroughDoctor({
       channels: {
         imessage: {},
       },
-      agents: {
-        list: [
-          {
-            id: "main",
-            default: true,
-            tools: {
-              allow: ["read"],
-            },
-          },
-          {
-            id: "ios-agent",
-            tools: {
-              profile: "messaging",
-            },
-          },
-        ],
-      },
+      agents: createMessagePolicyAgents("ios-agent"),
       bindings: [
         {
           agentId: "ios-agent",
@@ -1170,8 +1582,8 @@ describe("doctor preview warnings", () => {
     expect(warnings.join("\n")).not.toContain("imsg");
   });
 
-  it("warns for the default agent when configured account routes are incomplete", () => {
-    const warnings = collectChannelBoundMessageToolPolicyWarnings({
+  it("warns for the default agent when configured account routes are incomplete", async () => {
+    const warnings = await collectChannelBoundMessageToolPolicyWarningsThroughDoctor({
       channels: {
         discord: {
           accounts: {
@@ -1180,23 +1592,7 @@ describe("doctor preview warnings", () => {
           },
         },
       },
-      agents: {
-        list: [
-          {
-            id: "main",
-            default: true,
-            tools: {
-              allow: ["read"],
-            },
-          },
-          {
-            id: "personal-agent",
-            tools: {
-              profile: "messaging",
-            },
-          },
-        ],
-      },
+      agents: createMessagePolicyAgents("personal-agent"),
       bindings: [
         {
           agentId: "personal-agent",
@@ -1214,3 +1610,4 @@ describe("doctor preview warnings", () => {
     expect(warnings.join("\n")).not.toContain("personal-agent");
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

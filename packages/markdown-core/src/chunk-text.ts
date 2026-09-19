@@ -1,14 +1,14 @@
-function resolveChunkEarlyReturn(text: string, limit: number): string[] | undefined {
-  if (!text) {
-    return [];
-  }
-  if (limit <= 0) {
-    return [text];
-  }
-  if (text.length <= limit) {
-    return [text];
-  }
-  return undefined;
+import {
+  findGraphemeChunkEnd,
+  skipWhitespaceGraphemes,
+} from "@openclaw/normalization-core/grapheme";
+import { resolveIntegerOption } from "@openclaw/normalization-core/number-coercion";
+
+export { avoidTrailingHighSurrogateBreak } from "@openclaw/normalization-core/utf16-slice";
+
+function normalizeChunkLimit(limit: number): number {
+  // String slicing truncates fractional indexes, so positive limits need an integer progress step.
+  return Number.isFinite(limit) && limit > 0 ? resolveIntegerOption(limit, 1, { min: 1 }) : limit;
 }
 
 function scanParenAwareBreakpoints(text: string): { lastNewline: number; lastWhitespace: number } {
@@ -17,7 +17,9 @@ function scanParenAwareBreakpoints(text: string): { lastNewline: number; lastWhi
   let depth = 0;
 
   for (let i = 0; i < text.length; i++) {
-    const char = text[i];
+    const char = text.charAt(i);
+    // Parenthesized spans often contain rewritten links or file references;
+    // avoid splitting them unless the window has no safer outside break.
     if (char === "(") {
       depth += 1;
       continue;
@@ -39,30 +41,99 @@ function scanParenAwareBreakpoints(text: string): { lastNewline: number; lastWhi
   return { lastNewline, lastWhitespace };
 }
 
-/** Splits plain text at readable boundaries while avoiding breaks inside parentheses. */
+export type TextChunkRange = {
+  start: number;
+  end: number;
+};
+
+export type ChunkTextRangesOptions = {
+  limit: number;
+  mode?: "hard" | "preferred";
+};
+
+function findPreferredRangeEnd(text: string, start: number, end: number): number | undefined {
+  const slice = text.slice(start, end);
+  let paragraphEnd: number | undefined;
+  for (const match of slice.matchAll(/\n[\t ]*\n+/g)) {
+    if (match.index !== undefined) {
+      paragraphEnd = start + match.index + match[0].length;
+    }
+  }
+  if (paragraphEnd !== undefined) {
+    return paragraphEnd;
+  }
+
+  const newlineIndex = slice.lastIndexOf("\n");
+  if (newlineIndex >= 0) {
+    return start + newlineIndex + 1;
+  }
+
+  for (let index = end - 1; index > start; index -= 1) {
+    if (/\s/.test(text.charAt(index))) {
+      return index + 1;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Splits text into contiguous UTF-16 ranges without dropping separator whitespace.
+ * Preferred mode selects paragraph, newline, then whitespace boundaries.
+ */
+export function chunkTextRanges(text: string, options: ChunkTextRangesOptions): TextChunkRange[] {
+  if (!text) {
+    return [];
+  }
+  const normalizedLimit = normalizeChunkLimit(options.limit);
+  if (normalizedLimit <= 0 || text.length <= normalizedLimit) {
+    return [{ start: 0, end: text.length }];
+  }
+
+  const ranges: TextChunkRange[] = [];
+  let start = 0;
+  while (start < text.length) {
+    const maxEnd = Math.min(text.length, start + normalizedLimit);
+    const preferredEnd =
+      options.mode === "preferred" && maxEnd < text.length
+        ? findPreferredRangeEnd(text, start, maxEnd)
+        : undefined;
+    const end = findGraphemeChunkEnd(text, start, maxEnd, preferredEnd);
+    ranges.push({ start, end });
+    start = end;
+  }
+  return ranges;
+}
+
+/**
+ * Splits plain text into size-bounded chunks at readable boundaries.
+ *
+ * Returns the original text as one chunk when the limit is non-positive.
+ */
 export function chunkText(text: string, limit: number): string[] {
-  const early = resolveChunkEarlyReturn(text, limit);
-  if (early) {
-    return early;
+  const normalizedLimit = normalizeChunkLimit(limit);
+  if (!text) {
+    return [];
+  }
+  if (normalizedLimit <= 0 || text.length <= normalizedLimit) {
+    return [text];
   }
 
   const chunks: string[] = [];
   let cursor = 0;
   while (cursor < text.length) {
-    if (text.length - cursor <= limit) {
+    if (text.length - cursor <= normalizedLimit) {
       chunks.push(text.slice(cursor));
       break;
     }
-    const windowEnd = Math.min(text.length, cursor + limit);
+    const windowEnd = Math.min(text.length, cursor + normalizedLimit);
     const window = text.slice(cursor, windowEnd);
     const { lastNewline, lastWhitespace } = scanParenAwareBreakpoints(window);
+    // Prefer block boundaries, then spaces, then a hard size cut when no
+    // readable breakpoint exists inside this window.
     const breakOffset = lastNewline > 0 ? lastNewline : lastWhitespace;
-    const end = breakOffset > 0 ? cursor + breakOffset : windowEnd;
+    const end = findGraphemeChunkEnd(text, cursor, windowEnd, cursor + breakOffset);
     chunks.push(text.slice(cursor, end));
-    cursor = end;
-    while (cursor < text.length && /\s/.test(text[cursor] ?? "")) {
-      cursor += 1;
-    }
+    cursor = skipWhitespaceGraphemes(text, end);
   }
   return chunks;
 }

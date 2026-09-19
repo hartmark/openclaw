@@ -1,3 +1,4 @@
+// Matrix tests cover directory live plugin behavior.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { matrixAuthedHttpClientCtorMock, requestJsonMock } = vi.hoisted(() => ({
@@ -193,5 +194,21 @@ describe("matrix directory live", () => {
       },
     ]);
     expect(requestJsonMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-object peer directory response instead of returning no matches", async () => {
+    requestJsonMock.mockResolvedValue([]);
+
+    await expect(listMatrixDirectoryPeersLive({ cfg, query: "alice" })).rejects.toThrow(
+      /non-object JSON response/,
+    );
+  });
+
+  it("rejects a non-object joined-rooms response instead of returning no groups", async () => {
+    requestJsonMock.mockResolvedValue([]);
+
+    await expect(listMatrixDirectoryGroupsLive({ cfg, query: "somegroup" })).rejects.toThrow(
+      /non-object JSON response/,
+    );
   });
 });

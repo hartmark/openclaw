@@ -1,3 +1,4 @@
+// Voice Call tests cover twiml policy plugin behavior.
 import { describe, expect, it } from "vitest";
 import type { WebhookContext } from "../../types.js";
 import { decideTwimlResponse, readTwimlRequestView } from "./twiml-policy.js";
@@ -13,7 +14,7 @@ function createContext(rawBody: string, query?: WebhookContext["query"]): Webhoo
 }
 
 describe("twiml policy", () => {
-  it("returns stored twiml decision for initial notify callback", () => {
+  it("returns stored twiml decision for an initial pre-connect callback", () => {
     const view = readTwimlRequestView(
       createContext("CallStatus=initiated&Direction=outbound-api&CallSid=CA123", {
         callId: "call-1",
@@ -23,7 +24,6 @@ describe("twiml policy", () => {
     const decision = decideTwimlResponse({
       ...view,
       hasStoredTwiml: true,
-      isNotifyCall: true,
       hasActiveStreams: false,
       canStream: true,
     });
@@ -39,7 +39,6 @@ describe("twiml policy", () => {
     const decision = decideTwimlResponse({
       ...view,
       hasStoredTwiml: false,
-      isNotifyCall: false,
       hasActiveStreams: true,
       canStream: true,
     });
@@ -55,7 +54,6 @@ describe("twiml policy", () => {
     const decision = decideTwimlResponse({
       ...view,
       hasStoredTwiml: false,
-      isNotifyCall: false,
       hasActiveStreams: false,
       canStream: true,
     });
@@ -74,7 +72,6 @@ describe("twiml policy", () => {
     const decision = decideTwimlResponse({
       ...view,
       hasStoredTwiml: false,
-      isNotifyCall: false,
       hasActiveStreams: false,
       canStream: true,
     });

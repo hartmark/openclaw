@@ -5,6 +5,7 @@ type ProbeIMessageAccount = (params?: {
   timeoutMs?: number;
   cliPath?: string;
   dbPath?: string;
+  remoteHost?: string;
 }) => Promise<IMessageProbe>;
 
 export async function probeIMessageStatusAccount(params: {
@@ -16,5 +17,6 @@ export async function probeIMessageStatusAccount(params: {
     timeoutMs: params.timeoutMs,
     cliPath: params.account.config.cliPath,
     dbPath: params.account.config.dbPath,
+    ...(params.account.config.remoteHost ? { remoteHost: params.account.config.remoteHost } : {}),
   });
 }

@@ -1,8 +1,10 @@
+// Zalo plugin module implements setup allow from behavior.
 import {
   DEFAULT_ACCOUNT_ID,
   createSetupTranslator,
   formatDocsLink,
   mergeAllowFromEntries,
+  patchTopLevelChannelConfigSection,
   type ChannelSetupDmPolicy,
   type ChannelSetupWizard,
   type OpenClawConfig,
@@ -57,41 +59,26 @@ export async function promptZaloAllowFrom(params: {
   const normalized = entry.trim();
   const unique = mergeAllowFromEntries(existingAllowFrom, [normalized]);
 
-  if (accountId === DEFAULT_ACCOUNT_ID) {
-    return {
-      ...cfg,
-      channels: {
-        ...cfg.channels,
-        zalo: {
-          ...cfg.channels?.zalo,
-          enabled: true,
-          dmPolicy: "allowlist",
-          allowFrom: unique,
-        },
-      },
-    } as OpenClawConfig;
-  }
-
   const currentAccount = cfg.channels?.zalo?.accounts?.[accountId] as
     | ZaloAccountSetupConfig
     | undefined;
-  return {
-    ...cfg,
-    channels: {
-      ...cfg.channels,
-      zalo: {
-        ...cfg.channels?.zalo,
-        enabled: true,
-        accounts: {
-          ...cfg.channels?.zalo?.accounts,
-          [accountId]: {
-            ...currentAccount,
-            enabled: currentAccount?.enabled ?? true,
-            dmPolicy: "allowlist",
-            allowFrom: unique,
+  return patchTopLevelChannelConfigSection({
+    cfg,
+    channel: "zalo",
+    enabled: true,
+    patch:
+      accountId === DEFAULT_ACCOUNT_ID
+        ? { dmPolicy: "allowlist", allowFrom: unique }
+        : {
+            accounts: {
+              ...cfg.channels?.zalo?.accounts,
+              [accountId]: {
+                ...currentAccount,
+                enabled: currentAccount?.enabled ?? true,
+                dmPolicy: "allowlist",
+                allowFrom: unique,
+              },
+            },
           },
-        },
-      },
-    },
-  } as OpenClawConfig;
+  });
 }

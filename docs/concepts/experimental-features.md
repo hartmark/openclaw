@@ -7,101 +7,69 @@ read_when:
   - You want one place to find the currently documented experimental flags
 ---
 
-Experimental features in OpenClaw are **opt-in preview surfaces**. They are
-behind explicit flags because they still need real-world mileage before they
-deserve a stable default or a long-lived public contract.
+Experimental features are preview surfaces controlled by config flags. They need more real-world mileage before their shape and behavior become long-lived contracts.
 
-Treat them differently from normal config:
+- Off by default unless the feature docs state otherwise.
+- Shape and behavior can change faster than stable config.
+- Prefer a stable path when one already exists.
+- Roll out broadly only after testing in a smaller environment first.
 
-- Keep them **off by default** unless the related doc tells you to try one.
-- Expect **shape and behavior to change** faster than stable config.
-- Prefer the stable path first when one already exists.
-- If you are rolling OpenClaw out broadly, test experimental flags in a smaller
-  environment before baking them into a shared baseline.
+All [plugin APIs](/plugins/sdk-overview#api-stability) are also experimental.
+That stability label does not require a Labs switch for ordinary plugins; the
+Custom plugin UI flag below controls user-installed native browser code only.
 
 ## Currently documented flags
 
-| Surface                  | Key                                                                                        | Use it when                                                                                                                       | More                                                                                          |
-| ------------------------ | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Local model runtime      | `agents.defaults.experimental.localModelLean`, `agents.list[].experimental.localModelLean` | A smaller or stricter local backend chokes on OpenClaw's full default tool surface                                                | [Local Models](/gateway/local-models)                                                         |
-| Memory search            | `agents.defaults.memorySearch.experimental.sessionMemory`                                  | You want `memory_search` to index prior session transcripts and accept the extra storage/indexing cost                            | [Memory configuration reference](/reference/memory-config#session-memory-search-experimental) |
-| Codex harness            | `plugins.entries.codex.config.appServer.experimental.sandboxExecServer`                    | You want native Codex app-server 0.132.0 or newer to target an OpenClaw sandbox-backed exec-server instead of disabling Code Mode | [Codex harness reference](/plugins/codex-harness-reference#sandboxed-native-execution)        |
-| Structured planning tool | `tools.experimental.planTool`                                                              | You want the structured `update_plan` tool exposed for multi-step work tracking in compatible runtimes and UIs                    | [Gateway configuration reference](/gateway/config-tools#toolsexperimental)                    |
+| Surface          | Key                                                                     | Use it when                                                                                                                       | More                                                                                   |
+| ---------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Codex harness    | `plugins.entries.codex.config.appServer.experimental.sandboxExecServer` | You want native Codex app-server 0.143.0 or newer to target an OpenClaw sandbox-backed exec-server instead of disabling Code Mode | [Codex harness reference](/plugins/codex-harness-reference#sandboxed-native-execution) |
+| Code Mode        | `tools.codeMode.enabled`                                                | You want compact code-orchestrated access to a hidden OpenClaw tool catalog                                                       | [Code Mode](/tools/code-mode)                                                          |
+| Cloud workers    | `cloudWorkers.desktop`                                                  | You want to watch or control desktop-capable cloud worker environments from the Control UI                                        | [Cloud Worker Desktop](/gateway/cloud-workers#desktop-interactive)                     |
+| Custom plugin UI | `gateway.controlUi.experimental.customPlugins`                          | You want trusted user-installed plugins to add native Control UI views or replace built-in views                                  | [Feature plugins](/plugins/feature-plugins#enable-custom-plugin-ui)                    |
+| Host Desktop     | `desktop.host.enabled`                                                  | You want to watch or control the Gateway host through its VNC or Screen Sharing server                                            | [Desktop](/gateway/configuration-reference#desktop)                                    |
+| Tool Search      | `tools.toolSearch.enabled`                                              | You want to defer tool schemas for all models instead of using each model's default                                               | [Tool Search](/tools/tool-search)                                                      |
+
+## Control UI Labs
+
+Open **Settings → Agents & Tools → Labs** to manage experiments that have a
+Control UI switch. Enabling or disabling a lab patches the canonical Gateway
+config immediately; the page shows a restart hint only when a feature requires
+one.
+
+Labs includes Code Mode, Tool Search for all models, Custom plugin UI,
+Host Desktop, and Cloud Worker Desktop. Custom plugin UI and both desktop
+features require a Gateway restart. Custom plugin UI also requires reloading
+connected browser tabs. Code Mode and Tool Search changes normally take effect
+for future agent runs without restarting.
+
+Custom plugin UI is off by default. Enabled bundled plugins, including
+Workboard, retain their native UI with the setting off. Backend APIs and
+ordinary plugins remain available, and installing or approving a plugin
+artifact does not enable the lab.
+
+Code Mode remains disabled until you turn on its Labs switch or explicitly set
+`tools.codeMode` to `true` or `"auto"`. The Labs switch writes `"auto"`, so it
+engages only for models marked as preferred Code Mode performers; it does not
+force Code Mode on for every model.
+
+Local models use Tool Search automatically when `tools.toolSearch` is unset.
+The Labs switch enables an override for all models.
 
 ## Local model lean mode
 
-`agents.defaults.experimental.localModelLean: true` is a pressure-release valve for weaker local-model setups. When it is on, OpenClaw drops three default tools — `browser`, `cron`, and `message` — from the agent's tool surface for every turn. Nothing else changes. Use `agents.list[].experimental.localModelLean` to enable or disable the same behavior for one configured agent.
+Lean mode is an advanced troubleshooting override, configured outside Labs.
+Its existing `experimental.localModelLean` keys remain supported. See
+[Local model lean mode](/gateway/local-models#local-model-lean-mode) for capability
+restrictions, config examples, and recovery guidance.
 
-### Why these three tools
-
-These three tools have the largest descriptions and the most parameter shapes in the default OpenClaw runtime. On a small-context or stricter OpenAI-compatible backend that is the difference between:
-
-- Tool schemas fitting cleanly in the prompt vs. crowding out conversation history.
-- The model picking the right tool vs. emitting malformed tool calls because there are too many similar-looking schemas.
-- The Chat Completions adapter staying inside the server's structured-output limits vs. tripping a 400 on tool-call payload size.
-
-Removing them does not silently rewire OpenClaw — it just makes the tool list shorter. The model still has `read`, `write`, `edit`, `exec`, `apply_patch`, web search/fetch (when configured), memory, and session/agent tools available.
-
-### When to turn it on
-
-Enable lean mode when you have already proved the model can talk to the Gateway but full agent turns misbehave. The typical signal chain is:
-
-1. `openclaw infer model run --gateway --model <ref> --prompt "Reply with exactly: pong"` succeeds.
-2. A normal agent turn fails with malformed tool calls, oversized prompts, or the model ignoring its tools.
-3. Toggling `localModelLean: true` clears the failure.
-
-### When to leave it off
-
-If your backend handles the full default runtime cleanly, leave this off. Lean mode is a workaround, not a default. It exists because some local stacks need a smaller tool surface to behave; hosted models and well-resourced local rigs do not.
-
-Lean mode also does not replace `tools.profile`, `tools.allow`/`tools.deny`, or the model `compat.supportsTools: false` escape hatch. If you need a permanent narrower tool surface for a specific agent, prefer those stable knobs over the experimental flag.
-
-### Enable
-
-```json5
-{
-  agents: {
-    defaults: {
-      experimental: {
-        localModelLean: true,
-      },
-    },
-  },
-}
-```
-
-For one agent only:
-
-```json5
-{
-  agents: {
-    list: [
-      {
-        id: "local",
-        model: "lmstudio/gemma-4-e4b-it",
-        experimental: {
-          localModelLean: true,
-        },
-      },
-    ],
-  },
-}
-```
-
-Restart the Gateway after changing the flag, then confirm the trimmed tool list with:
-
-```bash
-openclaw status --deep
-```
-
-The deep status output lists the active agent tools; `browser`, `cron`, and `message` should be absent when lean mode is on.
+- <a id="why-these-tools" />[Why these tools](/gateway/local-models#why-these-tools)
+- <a id="when-to-turn-it-on" />[When to turn it on](/gateway/local-models#when-to-turn-it-on)
+- <a id="when-to-leave-it-off" />[When to leave it off](/gateway/local-models#when-to-leave-it-off)
+- <a id="enable" />[Enable](/gateway/local-models#enable)
 
 ## Experimental does not mean hidden
 
-If a feature is experimental, OpenClaw should say so plainly in docs and in the
-config path itself. What it should **not** do is smuggle preview behavior into a
-stable-looking default knob and pretend that is normal. That's how config
-surfaces get messy.
+An experimental feature should say so plainly in docs and in the config path itself, not hide behind a stable-looking default knob.
 
 ## Related
 

@@ -1,39 +1,67 @@
-import fs from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import os from "node:os";
 import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import chokidar, { type FSWatcher } from "chokidar";
+import chokidar from "chokidar";
+import { isDefaultStateDir } from "../../config/paths.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { getFileWatchCapacityCode } from "../../infra/fs-watch-errors.js";
+import { isPathInside } from "../../infra/path-guards.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { CONFIG_DIR, resolveUserPath } from "../../utils.js";
-import { resolvePluginSkillDirs } from "../loading/plugin-skills.js";
+import {
+  resolvePluginSkillRoots,
+  resolvePluginSkillRootsFromMetadata,
+} from "../loading/plugin-skills.js";
+import { resolveAllowedSkillSymlinkTargetRealPaths } from "../loading/symlink-targets.js";
+import {
+  normalizeWorkspaceSkillRoots,
+  resolveWorkspaceSkillDirectories,
+} from "../loading/workspace-skill-roots.js";
+import { resolveWorkshopWatchRoots } from "../workshop/skills-root.js";
+import { areOrderedArraysEqual } from "./ordered-array-equality.js";
+import { acquireSkillsAncestorWatcher } from "./refresh-ancestor-watch.js";
+import { createRawSkillFileScheduler } from "./refresh-file-stability.js";
 import {
   bumpSkillsSnapshotVersion,
-  clearSkillsSnapshotVersionForWorkspace,
+  markSkillsSupportingFilesChanged,
   resetSkillsRefreshStateForTest,
   setSkillsChangeListenerErrorHandler,
+  suspendSkillsSnapshotSources,
+  type SkillsSourceScope,
 } from "./refresh-state.js";
-export {
-  bumpSkillsSnapshotVersion,
-  getSkillsSnapshotVersion,
-  registerSkillsChangeListener,
-  shouldRefreshSnapshotForVersion,
-  type SkillsChangeEvent,
-} from "./refresh-state.js";
+import { joinSkillsWatcherCloses, teardownSkillsPathWatcher } from "./refresh-watch-close.js";
+import {
+  createSkillsWatchPathFilter,
+  getRawWatchedPath,
+  isSkillDiscoveryFileWatchPath,
+  rawPathToString,
+  resolveRawSkillsWatchPath,
+  makeSkillsWatchTarget,
+  resolveSkillsWatcherUsePolling,
+  toWatchRoot,
+} from "./refresh-watch-path.js";
+import {
+  addSkillSourceWatchTargets,
+  GROUPED_SKILLS_WATCH_DEPTH,
+  type WatchTarget,
+} from "./refresh-watch-targets.js";
+export { registerSkillsChangeListener } from "./refresh-state.js";
 
+type SkillsWatchChange = "skills" | "supporting";
 type SkillsPathWatchState = {
-  watcher: FSWatcher;
+  closed: boolean;
+  close: () => void;
+  schedule: (path?: string) => void;
+  watchRoot: string;
+  ancestorRoot: string;
   depth: number;
-  debounceMs: number;
+  initialScan: "pending" | "ready" | "error";
   timer?: ReturnType<typeof setTimeout>;
   pendingPath?: string;
+  pendingChange?: SkillsWatchChange;
   readonly subscribers: Set<string>;
-};
-
-type WatchTarget = {
-  path: string;
-  depth: number;
-  key: string;
 };
 
 type WatchTargetCacheEntry = {
@@ -42,20 +70,26 @@ type WatchTargetCacheEntry = {
 };
 
 const log = createSubsystemLogger("gateway/skills");
-const GROUPED_SKILLS_WATCH_DEPTH = 6;
-const CONFIGURED_ROOT_WATCH_DEPTH = 2;
-const MAX_SYMLINK_WATCH_TARGETS_PER_ROOT = 100;
-const MAX_SYMLINK_WATCH_DIRECTORY_SCANS_PER_ROOT = 200;
-const MAX_SYMLINK_WATCH_RAW_ENTRIES_PER_ROOT = 2_000;
+// Gateway startup imports this owner before serving turns. Shared watcher handles,
+// including later rebuilds, must inherit that lifetime rather than the triggering turn.
+const runInSkillsWatcherContext = AsyncLocalStorage.snapshot();
+const SKILLS_WATCH_DEBOUNCE_MS = 250;
 // One watcher per unique watched directory. Agent workspaces that include the
 // same shared skill root (the global skills dir, the home skills dir, or a
 // configured extra/plugin dir) subscribe to the same watcher instead of each
 // opening its own, so open file descriptors scale with distinct directories
 // rather than with agent count.
 const pathWatchers = new Map<string, SkillsPathWatchState>();
+let nativeWatchCapacityFailed = false;
 // Watch targets each workspace is currently subscribed to, used to reconcile
 // subscriptions and to detect watch-target changes across calls.
 const workspaceWatchTargets = new Map<string, WatchTarget[]>();
+// A watcher key may include an execution root, but refresh events and versions
+// retain the configured agent workspace as their stable public identity.
+const workspaceWatchOwners = new Map<
+  string,
+  { workspaceDir: string; sourceScope: SkillsSourceScope; sharedScanPending: boolean }
+>();
 // Resolved nested skill watch roots are filesystem-derived. Cache them so the
 // per-turn watcher reconciliation path stays cheap until config or watched
 // filesystem changes require a fresh root scan.
@@ -64,569 +98,619 @@ const workspaceWatchLastEnsuredAt = new Map<string, number>();
 // Session turns re-ensure their workspace; entries older than this are treated
 // as abandoned subscriptions and evicted by the next ensure call.
 const SKILLS_WORKSPACE_WATCH_IDLE_TTL_MS = 60 * 60_000;
+const MAX_SKILLS_WORKSPACE_WATCH_STATES = 128;
 
 setSkillsChangeListenerErrorHandler((err) => {
   log.warn(`skills change listener failed: ${String(err)}`);
 });
 
-export const DEFAULT_SKILLS_WATCH_IGNORED: RegExp[] = [
-  /(^|[\\/])\.git([\\/]|$)/,
-  /(^|[\\/])node_modules([\\/]|$)/,
-  /(^|[\\/])dist([\\/]|$)/,
-  // Python virtual environments and caches
-  /(^|[\\/])\.venv([\\/]|$)/,
-  /(^|[\\/])venv([\\/]|$)/,
-  /(^|[\\/])__pycache__([\\/]|$)/,
-  /(^|[\\/])\.mypy_cache([\\/]|$)/,
-  /(^|[\\/])\.pytest_cache([\\/]|$)/,
-  // Build artifacts and caches
-  /(^|[\\/])build([\\/]|$)/,
-  /(^|[\\/])\.cache([\\/]|$)/,
-];
-
-function resolveWatchTargets(workspaceDir: string, config?: OpenClawConfig): WatchTarget[] {
-  const baseRoots: Array<{ path: string; source: string }> = [];
-  if (workspaceDir.trim()) {
-    baseRoots.push({ path: path.join(workspaceDir, "skills"), source: "openclaw-workspace" });
+function resolveWatchTargets(
+  workspaceDir: string,
+  config: OpenClawConfig | undefined,
+  agentId: string | undefined,
+  executionWorkspaceDir: string | undefined,
+  watcherKey: string,
+  pluginMetadataSnapshot: PluginMetadataSnapshot | undefined,
+): WatchTarget[] {
+  const baseRoots = resolveWorkspaceSkillDirectories(workspaceDir).map(({ dir, source }) => ({
+    path: dir,
+    source,
+  }));
+  const executionRoots = executionWorkspaceDir
+    ? resolveWorkspaceSkillDirectories(executionWorkspaceDir)
+    : [];
+  baseRoots.push(...resolveWorkshopWatchRoots(config, agentId));
+  baseRoots.push({ path: path.join(CONFIG_DIR, "skills"), source: "openclaw-managed" });
+  if (isDefaultStateDir()) {
     baseRoots.push({
-      path: path.join(workspaceDir, ".agents", "skills"),
-      source: "agents-skills-project",
+      path: path.join(os.homedir(), ".agents", "skills"),
+      source: "agents-skills-personal",
     });
   }
-  baseRoots.push({ path: path.join(CONFIG_DIR, "skills"), source: "openclaw-managed" });
-  baseRoots.push({
-    path: path.join(os.homedir(), ".agents", "skills"),
-    source: "agents-skills-personal",
-  });
   const extraDirsRaw = config?.skills?.load?.extraDirs ?? [];
   const extraDirs = extraDirsRaw
     .map((d) => normalizeOptionalString(d) ?? "")
     .filter(Boolean)
     .map((dir) => resolveUserPath(dir));
-  const pluginSkillDirs = resolvePluginSkillDirs({ workspaceDir, config });
-  const allowedSymlinkTargetRealPaths = resolveAllowedSymlinkTargetRealPaths(config);
+  const pluginSkillRoots = pluginMetadataSnapshot
+    ? resolvePluginSkillRootsFromMetadata({
+        workspaceDir,
+        config,
+        metadataSnapshot: pluginMetadataSnapshot,
+      })
+    : resolvePluginSkillRoots({ workspaceDir, config });
+  const pluginSkillDirs = pluginSkillRoots.map((root) => root.dir);
+  const allowedSymlinkTargetRealPaths = resolveAllowedSkillSymlinkTargetRealPaths(config);
   const signature = JSON.stringify({
     basePaths: baseRoots.map((root) => toWatchRoot(root.path)),
+    executionPaths: executionRoots.map((root) => toWatchRoot(root.dir)),
     extraDirs: extraDirs.map(toWatchRoot),
     pluginSkillDirs: pluginSkillDirs.map(toWatchRoot),
     allowSymlinkTargets: allowedSymlinkTargetRealPaths,
   });
-  const cached = workspaceWatchTargetCache.get(workspaceDir);
+  const cached = workspaceWatchTargetCache.get(watcherKey);
   if (cached?.signature === signature) {
     return cached.targets;
   }
 
   const targets = new Map<string, WatchTarget>();
   for (const root of baseRoots) {
-    addSkillRootWatchTargets(targets, root.path, GROUPED_SKILLS_WATCH_DEPTH);
-    addTrustedSymlinkSkillWatchTargets(
+    addSkillSourceWatchTargets(
       targets,
       root.path,
       root.source,
       allowedSymlinkTargetRealPaths,
       GROUPED_SKILLS_WATCH_DEPTH,
-      root.path,
-    );
-    addTrustedSymlinkSkillWatchTargets(
-      targets,
-      path.join(root.path, "skills"),
-      root.source,
-      allowedSymlinkTargetRealPaths,
-      GROUPED_SKILLS_WATCH_DEPTH,
-      root.path,
     );
   }
   for (const resolved of extraDirs) {
-    const rootDepth =
-      path.basename(resolved) === "skills"
-        ? GROUPED_SKILLS_WATCH_DEPTH
-        : CONFIGURED_ROOT_WATCH_DEPTH;
-    addSkillRootWatchTargets(targets, resolved, rootDepth);
-    addTrustedSymlinkSkillWatchTargets(
-      targets,
-      resolved,
-      "openclaw-extra",
-      allowedSymlinkTargetRealPaths,
-      rootDepth,
-      resolved,
-    );
-    addTrustedSymlinkSkillWatchTargets(
-      targets,
-      path.join(resolved, "skills"),
-      "openclaw-extra",
-      allowedSymlinkTargetRealPaths,
-      GROUPED_SKILLS_WATCH_DEPTH,
-      resolved,
-    );
+    addSkillSourceWatchTargets(targets, resolved, "openclaw-extra", allowedSymlinkTargetRealPaths);
   }
   for (const dir of pluginSkillDirs) {
-    const rootDepth =
-      path.basename(dir) === "skills" ? GROUPED_SKILLS_WATCH_DEPTH : CONFIGURED_ROOT_WATCH_DEPTH;
-    addSkillRootWatchTargets(targets, dir, rootDepth);
-    addTrustedSymlinkSkillWatchTargets(
-      targets,
-      dir,
-      "openclaw-plugin",
-      allowedSymlinkTargetRealPaths,
-      rootDepth,
-      dir,
-    );
-    addTrustedSymlinkSkillWatchTargets(
-      targets,
-      path.join(dir, "skills"),
-      "openclaw-plugin",
+    addSkillSourceWatchTargets(targets, dir, "openclaw-plugin", allowedSymlinkTargetRealPaths);
+  }
+  const executionTargets = new Map<string, WatchTarget>();
+  for (const root of executionRoots) {
+    addSkillSourceWatchTargets(
+      executionTargets,
+      root.dir,
+      root.source,
       allowedSymlinkTargetRealPaths,
       GROUPED_SKILLS_WATCH_DEPTH,
-      dir,
     );
   }
-  const sortedTargets = Array.from(targets.values()).toSorted((a, b) => a.key.localeCompare(b.key));
-  workspaceWatchTargetCache.set(workspaceDir, { signature, targets: sortedTargets });
+  for (const [key, target] of executionTargets) {
+    const shared = targets.get(key);
+    if (shared) {
+      shared.depth = Math.max(shared.depth, target.depth);
+    } else {
+      targets.set(key, { ...target, executionOnly: true });
+    }
+  }
+  const sortedTargets = Array.from(targets.values()).toSorted((a, b) =>
+    a.path.localeCompare(b.path),
+  );
+  workspaceWatchTargetCache.set(watcherKey, { signature, targets: sortedTargets });
   return sortedTargets;
 }
 
-function toWatchRoot(raw: string): string {
-  const normalized = raw.replaceAll("\\", "/");
-  return normalized.replace(/\/+$/, "") || normalized;
-}
-
-function makeWatchTarget(raw: string, depth: number): WatchTarget {
-  const watchPath = toWatchRoot(raw);
-  return { path: watchPath, depth, key: watchPath };
-}
-
-function addWatchTarget(targets: Map<string, WatchTarget>, raw: string, depth: number): void {
-  const target = makeWatchTarget(raw, depth);
-  const existing = targets.get(target.key);
-  if (existing) {
-    existing.depth = Math.max(existing.depth, target.depth);
-    return;
-  }
-  targets.set(target.key, target);
-}
-
-function addSkillRootWatchTargets(
-  targets: Map<string, WatchTarget>,
-  root: string,
-  rootDepth: number,
-): void {
-  addWatchTarget(targets, root, watchDepthForPath(root, rootDepth));
-  const companionSkillsRoot = path.join(root, "skills");
-  addWatchTarget(
-    targets,
-    companionSkillsRoot,
-    watchDepthForPath(companionSkillsRoot, GROUPED_SKILLS_WATCH_DEPTH),
-  );
-}
-
-function addTrustedSymlinkSkillWatchTargets(
-  targets: Map<string, WatchTarget>,
-  root: string,
-  source: string,
-  allowedSymlinkTargetRealPaths: readonly string[],
-  maxDepth: number,
-  containmentRoot: string,
-): void {
-  const containmentRootRealPath = tryRealpath(containmentRoot) ?? path.resolve(containmentRoot);
-  const rootRealPath = tryRealpath(root) ?? path.resolve(root);
-  try {
-    if (
-      fs.lstatSync(root).isSymbolicLink() &&
-      isTrustedSymlinkSkillTarget(
-        source,
-        containmentRootRealPath,
-        rootRealPath,
-        allowedSymlinkTargetRealPaths,
-      )
-    ) {
-      addSkillRootWatchTargets(targets, rootRealPath, maxDepth);
+function createSkillsPathWatcher(
+  target: WatchTarget,
+  previousAncestorRoot = target.watchRoot,
+): SkillsPathWatchState {
+  const usePolling = resolveSkillsWatcherUsePolling();
+  const pathFilter = createSkillsWatchPathFilter(target.path, usePolling);
+  // Descendant native watches do not report ancestor moves. Keep shallow
+  // observation along the original path even after its content watch promotes.
+  const ancestorRoot = isPathInside(previousAncestorRoot, target.watchRoot)
+    ? previousAncestorRoot
+    : target.watchRoot;
+  const ancestorRoots: string[] = [];
+  let currentRoot = target.watchRoot;
+  while (isPathInside(ancestorRoot, currentRoot)) {
+    if (currentRoot !== target.path) {
+      ancestorRoots.push(currentRoot);
     }
-  } catch {
-    return;
-  }
-  const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
-  let watched = 0;
-  let directoryScans = 0;
-  let rawEntries = 0;
-  for (const queued of queue) {
-    if (
-      watched >= MAX_SYMLINK_WATCH_TARGETS_PER_ROOT ||
-      directoryScans >= MAX_SYMLINK_WATCH_DIRECTORY_SCANS_PER_ROOT ||
-      rawEntries >= MAX_SYMLINK_WATCH_RAW_ENTRIES_PER_ROOT
-    ) {
+    const parent = toWatchRoot(path.dirname(currentRoot));
+    if (parent === currentRoot) {
       break;
     }
-    const current = queued;
-    if (!current) {
-      continue;
-    }
-    const scan = readBudgetedDirEntries(
-      current.dir,
-      MAX_SYMLINK_WATCH_RAW_ENTRIES_PER_ROOT - rawEntries,
-    );
-    directoryScans += 1;
-    rawEntries += scan.scannedEntryCount;
-    if (!scan.ok) {
-      continue;
-    }
-    for (const entry of scan.entries.toSorted((a, b) => a.name.localeCompare(b.name))) {
-      if (watched >= MAX_SYMLINK_WATCH_TARGETS_PER_ROOT) {
-        break;
-      }
-      if (entry.name.startsWith(".") || entry.name === "node_modules") {
-        continue;
-      }
-      const childPath = path.join(current.dir, entry.name);
-      if (DEFAULT_SKILLS_WATCH_IGNORED.some((re) => re.test(childPath))) {
-        continue;
-      }
-      if (entry.isSymbolicLink()) {
-        const targetRealPath = tryRealpath(childPath);
-        if (
-          targetRealPath &&
-          isTrustedSymlinkSkillTarget(
-            source,
-            containmentRootRealPath,
-            targetRealPath,
-            allowedSymlinkTargetRealPaths,
-          )
-        ) {
-          addSkillRootWatchTargets(targets, targetRealPath, GROUPED_SKILLS_WATCH_DEPTH);
-          watched += 1;
-        }
-        continue;
-      }
-      if (entry.isDirectory() && current.depth < maxDepth) {
-        queue.push({ dir: childPath, depth: current.depth + 1 });
-      }
-    }
+    currentRoot = parent;
   }
-}
-
-function readBudgetedDirEntries(
-  dir: string,
-  maxEntries: number,
-):
-  | { ok: true; entries: fs.Dirent[]; scannedEntryCount: number }
-  | { ok: false; scannedEntryCount: number } {
-  const entries: fs.Dirent[] = [];
-  const limit = Math.max(0, maxEntries);
-  let handle: fs.Dir | undefined;
-  try {
-    handle = fs.opendirSync(dir);
-    for (let scanned = 0; scanned < limit; scanned += 1) {
-      const entry = handle.readSync();
-      if (!entry) {
-        return { ok: true, entries, scannedEntryCount: scanned };
-      }
-      entries.push(entry);
-    }
-    return { ok: true, entries, scannedEntryCount: limit };
-  } catch {
-    return { ok: false, scannedEntryCount: 0 };
-  } finally {
-    handle?.closeSync();
-  }
-}
-
-function isTrustedSymlinkSkillTarget(
-  source: string,
-  rootRealPath: string,
-  targetRealPath: string,
-  allowedSymlinkTargetRealPaths: readonly string[],
-): boolean {
-  if (source === "openclaw-managed" || source === "agents-skills-personal") {
-    return true;
-  }
-  return (
-    isPathInside(rootRealPath, targetRealPath) ||
-    isPathInsideAnyRoot(allowedSymlinkTargetRealPaths, targetRealPath)
-  );
-}
-
-function watchDepthForPath(raw: string, depth: number): number {
-  let missingSegments = 0;
-  let candidate = raw;
-  while (!fs.existsSync(candidate)) {
-    const parent = path.dirname(candidate);
-    if (parent === candidate) {
-      break;
-    }
-    missingSegments += 1;
-    candidate = parent;
-  }
-  return depth + missingSegments;
-}
-
-function resolveAllowedSymlinkTargetRealPaths(config?: OpenClawConfig): string[] {
-  const rawTargets = config?.skills?.load?.allowSymlinkTargets ?? [];
-  return rawTargets
-    .map((dir) => normalizeOptionalString(dir) ?? "")
-    .filter(Boolean)
-    .map((dir) => tryRealpath(resolveUserPath(dir)))
-    .filter((dir): dir is string => Boolean(dir));
-}
-
-function tryRealpath(filePath: string): string | null {
-  try {
-    return fs.realpathSync(filePath);
-  } catch {
-    return null;
-  }
-}
-
-function isPathInside(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return (
-    relative === "" || (relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative))
-  );
-}
-
-function isPathInsideAnyRoot(roots: readonly string[], child: string): boolean {
-  return roots.some((root) => isPathInside(root, child));
-}
-
-export function shouldIgnoreSkillsWatchPath(
-  watchPath: string,
-  stats?: { isDirectory?: () => boolean; isSymbolicLink?: () => boolean },
-): boolean {
-  if (DEFAULT_SKILLS_WATCH_IGNORED.some((re) => re.test(watchPath))) {
-    return true;
-  }
-  if (stats?.isDirectory?.() || stats?.isSymbolicLink?.()) {
-    return false;
-  }
-  if (!stats) {
-    return false;
-  }
-  const normalized = watchPath.replaceAll("\\", "/");
-  return path.posix.basename(normalized) !== "SKILL.md";
-}
-
-function resolveWatchDebounceMs(config?: OpenClawConfig): number {
-  const raw = config?.skills?.load?.watchDebounceMs;
-  return typeof raw === "number" && Number.isFinite(raw) ? Math.max(0, raw) : 250;
-}
-
-// Requires resolveWatchTargets to produce a stable-order result (it returns a
-// sorted array); positional comparison is intentional for hot-path efficiency.
-function sameWatchTargets(a: WatchTarget[], b: WatchTarget[]): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  for (let index = 0; index < a.length; index++) {
-    if (a[index]?.key !== b[index]?.key || a[index]?.depth !== b[index]?.depth) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function createSkillsPathWatcher(target: WatchTarget, debounceMs: number): SkillsPathWatchState {
-  const watcher = chokidar.watch(target.path, {
-    ignoreInitial: true,
-    followSymlinks: false,
-    // Skill root precedence and grouped discovery use the same bounded depth,
-    // so watcher invalidation must observe that whole decision surface.
-    depth: target.depth,
-    awaitWriteFinish: {
-      stabilityThreshold: debounceMs,
-      pollInterval: 100,
-    },
-    ignored: shouldIgnoreSkillsWatchPath,
-  });
-
+  const pendingAncestors = new Set(ancestorRoots);
+  let contentReady = target.path !== target.watchRoot;
+  const watcher =
+    target.path === target.watchRoot
+      ? runInSkillsWatcherContext(() =>
+          chokidar.watch(target.path, {
+            ignoreInitial: true,
+            followSymlinks: false,
+            usePolling,
+            // Identity metadata sits one level below the deepest admitted skill.
+            depth: target.depth + 1,
+            awaitWriteFinish: {
+              stabilityThreshold: SKILLS_WATCH_DEBOUNCE_MS,
+              pollInterval: 100,
+            },
+            ignored: pathFilter.ignored,
+          }),
+        )
+      : undefined;
+  const releaseAncestors: (() => void)[] = [];
   const state: SkillsPathWatchState = {
-    watcher,
+    closed: false,
+    close: () => {
+      if (state.closed) {
+        return;
+      }
+      state.closed = true;
+      clearTimeout(state.timer);
+      if (watcher) {
+        void teardownSkillsPathWatcher({ watcher });
+      }
+      for (const release of releaseAncestors) {
+        release();
+      }
+    },
+    schedule: (changedPath) => schedule(changedPath),
+    watchRoot: target.watchRoot,
+    ancestorRoot,
     depth: target.depth,
-    debounceMs,
+    initialScan: "pending",
     subscribers: new Set<string>(),
   };
-
-  const schedule = (changedPath?: string) => {
-    state.pendingPath = changedPath ?? state.pendingPath;
-    if (state.timer) {
-      clearTimeout(state.timer);
+  const isCurrent = () => !state.closed && pathWatchers.get(target.path) === state;
+  const reconcileRoot = (changedPath?: string) => {
+    if (!isCurrent()) {
+      return true;
     }
+    const nextTarget = makeSkillsWatchTarget(target.path, state.depth, state.ancestorRoot);
+    if (nextTarget.watchRoot === state.watchRoot) {
+      return false;
+    }
+    for (const subscriber of state.subscribers) {
+      workspaceWatchTargetCache.delete(subscriber);
+      for (const entry of workspaceWatchTargets.get(subscriber) ?? []) {
+        if (entry.path === target.path) {
+          entry.watchRoot = nextTarget.watchRoot;
+        }
+      }
+    }
+    const subscriber = state.subscribers.values().next().value;
+    if (subscriber !== undefined) {
+      subscribeWorkspaceToPath(subscriber, nextTarget);
+      if (changedPath) {
+        pathWatchers.get(target.path)?.schedule(changedPath);
+      }
+    }
+    return true;
+  };
+
+  const publishChanges = (
+    watcherKeys: Iterable<string>,
+    changedPath?: string,
+    change: SkillsWatchChange | "initial-scan" = "skills",
+  ) => {
+    const initialScan = change === "initial-scan";
+    const affected = new Map<string, SkillsSourceScope[] | undefined>();
+    for (const watcherKey of watcherKeys) {
+      if (change !== "supporting") {
+        workspaceWatchTargetCache.delete(watcherKey);
+      }
+      const owner = workspaceWatchOwners.get(watcherKey);
+      if (!owner) {
+        continue;
+      }
+      const shared = initialScan
+        ? owner.sharedScanPending
+        : workspaceWatchTargets.get(watcherKey)?.find((entry) => entry.path === target.path)
+            ?.executionOnly !== true;
+      if (initialScan) {
+        owner.sharedScanPending &&= (workspaceWatchTargets.get(watcherKey) ?? []).some(
+          (entry) => !entry.executionOnly && pathWatchers.get(entry.path)?.initialScan !== "ready",
+        );
+      }
+      if (shared) {
+        affected.set(owner.workspaceDir, undefined);
+        continue;
+      }
+      if (affected.has(owner.workspaceDir) && !affected.get(owner.workspaceDir)) {
+        continue;
+      }
+      const scopes = affected.get(owner.workspaceDir) ?? [];
+      scopes.push(owner.sourceScope);
+      affected.set(owner.workspaceDir, scopes);
+    }
+    for (const [workspaceDir, sourceScopes] of affected) {
+      if (change === "supporting") {
+        markSkillsSupportingFilesChanged({ workspaceDir, sourceScopes });
+      } else {
+        bumpSkillsSnapshotVersion({ workspaceDir, sourceScopes, reason: "watch", changedPath });
+      }
+    }
+  };
+  const settleInitialScan = (result: "ready" | "error") => {
+    if (!isCurrent() || state.initialScan === "ready" || state.initialScan === result) {
+      return;
+    }
+    state.initialScan = result;
+    const readySubscribers: string[] = [];
+    for (const watcherKey of state.subscribers) {
+      const targets = workspaceWatchTargets.get(watcherKey);
+      if (
+        targets?.every((entry) => {
+          const current = pathWatchers.get(entry.path);
+          return current && !current.closed && current.initialScan !== "pending";
+        })
+      ) {
+        readySubscribers.push(watcherKey);
+      }
+    }
+    publishChanges(readySubscribers, undefined, "initial-scan");
+  };
+
+  const schedule = (changedPath?: string, change: SkillsWatchChange = "skills") => {
+    // File-stability work may finish after this subscription has been closed.
+    if (!isCurrent() || (change === "supporting" && state.pendingChange === "skills")) {
+      return;
+    }
+    state.pendingPath = changedPath ?? state.pendingPath;
+    state.pendingChange = change;
+    clearTimeout(state.timer);
     state.timer = setTimeout(() => {
+      if (!isCurrent()) {
+        return;
+      }
       const pendingPath = state.pendingPath;
+      const pendingChange = state.pendingChange;
       state.pendingPath = undefined;
+      state.pendingChange = undefined;
       state.timer = undefined;
       // Fan the change out to every workspace subscribed to this directory so a
       // shared skill root refreshes the snapshot for all agents that use it.
-      for (const workspaceDir of state.subscribers) {
-        workspaceWatchTargetCache.delete(workspaceDir);
-        bumpSkillsSnapshotVersion({
-          workspaceDir,
-          reason: "watch",
-          changedPath: pendingPath,
-        });
-      }
-    }, debounceMs);
+      publishChanges(state.subscribers, pendingPath, pendingChange);
+    }, SKILLS_WATCH_DEBOUNCE_MS);
   };
-
-  watcher.on("add", (p) => schedule(p));
-  watcher.on("change", (p) => schedule(p));
-  watcher.on("unlink", (p) => schedule(p));
-  watcher.on("unlinkDir", (p) => schedule(p));
-  watcher.on("error", (err) => {
-    log.warn(`skills watcher error (${target.path}): ${String(err)}`);
+  const scheduleRawSkillFile = createRawSkillFileScheduler({
+    watcher: state,
+    stabilityMs: SKILLS_WATCH_DEBOUNCE_MS,
+    schedule,
+    onError: (changedPath, err) => {
+      log.warn(`skills watcher stability check failed (${changedPath}): ${String(err)}`);
+    },
   });
+
+  // ignoreInitial suppresses writes discovered before native watches are ready.
+  // Reconcile the whole workspace once its initial scans finish, rather than
+  // rebuilding metadata for every root that becomes ready.
+  const ready = () => {
+    if (!reconcileRoot() && contentReady && pendingAncestors.size === 0) {
+      settleInitialScan("ready");
+    }
+  };
+  watcher?.on("ready", () => {
+    contentReady = true;
+    ready();
+  });
+  const onChange = (event: string, changedPath: string) => {
+    if (
+      !isCurrent() ||
+      ((!watcher || event === "addDir" || event === "unlinkDir") && reconcileRoot(changedPath))
+    ) {
+      return;
+    }
+    const skillsRelevant = pathFilter.isRelevant(event, changedPath);
+    if (skillsRelevant || pathFilter.isSupportingPath(changedPath)) {
+      schedule(changedPath, skillsRelevant ? "skills" : "supporting");
+    }
+  };
+  watcher?.on("all", onChange);
+  const onRaw = (_eventName: string, rawPath: unknown, details: unknown) => {
+    if (!isCurrent()) {
+      return;
+    }
+    const rawPathText = rawPathToString(rawPath);
+    if (!rawPathText) {
+      const watchedPath = getRawWatchedPath(details);
+      if (watchedPath && isPathInside(target.path, watchedPath)) {
+        // Native filename loss can conceal a skill edit; content reconciliation decides.
+        schedule(watchedPath);
+      }
+      return;
+    }
+    const changedPath = resolveRawSkillsWatchPath(rawPathText, details);
+    if (
+      changedPath &&
+      isSkillDiscoveryFileWatchPath(changedPath) &&
+      isPathInside(target.path, changedPath)
+    ) {
+      if (usePolling) {
+        return;
+      }
+      scheduleRawSkillFile(changedPath);
+    } else if (changedPath && pathFilter.isSupportingPath(changedPath)) {
+      schedule(changedPath, "supporting");
+    }
+  };
+  watcher?.on("raw", onRaw);
+  const onError = (err: unknown) => {
+    if (!isCurrent()) {
+      return;
+    }
+    const capacityCode = usePolling ? undefined : getFileWatchCapacityCode(err);
+    if (capacityCode) {
+      if (!nativeWatchCapacityFailed) {
+        nativeWatchCapacityFailed = true;
+        log.warn(
+          `skills native watcher capacity exhausted (${capacityCode}); refreshing skills during agent preparation`,
+        );
+        for (const active of pathWatchers.values()) {
+          active.close();
+        }
+      }
+      return;
+    }
+    log.warn(`skills watcher error (${target.path}): ${String(err)}`);
+    // A failed scan may never emit ready. Let healthy roots reconcile; if the
+    // failed scan continues, its eventual ready still closes that read gap.
+    settleInitialScan("error");
+  };
+  watcher?.on("error", onError);
+  for (const root of ancestorRoots) {
+    releaseAncestors.push(
+      acquireSkillsAncestorWatcher(root, usePolling, {
+        path: target.path,
+        ignored: pathFilter.ignored,
+        ready: () => {
+          pendingAncestors.delete(root);
+          ready();
+        },
+        changed: onChange,
+        raw: onRaw,
+        error: (error) => {
+          pendingAncestors.delete(root);
+          onError(error);
+          // Missing roots still need the ancestor's recovery scan.
+          if (watcher) {
+            ready();
+          }
+        },
+      }).release,
+    );
+  }
 
   return state;
 }
 
-function teardownSkillsPathWatcher(state: SkillsPathWatchState): void {
-  if (state.timer) {
-    clearTimeout(state.timer);
-  }
-  void state.watcher.close().catch(() => {});
-}
-
-function subscribeWorkspaceToPath(
-  workspaceDir: string,
-  watchTarget: WatchTarget,
-  debounceMs: number,
-): void {
-  const existing = pathWatchers.get(watchTarget.key);
-  if (existing && existing.debounceMs === debounceMs && existing.depth >= watchTarget.depth) {
+function subscribeWorkspaceToPath(workspaceDir: string, watchTarget: WatchTarget): void {
+  const existing = pathWatchers.get(watchTarget.path);
+  if (
+    existing &&
+    existing.watchRoot === watchTarget.watchRoot &&
+    existing.depth >= watchTarget.depth
+  ) {
     existing.subscribers.add(workspaceDir);
     return;
   }
   if (existing) {
-    // Debounce changed (config reload): rebuild the shared watcher while
-    // preserving existing subscribers. Debounce is a gateway-global config
-    // value, so all workspaces normally request the same value and this branch
-    // does not fire; if it does, the most recent requested debounce wins for
-    // every subscriber of the shared path (last-writer-wins).
+    // A changed ancestor or deeper target needs a rebuilt watcher, preserving subscribers.
     const next = createSkillsPathWatcher(
-      { ...watchTarget, depth: Math.max(existing.depth, watchTarget.depth) },
-      debounceMs,
+      {
+        ...watchTarget,
+        depth: Math.max(existing.depth, watchTarget.depth),
+      },
+      existing.ancestorRoot,
     );
     for (const subscriber of existing.subscribers) {
       next.subscribers.add(subscriber);
+      const owner = workspaceWatchOwners.get(subscriber);
+      if (
+        owner &&
+        workspaceWatchTargets
+          .get(subscriber)
+          ?.some((target) => target.path === watchTarget.path && !target.executionOnly)
+      ) {
+        owner.sharedScanPending = true;
+      }
     }
     next.subscribers.add(workspaceDir);
-    teardownSkillsPathWatcher(existing);
-    pathWatchers.set(watchTarget.key, next);
+    existing.close();
+    pathWatchers.set(watchTarget.path, next);
     return;
   }
-  const state = createSkillsPathWatcher(watchTarget, debounceMs);
+  const state = createSkillsPathWatcher(watchTarget);
   state.subscribers.add(workspaceDir);
-  pathWatchers.set(watchTarget.key, state);
+  pathWatchers.set(watchTarget.path, state);
 }
 
 function unsubscribeWorkspaceFromPath(workspaceDir: string, watchTarget: WatchTarget): void {
-  const state = pathWatchers.get(watchTarget.key);
+  const state = pathWatchers.get(watchTarget.path);
   if (!state) {
     return;
   }
   state.subscribers.delete(workspaceDir);
   if (state.subscribers.size === 0) {
-    teardownSkillsPathWatcher(state);
-    pathWatchers.delete(watchTarget.key);
+    state.close();
+    pathWatchers.delete(watchTarget.path);
   }
 }
 
 function disposeWorkspaceWatchState(
-  workspaceDir: string,
-  watchTargets: readonly WatchTarget[] = workspaceWatchTargets.get(workspaceDir) ?? [],
+  watcherKey: string,
+  watchTargets: readonly WatchTarget[] = workspaceWatchTargets.get(watcherKey) ?? [],
 ): void {
-  const hadWatchTargets = watchTargets.length > 0;
   for (const watchTarget of watchTargets) {
-    unsubscribeWorkspaceFromPath(workspaceDir, watchTarget);
+    unsubscribeWorkspaceFromPath(watcherKey, watchTarget);
   }
-  workspaceWatchTargets.delete(workspaceDir);
-  workspaceWatchTargetCache.delete(workspaceDir);
-  workspaceWatchLastEnsuredAt.delete(workspaceDir);
-  if (hadWatchTargets) {
-    // Watcher disposal creates an unwatched interval; mark the workspace dirty
-    // so the next turn rebuilds skills even if file events were missed.
-    bumpSkillsSnapshotVersion({ workspaceDir, reason: "watch-targets" });
-  }
-  clearSkillsSnapshotVersionForWorkspace(workspaceDir);
+  workspaceWatchTargets.delete(watcherKey);
+  workspaceWatchOwners.delete(watcherKey);
+  workspaceWatchTargetCache.delete(watcherKey);
+  workspaceWatchLastEnsuredAt.delete(watcherKey);
+  // Reacquisition invalidates after an unwatched interval. Disposal itself does
+  // not change skills, including for other subscriptions sharing this workspace.
 }
 
-function evictIdleWorkspaceWatchStates(now: number): void {
+function evictWorkspaceWatchStates(now: number): void {
+  const evict = (watcherKey: string) => {
+    const owner = workspaceWatchOwners.get(watcherKey);
+    disposeWorkspaceWatchState(watcherKey);
+    if (!owner) {
+      return;
+    }
+    const remainingOwners = Array.from(workspaceWatchOwners.values()).filter(
+      (other) => other.workspaceDir === owner.workspaceDir,
+    );
+    if (remainingOwners.length === 0) {
+      suspendSkillsSnapshotSources(owner.workspaceDir, {});
+    }
+    if (
+      owner.sourceScope.executionWorkspaceDir &&
+      !remainingOwners.some(
+        (other) =>
+          other.sourceScope.executionWorkspaceDir === owner.sourceScope.executionWorkspaceDir,
+      )
+    ) {
+      suspendSkillsSnapshotSources(owner.workspaceDir, owner.sourceScope);
+    }
+  };
   const cutoff = now - SKILLS_WORKSPACE_WATCH_IDLE_TTL_MS;
-  for (const [workspaceDir, lastEnsuredAt] of workspaceWatchLastEnsuredAt) {
+  for (const [watcherKey, lastEnsuredAt] of workspaceWatchLastEnsuredAt) {
     if (lastEnsuredAt < cutoff) {
-      disposeWorkspaceWatchState(workspaceDir);
+      evict(watcherKey);
     }
   }
+  for (const watcherKey of workspaceWatchLastEnsuredAt.keys()) {
+    if (workspaceWatchLastEnsuredAt.size <= MAX_SKILLS_WORKSPACE_WATCH_STATES) {
+      break;
+    }
+    evict(watcherKey);
+  }
 }
 
-export function ensureSkillsWatcher(params: { workspaceDir: string; config?: OpenClawConfig }) {
+export function ensureSkillsWatcher(params: {
+  workspaceDir: string;
+  executionWorkspaceDir?: string;
+  config?: OpenClawConfig;
+  agentId?: string;
+  pluginMetadataSnapshot?: PluginMetadataSnapshot;
+}) {
   const workspaceDir = params.workspaceDir.trim();
   if (!workspaceDir) {
     return;
   }
+  const { executionWorkspaceDir } = normalizeWorkspaceSkillRoots({
+    agentWorkspaceDir: workspaceDir,
+    executionWorkspaceDir: params.executionWorkspaceDir,
+  });
+  const watcherKey = JSON.stringify([workspaceDir, executionWorkspaceDir, params.agentId]);
+  const sourceScope = { executionWorkspaceDir };
+  const owner = {
+    workspaceDir,
+    sourceScope,
+    sharedScanPending: workspaceWatchOwners.get(watcherKey)?.sharedScanPending ?? false,
+  };
+  workspaceWatchOwners.set(watcherKey, owner);
+  const refreshInputs = {
+    sourceScope,
+    config: params.config,
+    pluginMetadataSnapshot: params.pluginMetadataSnapshot,
+  };
   const now = Date.now();
   const watchEnabled = params.config?.skills?.load?.watch !== false;
-  const debounceMs = resolveWatchDebounceMs(params.config);
-  const previousTargets = workspaceWatchTargets.get(workspaceDir) ?? [];
+  const previousTargets = workspaceWatchTargets.get(watcherKey) ?? [];
 
   if (!watchEnabled) {
-    disposeWorkspaceWatchState(workspaceDir, previousTargets);
-    evictIdleWorkspaceWatchStates(now);
+    disposeWorkspaceWatchState(watcherKey, previousTargets);
+    evictWorkspaceWatchStates(now);
     return;
   }
 
-  workspaceWatchLastEnsuredAt.set(workspaceDir, now);
-  const watchTargets = resolveWatchTargets(workspaceDir, params.config);
-  const targetsUnchanged = sameWatchTargets(previousTargets, watchTargets);
-  const debounceUnchanged = watchTargets.every(
-    // undefined for paths not yet watched -> false -> fall through to subscribe.
-    (watchTarget) => {
-      const pathWatcher = pathWatchers.get(watchTarget.key);
-      return pathWatcher?.debounceMs === debounceMs && pathWatcher.depth >= watchTarget.depth;
-    },
+  // Map order breaks equal-clock ties and promotes reuse without adding a generation.
+  workspaceWatchLastEnsuredAt.delete(watcherKey);
+  workspaceWatchLastEnsuredAt.set(watcherKey, now);
+  evictWorkspaceWatchStates(now);
+  if (nativeWatchCapacityFailed) {
+    // Reconcile file-backed sources during preparation while native observation
+    // is unavailable, without reopening watches.
+    workspaceWatchTargetCache.delete(watcherKey);
+    bumpSkillsSnapshotVersion({ workspaceDir, refreshInputs, reason: "watch" });
+    return;
+  }
+  const watchTargets = resolveWatchTargets(
+    workspaceDir,
+    params.config,
+    params.agentId,
+    executionWorkspaceDir,
+    watcherKey,
+    params.pluginMetadataSnapshot,
   );
-  if (targetsUnchanged && debounceUnchanged) {
-    evictIdleWorkspaceWatchStates(now);
+  // resolveWatchTargets returns stable sorted order, so positional equality is intentional.
+  const targetsMatch = (previous: WatchTarget, next: WatchTarget) =>
+    previous.path === next.path &&
+    previous.watchRoot === next.watchRoot &&
+    previous.depth === next.depth &&
+    previous.executionOnly === next.executionOnly;
+  const targetsUnchanged = areOrderedArraysEqual(previousTargets, watchTargets, targetsMatch);
+  const watcherDepthsCoverTargets = watchTargets.every(
+    (watchTarget) => (pathWatchers.get(watchTarget.path)?.depth ?? -1) >= watchTarget.depth,
+  );
+  if (targetsUnchanged && watcherDepthsCoverTargets) {
     return;
   }
-  const watchTargetsChanged = previousTargets.length > 0 && !targetsUnchanged;
-
-  const nextTargetKeys = new Set(watchTargets.map((target) => target.key));
+  const coveredTargets = previousTargets.length
+    ? previousTargets
+    : Array.from(workspaceWatchOwners).flatMap(([key, other]) =>
+        other.workspaceDir === workspaceDir ? (workspaceWatchTargets.get(key) ?? []) : [],
+      );
+  const sharedTargetsChanged =
+    watchTargets.some(
+      (target) =>
+        !target.executionOnly && !coveredTargets.some((previous) => targetsMatch(previous, target)),
+    ) ||
+    previousTargets.some(
+      (previous) =>
+        !previous.executionOnly && !watchTargets.some((target) => targetsMatch(previous, target)),
+    );
+  const nextTargetKeys = new Set(watchTargets.map((target) => target.path));
   for (const watchTarget of previousTargets) {
-    if (!nextTargetKeys.has(watchTarget.key)) {
-      unsubscribeWorkspaceFromPath(workspaceDir, watchTarget);
+    if (!nextTargetKeys.has(watchTarget.path)) {
+      unsubscribeWorkspaceFromPath(watcherKey, watchTarget);
     }
   }
   for (const watchTarget of watchTargets) {
-    subscribeWorkspaceToPath(workspaceDir, watchTarget, debounceMs);
+    subscribeWorkspaceToPath(watcherKey, watchTarget);
   }
-  workspaceWatchTargets.set(workspaceDir, watchTargets);
+  workspaceWatchTargets.set(watcherKey, watchTargets);
+  owner.sharedScanPending ||= watchTargets.some(
+    (target) => !target.executionOnly && pathWatchers.get(target.path)?.initialScan !== "ready",
+  );
 
-  if (watchTargetsChanged) {
+  // Acquisition must invalidate reads cached during an unwatched interval,
+  // before the first consumer runs or the asynchronous initial scan completes.
+  if (!targetsUnchanged) {
     bumpSkillsSnapshotVersion({
       workspaceDir,
+      sourceScopes: sharedTargetsChanged ? undefined : [sourceScope],
+      refreshInputs,
       reason: "watch-targets",
       changedPath: watchTargets.map((target) => target.path).join("|"),
     });
   }
-  evictIdleWorkspaceWatchStates(now);
 }
 
-export async function resetSkillsRefreshForTest(): Promise<void> {
-  resetSkillsRefreshStateForTest();
-
+export async function closeSkillsWatchers(resetState = false): Promise<void> {
+  if (resetState) {
+    resetSkillsRefreshStateForTest();
+  }
   const active = Array.from(pathWatchers.values());
+  nativeWatchCapacityFailed = false;
   pathWatchers.clear();
   workspaceWatchTargets.clear();
+  workspaceWatchOwners.clear();
   workspaceWatchTargetCache.clear();
   workspaceWatchLastEnsuredAt.clear();
-  await Promise.all(
-    active.map(async (state) => {
-      if (state.timer) {
-        clearTimeout(state.timer);
-      }
-      try {
-        await state.watcher.close();
-      } catch {
-        // Best-effort test cleanup.
-      }
-    }),
-  );
+  for (const state of active) {
+    state.close();
+  }
+  await joinSkillsWatcherCloses();
 }

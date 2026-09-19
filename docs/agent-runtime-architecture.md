@@ -1,29 +1,32 @@
 ---
 title: "Agent runtime architecture"
-summary: "How OpenClaw runs the built-in agent runtime, providers, sessions, tools, and extensions."
+summary: "How OpenClaw structures the built-in agent runtime: code layout, boundaries, resource manifests, and runtime selection."
 ---
 
-OpenClaw owns the built-in agent runtime directly. The runtime code lives under `src/agents/`, model/provider helpers live under `src/llm/`, and plugin-facing contracts are exposed through `openclaw/plugin-sdk/*` barrels.
+OpenClaw owns the built-in agent runtime. Runtime code lives under `src/agents/`, model/provider transport lives under `src/llm/`, and `openclaw/plugin-sdk/*` barrels expose the plugin-facing contracts.
 
 ## Runtime Layout
 
-- `src/agents/embedded-agent-runner/`: built-in agent attempt loop, provider stream adapters, compaction, model selection, and session wiring.
-- `src/agents/sessions/`: session persistence, extension loading, resource discovery, skills, prompts, themes, and TUI-backed tool renderers.
-- `packages/agent-core/`: reusable agent core, lower-level harness types, messages, compaction helpers, prompt templates, and tool/session contracts.
-- `src/agents/runtime/`: OpenClaw facade for `@openclaw/agent-core` plus local proxy utilities.
-- `src/agents/agent-tools*.ts`: OpenClaw-owned tool definitions, schemas, policy, before/after hook adapters, and host edit support.
-- `src/agents/agent-hooks/`: built-in runtime hooks such as compaction safeguards and context pruning.
-- `src/llm/`: model/provider registry, transport helpers, and provider-specific stream implementations.
+| Path                                | Owns                                                                                                                                                                                                                      |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/agents/embedded-agent-runner/` | Built-in attempt loop (`run.ts`, `run/`), model selection and provider normalization (`model*.ts`), per-provider request params (`extra-params.*`), compaction, transcript and session wiring.                            |
+| `src/agents/sessions/`              | Session persistence (`session-manager.ts`), resource discovery (`package-manager.ts`, `resource-loader.ts`), in-session `extensions` loading, prompt templates, skills, themes, and TUI-backed tool renderers (`tools/`). |
+| `packages/agent-core/`              | Reusable agent core (`@openclaw/agent-core`): agent loop, harness types, messages, compaction helpers, prompt templates, skills, and session storage contracts.                                                           |
+| `src/agents/runtime/`               | OpenClaw facade that wires `@openclaw/agent-core` to the plugin SDK LLM runtime and re-exports it plus local proxy utilities.                                                                                             |
+| `src/agents/agent-tools*.ts`        | OpenClaw-owned tool definitions, parameter schemas, tool policy, before/after tool-call adapters, and host/sandbox edit tools.                                                                                            |
+| `src/agents/agent-hooks/`           | Built-in runtime hooks: compaction safeguard, compaction instructions, context pruning.                                                                                                                                   |
+| `src/agents/harness/`               | Harness registry, selection policy, and lifecycle for the built-in and plugin-registered harnesses.                                                                                                                       |
+| `src/llm/`                          | Model/provider registry, transport helpers, and provider-specific stream implementations (`src/llm/providers/`).                                                                                                          |
 
 ## Boundaries
 
-Core code calls the built-in runtime through OpenClaw modules and SDK barrels, not through old external agent packages. Plugins use documented `openclaw/plugin-sdk/*` entrypoints and do not import `src/**` internals.
+Core calls the built-in runtime through OpenClaw modules and SDK barrels. No external agent framework packages remain. Plugins use documented `openclaw/plugin-sdk/*` entrypoints and do not import `src/**` internals.
 
-`@earendil-works/pi-tui` remains a third-party TUI dependency. It is used as a terminal component toolkit by the local TUI and session renderers; internalizing it would be a separate vendoring effort.
+`@earendil-works/pi-tui` remains a third-party dependency: a terminal component toolkit used by the local TUI and session tool renderers. Internalizing it would be a separate vendoring effort.
 
 ## Manifests
 
-Resource packages declare OpenClaw resources in package metadata:
+Resource packages declare OpenClaw resources in `package.json` metadata. Entries are file paths or globs relative to the package root:
 
 ```json
 {
@@ -36,11 +39,43 @@ Resource packages declare OpenClaw resources in package metadata:
 }
 ```
 
-The package manager also discovers conventional `extensions/`, `skills/`, `prompts/`, and `themes/` directories.
+Resource types not listed in a manifest fall back to discovery of conventional `extensions/`, `skills/`, `prompts/`, and `themes/` directories.
 
 ## Runtime Selection
 
-The default built-in runtime id is `openclaw`. Plugin harnesses can register additional runtime ids. `auto` selects a supporting plugin harness when one exists and otherwise uses the built-in OpenClaw runtime.
+- The built-in runtime id is `openclaw`. The legacy alias `pi` normalizes to `openclaw`. The alias `codex-app-server` normalizes to `codex`.
+- Plugin harnesses register additional runtime ids (for example `codex`).
+- Runtime policy is model/provider-scoped `agentRuntime.id` config (model entry wins over provider entry). Unset or `default` resolves to `auto`.
+- `auto` selects a registered plugin harness that supports the effective provider route, otherwise the built-in OpenClaw runtime. A provider or model prefix alone never selects a harness.
+- OpenAI may select `codex` implicitly. This happens only for an exact official HTTPS Platform Responses or ChatGPT Responses route with no authored request override. Completions adapters, custom endpoints, and routes with authored request behavior stay on `openclaw`. Plaintext official HTTP endpoints are rejected. See [OpenAI implicit agent runtime](/providers/openai/runtimes#implicit-agent-runtime).
+
+## Model Runtime Generations
+
+Gateway startup and config, plugin, or auth publication build one prepared model runtime generation per configured agent. Each generation owns the discovered auth template, model registry, and projected model catalog as one atomic snapshot. Agent runs fork mutable auth and registry stores from that snapshot. Browse, status, cron, doctor, TUI, PDF, and image paths read the published catalog instead of repeating filesystem discovery.
+
+Standalone embedded runtimes publish the same snapshot shape at their activation boundary. A failed or stale generation is never served alongside a newer partial generation. The lifecycle owner must publish a complete replacement first.
+
+## Compute workers
+
+Code-mode execution and compaction planning use the reusable `WorkerTaskPool`.
+Their pools share a CPU admission limit of `max(1, availableParallelism() - 1)`
+within the calling isolate, reserving a CPU where possible for the Gateway. Ordered
+database and model-generation workers keep their existing independent limits.
+
+Admission includes queued, preparing, and running tasks. Each pool defaults to
+128 pending tasks and 256 MiB of producer-reported retained input; compute pools
+also share those pending limits. Producers supply known input sizes without an
+extra serialization pass. This bounds reported input retention, not total worker
+heap usage. Excess work fails with `WorkerTaskError.code = "overloaded"`.
+Cancellation retains the execution permit until the worker stops, and retains
+the input reservation until any asynchronous preparation settles.
+
+Waiting compute pools request checkpoints from code-mode host exchanges so that
+nested work can progress. Idle workers release CPU admission and retire after
+the pool's idle timeout. Local `node:diagnostics_channel` subscribers to
+`openclaw.worker.task` can observe queue, preparation, execution wall time,
+message transfer time, and pending task/input counts. These events contain no
+task inputs; execution wall time includes worker startup and host waits.
 
 ## Related
 
