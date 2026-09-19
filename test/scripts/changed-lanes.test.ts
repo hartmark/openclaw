@@ -1918,6 +1918,7 @@ describe("scripts/changed-lanes", () => {
       create: createTargetedCoreLintCommands,
       targets: [
         "config/assertion-safety-baseline.txt",
+        "config/max-lines-baseline.txt",
         ".github/workflows/ci.yml",
         "scripts/check-changed.mjs",
         "src/agents/auth-profiles/usage.ts",
@@ -1934,6 +1935,7 @@ describe("scripts/changed-lanes", () => {
       create: createTargetedExtensionLintCommand,
       targets: [
         "config/assertion-safety-baseline.txt",
+        "config/max-lines-baseline.txt",
         "extensions/lmstudio/src/model-reasoning.ts",
         "docs/help/testing.md",
       ],
@@ -1948,6 +1950,7 @@ describe("scripts/changed-lanes", () => {
       create: createTargetedScriptLintCommand,
       targets: [
         "config/assertion-safety-baseline.txt",
+        "config/max-lines-baseline.txt",
         "scripts/check-changed.mjs",
         "test/scripts/changed-lanes.test.ts",
       ],
