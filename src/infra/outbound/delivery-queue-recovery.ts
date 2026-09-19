@@ -538,19 +538,13 @@ async function runReconciledSentCommitHooks(params: {
   }
 }
 
-function recoveryPlatformAttemptId(
-  entry: QueuedDelivery,
-  claimedAttemptId?: string,
-): string | null | undefined {
+function recoveryPlatformAttemptId(entry: QueuedDelivery, claimedAttemptId?: string) {
   return claimedAttemptId !== undefined
     ? claimedAttemptId
     : typeof entry.platformSendAttemptId === "string"
       ? entry.platformSendAttemptId
       : entry.recoveryState === "producer_claimed" && typeof entry.producerClaimId === "string"
-        ? // A live producer claim already fences this row; expecting "no claim"
-          // (null) here would make every completed-owner ack lose the race
-          // against its own still-current lease and never settle the entry.
-          entry.producerClaimId
+        ? entry.producerClaimId
         : typeof entry.completionRetention === "object" || entry.requiresProducerClaim === true
           ? null
           : undefined;

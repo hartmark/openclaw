@@ -240,9 +240,6 @@ describe("exhausted delivery producer recovery", () => {
         sessionKey: "agent:main:directchat:direct:recipient",
         storePath: path.join(tmpDir(), "sessions.json"),
       };
-      // The session moved on without this delivery id (e.g. the live send
-      // already settled it through another path): the durable completion
-      // authority resolves this delivery as "stale", not "queued"/"delivered".
       await sessionAccessor.replaceSessionEntry(completion, {
         sessionId: completion.sessionId,
         updatedAt: now,
@@ -255,10 +252,7 @@ describe("exhausted delivery producer recovery", () => {
           deliveries: [],
         },
       });
-      // No reserveDeliveryAttempt here: the real incident's rows never
-      // reached a real send attempt (attemptCount stayed 0), so the retry
-      // budget is never exhausted and recovery must reach the completed-owner
-      // ack path instead of the unrelated budget-exhaustion settlement.
+      // Keep the attempt budget unused to reach completed-owner acknowledgement.
       await enqueue(id, true, completion);
       const claimId = await queueStorage.claimDeliveryPlatformSendAttempt(id, tmpDir());
       if (!claimId) {
@@ -268,11 +262,6 @@ describe("exhausted delivery producer recovery", () => {
 
       await recover(mode);
 
-      // A stale durable completion must still terminalize the queue row (no
-      // completionRetention here, matching the real incident's rows, so a
-      // successful ack removes the row outright rather than marking it
-      // "failed"). Recovery must not leave a producer-claimed entry pending
-      // forever just because its completion authority no longer tracks it.
       expect(queueStatus(id)).toBeUndefined();
     },
   );
