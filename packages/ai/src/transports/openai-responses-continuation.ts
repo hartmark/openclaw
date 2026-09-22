@@ -361,6 +361,17 @@ export function claimOpenAIResponsesHttpContinuation(
           lastResponseItems: response.output,
         };
         const retainedBytes = estimateRetainedBytes(state);
+        // estimateRetainedBytes just ran JSON.stringify over caller-supplied
+        // request/response content, which can synchronously invoke a
+        // caller-defined toJSON/getter. That callback could run session
+        // cleanup and/or start a replacement claim at this same key
+        // mid-serialization -- re-check ownership now, after the one step
+        // that can re-enter this module, and before eviction or any write
+        // touches shared state, so a stale commit can't overwrite the
+        // replacement claim or resurrect state a concurrent cleanup cleared.
+        if (httpContinuationEntries.get(key) !== claimed) {
+          return;
+        }
         if (retainedBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES) {
           // Evicting every other entry still wouldn't make this one fit --
           // skip caching it. The turn's actual response already completed

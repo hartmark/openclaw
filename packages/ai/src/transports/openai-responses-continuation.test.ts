@@ -511,21 +511,52 @@ describe("OpenAI Responses continuation", () => {
 
   it("honors a shorter per-model idleTtlMs override", () => {
     vi.useFakeTimers();
-    const first = claimOpenAIResponsesHttpContinuation({
-      sessionId: "session-1",
-      apiKey: "api-key",
-      baseUrl: "https://api.openai.com/v1",
-      headers: { Authorization: "Bearer tenant-a" },
-      request: continuationState().lastRequest,
-      idleTtlMs: 60_000,
-    });
+    // Mirrors claim()'s own header set exactly (Authorization plus the
+    // turn/route headers it always adds), not just Authorization -- headers
+    // participate in the cache key via connectionIdentity(), so a claim with
+    // a narrower header set than a later claim() call would land at a
+    // *different* key and always miss regardless of whether idleTtlMs is
+    // honored at all, silently making this test's assertion vacuous. Every
+    // claim below goes through this same helper (not the file's shared
+    // claim(), which doesn't accept an override) so the short TTL applies
+    // consistently across the whole chain instead of reverting to the
+    // module default the moment any commit omits it.
+    const claimWithOverride = (request: ResponsesContinuationRequest) =>
+      claimOpenAIResponsesHttpContinuation({
+        sessionId: "session-1",
+        apiKey: "api-key",
+        baseUrl: "https://api.openai.com/v1",
+        headers: {
+          Authorization: "Bearer tenant-a",
+          traceparent: "trace-1",
+          "x-openclaw-turn-id": "turn-1",
+          "x-openclaw-turn-attempt": "1",
+          "x-stable-route": "route-a",
+        },
+        request,
+        idleTtlMs: 60_000,
+      });
+
+    const first = claimWithOverride(continuationState().lastRequest);
     first?.commit(continuationState().lastRequest, {
       id: "resp_custom_ttl",
       output: continuationState().lastResponseItems,
     });
+
+    // Establish a real pre-expiry hit first, under the identical identity
+    // and the same override, so the miss below actually demonstrates the
+    // override's TTL firing rather than some other, unrelated identity
+    // mismatch that would miss regardless.
+    const withinTtl = claimWithOverride(nextRequest());
+    expect(withinTtl?.request.previous_response_id).toBe("resp_custom_ttl");
+    withinTtl?.commit(withinTtl.fullRequest, {
+      id: "resp_custom_ttl_2",
+      output: continuationState().lastResponseItems,
+    });
+
     vi.advanceTimersByTime(60_000 + 1);
 
-    const next = claim({ request: nextRequest() });
+    const next = claimWithOverride(nextRequest());
     expect(next?.request.previous_response_id).toBeUndefined();
     next?.release();
   });
@@ -676,5 +707,39 @@ describe("OpenAI Responses continuation", () => {
     });
     expect(survivor?.request.previous_response_id).toBe(`budget-resp-${fillEntries - 1}`);
     survivor?.release();
+  });
+
+  it("does not overwrite a replacement claim that starts while the stale commit is still serializing", () => {
+    // estimateRetainedBytes runs JSON.stringify over the committed
+    // request/response to size it against the byte budget. That stringify
+    // synchronously invokes any toJSON a caller-supplied value defines --
+    // this simulates a caller whose toJSON callback runs session cleanup and
+    // starts a brand-new claim at the exact same key, mid-serialization, the
+    // same way a genuinely concurrent turn's cleanup + reclaim could
+    // interleave with this commit's own (already in-flight) work.
+    const raceParams = { sessionId: "toJSON-race-session" };
+    const first = claim(raceParams);
+    let replacement: ReturnType<typeof claim>;
+    const raceOutput = {
+      ...assistantOutput,
+      toJSON() {
+        cleanupSessionResources(raceParams.sessionId);
+        replacement = claim(raceParams);
+        return { ...assistantOutput };
+      },
+    };
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_race",
+      output: [raceOutput] as never,
+    });
+
+    // The replacement claim must still own the key afterward: a fixed commit
+    // re-checks ownership right after serialization and bails out instead of
+    // clobbering the replacement with a stale "ready" entry. If it didn't,
+    // a third claim attempt here would wrongly succeed against resurrected
+    // state instead of correctly finding the key still busy.
+    expect(replacement).toBeDefined();
+    expect(claim(raceParams)).toBeUndefined();
+    replacement?.release();
   });
 });
