@@ -1,3 +1,4 @@
+// Discord tests cover thread bindingsiscord api plugin behavior.
 import { ChannelType } from "discord-api-types/v10";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -217,6 +218,33 @@ describe("maybeSendBindingMessage", () => {
       sendWebhookMessageDiscord(...args),
     );
   });
+
+  it.each([false, true])(
+    "does not send a fresh binding notice after revocation (webhook=%s)",
+    async (webhook) => {
+      await maybeSendBindingMessage({
+        cfg: EMPTY_DISCORD_TEST_CONFIG,
+        record: {
+          accountId: "default",
+          channelId: "parent-1",
+          threadId: "thread-1",
+          targetKind: "subagent",
+          targetSessionKey: "agent:main:subagent:test",
+          agentId: "main",
+          boundBy: "test",
+          boundAt: 1,
+          lastActivityAt: 1,
+          ...(webhook ? { webhookId: "wh-1", webhookToken: "tok-1" } : {}),
+        },
+        text: "Binding ready",
+        assertCurrent: () => {
+          throw new Error("Command owner was revoked");
+        },
+      });
+      expect(sendMessageDiscord).not.toHaveBeenCalled();
+      expect(sendWebhookMessageDiscord).not.toHaveBeenCalled();
+    },
+  );
 
   it("forwards cfg to webhook send path", async () => {
     const cfg = {

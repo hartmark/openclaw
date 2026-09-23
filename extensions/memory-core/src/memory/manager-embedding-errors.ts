@@ -1,10 +1,10 @@
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 
-export const MEMORY_EMBEDDING_OPERATION_ERROR_CODE = "MEMORY_EMBEDDING_OPERATION_FAILED";
+const MEMORY_EMBEDDING_OPERATION_ERROR_CODE = "MEMORY_EMBEDDING_OPERATION_FAILED";
 
-export type MemoryEmbeddingOperationKind = "query" | "batch" | "structured-batch";
+type MemoryEmbeddingOperationKind = "query" | "batch" | "structured-batch";
 
-export type MemoryEmbeddingOperationError = Error & {
+type MemoryEmbeddingOperationError = Error & {
   code: typeof MEMORY_EMBEDDING_OPERATION_ERROR_CODE;
   operation: MemoryEmbeddingOperationKind;
   providerId?: string;

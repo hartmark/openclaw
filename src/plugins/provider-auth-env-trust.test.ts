@@ -1,9 +1,10 @@
+// Verifies provider auth environment trust decisions.
 import { describe, expect, it, vi } from "vitest";
 
-const getProviderEnvVars = vi.hoisted(() => vi.fn(() => ["WHISPERX_API_KEY"]));
+const getProviderEnvVarsCore = vi.hoisted(() => vi.fn(() => ["WHISPERX_API_KEY"]));
 
 vi.mock("../secrets/provider-env-vars.js", () => ({
-  getProviderEnvVars,
+  getProviderEnvVarsCore,
   resolveProviderAuthLookupMaps: () => ({
     aliasMap: {},
     envCandidateMap: {},
@@ -21,7 +22,7 @@ describe("provider auth env trust", () => {
       config,
     });
 
-    expect(getProviderEnvVars).toHaveBeenCalledWith("whisperx", {
+    expect(getProviderEnvVarsCore).toHaveBeenCalledWith("whisperx", {
       config,
       includeUntrustedWorkspacePlugins: false,
     });
@@ -46,6 +47,34 @@ describe("provider auth env trust", () => {
     });
   });
 
+  it("buildApiKeyCredential rejects malformed object SecretRefs", async () => {
+    const { buildApiKeyCredential } = await import("./provider-auth-helpers.js");
+    const malformedRefs = [
+      { source: "env", provider: "default", id: "OPENAI_API_KEY", extra: "x" },
+      { source: "env", provider: "Default", id: "OPENAI_API_KEY" },
+      { source: "env", provider: "default", id: "openai_api_key" },
+      { source: "file", provider: "default", id: "providers/openai/apiKey" },
+      { source: "exec", provider: "vault", id: "vault/../api-key" },
+    ];
+
+    for (const ref of malformedRefs) {
+      expect(() => buildApiKeyCredential("openai", ref as never)).toThrow(
+        "API key SecretRef is invalid.",
+      );
+    }
+  });
+
+  it("buildApiKeyCredential keeps invalid env-template strings as plaintext", async () => {
+    const { buildApiKeyCredential } = await import("./provider-auth-helpers.js");
+    const overlongEnvRef = `\${A${"B".repeat(128)}}`;
+
+    expect(buildApiKeyCredential("openai", overlongEnvRef)).toEqual({
+      type: "api_key",
+      provider: "openai",
+      key: overlongEnvRef,
+    });
+  });
+
   it("resolveRefFallbackInput excludes untrusted workspace plugin env vars", async () => {
     const { resolveRefFallbackInput } = await import("./provider-auth-ref.js");
     const config = { plugins: {} };
@@ -56,7 +85,7 @@ describe("provider auth env trust", () => {
       env: { WHISPERX_API_KEY: "test-secret" },
     });
 
-    expect(getProviderEnvVars).toHaveBeenCalledWith("whisperx", {
+    expect(getProviderEnvVarsCore).toHaveBeenCalledWith("whisperx", {
       config,
       includeUntrustedWorkspacePlugins: false,
     });
@@ -82,7 +111,7 @@ describe("provider auth env trust", () => {
       env: { WHISPERX_API_KEY: "test-secret" },
     });
 
-    expect(getProviderEnvVars).toHaveBeenCalledWith("whisperx", {
+    expect(getProviderEnvVarsCore).toHaveBeenCalledWith("whisperx", {
       config,
       includeUntrustedWorkspacePlugins: false,
     });

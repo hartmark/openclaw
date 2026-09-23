@@ -1,165 +1,101 @@
+/**
+ * Builds runtime context prompt fragments and custom session messages.
+ */
+import type { Context, UserMessage } from "../../../llm/types.js";
 import {
-  extractInternalRuntimeContext,
-  OPENCLAW_NEXT_TURN_RUNTIME_CONTEXT_HEADER,
+  INTERNAL_RUNTIME_CONTEXT_BEGIN,
+  INTERNAL_RUNTIME_CONTEXT_END,
   OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE,
-  OPENCLAW_RUNTIME_CONTEXT_NOTICE,
-  OPENCLAW_RUNTIME_EVENT_HEADER,
+  type RuntimeContextFragment,
 } from "../../internal-runtime-context.js";
 import type { CurrentInboundPromptContext } from "./params.js";
-export { OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE };
 
 const OPENCLAW_RUNTIME_EVENT_USER_PROMPT = "Continue the OpenClaw runtime event.";
 
-type RuntimeContextPromptParts = {
-  prompt: string;
-  modelPrompt?: string;
-  runtimeContext?: string;
-  runtimeOnly?: boolean;
-  runtimeSystemContext?: string;
-};
-
+/** Hidden custom transcript message that carries runtime context into model conversion. */
 export type RuntimeContextCustomMessage = {
   role: "custom";
   customType: string;
   content: string;
   display: false;
-  details: { source: "openclaw-runtime-context" };
+  details: {
+    source: "openclaw-runtime-context";
+    runtimeContextCarrier: true;
+    fragments?: RuntimeContextFragment[];
+  };
   timestamp: number;
 };
 
-type EmptyTranscriptMode = "model-prompt" | "runtime-event";
-
-export function buildCurrentInboundPromptContextPrefix(
+/** Appends turn additions to both full and resumed projections without changing their provenance. */
+export function appendCurrentInboundContext(
   context: CurrentInboundPromptContext | undefined,
-  options?: { preferResumableText?: boolean },
-): string {
-  const text =
-    options?.preferResumableText === true
-      ? (context?.resumableText ?? context?.text)
-      : context?.text;
-  return text?.trim() ?? "";
+  fragments: RuntimeContextFragment[],
+  legacyText = fragments.map((fragment) => fragment.text).join("\n\n"),
+): CurrentInboundPromptContext {
+  const append = (text?: string) => [text, legacyText].filter(Boolean).join("\n\n");
+  return {
+    ...context,
+    text: append(context?.text),
+    ...(context?.resumableText !== undefined
+      ? { resumableText: append(context.resumableText) }
+      : {}),
+    fragments: [
+      ...(context?.fragments ??
+        (context?.text ? [{ kind: "conversation-data" as const, text: context.text }] : [])),
+      ...fragments,
+    ],
+  };
 }
 
+/** Combines inbound context and the current prompt using the channel-provided joiner. */
 export function buildCurrentInboundPrompt(params: {
   context: CurrentInboundPromptContext | undefined;
   prompt: string;
   preferResumableText?: boolean;
 }): string {
-  const prefix = buildCurrentInboundPromptContextPrefix(params.context, {
-    preferResumableText: params.preferResumableText,
-  });
-  if (!prefix) {
-    return params.prompt;
-  }
-  if (!params.prompt) {
-    return prefix;
-  }
-  return [prefix, params.prompt].join(params.context?.promptJoiner ?? "\n\n");
+  const contextText =
+    params.preferResumableText === true
+      ? (params.context?.resumableText ?? params.context?.text)
+      : params.context?.text;
+  const prefix = contextText?.trim() ?? "";
+  return [prefix, params.prompt].filter(Boolean).join(params.context?.promptJoiner ?? "\n\n");
 }
 
-function removeLastPromptOccurrence(text: string, prompt: string): string | null {
-  const index = text.lastIndexOf(prompt);
-  if (index === -1) {
-    return null;
-  }
-  const before = text.slice(0, index).trimEnd();
-  const after = text.slice(index + prompt.length).trimStart();
-  return [before, after]
-    .filter((part) => part.length > 0)
-    .join("\n\n")
-    .trim();
-}
-
+/** Selects explicit producer context without interpreting any prompt text as provenance. */
 export function resolveRuntimeContextPromptParts(params: {
   effectivePrompt: string;
   transcriptPrompt?: string;
-  modelPrompt?: string;
-  emptyTranscriptMode?: EmptyTranscriptMode;
-}): RuntimeContextPromptParts {
-  const transcriptPrompt = params.transcriptPrompt;
-  const shouldExtractInternalRuntimeContext = transcriptPrompt !== undefined;
-  const extracted = shouldExtractInternalRuntimeContext
-    ? extractInternalRuntimeContext(params.effectivePrompt)
-    : { text: params.effectivePrompt };
-  const modelPrompt =
-    params.modelPrompt === undefined
-      ? undefined
-      : shouldExtractInternalRuntimeContext
-        ? extractInternalRuntimeContext(params.modelPrompt)
-        : { text: params.modelPrompt };
-  const modelPromptText = modelPrompt?.text ?? transcriptPrompt ?? extracted.text;
-  const prompt = transcriptPrompt ?? extracted.text;
-  if (!prompt.trim() && params.emptyTranscriptMode === "model-prompt") {
-    return {
-      prompt: extracted.text,
-      ...(modelPromptText.trim() && modelPromptText !== extracted.text
-        ? { modelPrompt: modelPromptText }
-        : {}),
-      ...(extracted.runtimeContext ? { runtimeContext: extracted.runtimeContext } : {}),
-    };
-  }
-  const hiddenRuntimeContext = modelPrompt
-    ? (removeLastPromptOccurrence(extracted.text, modelPrompt.text)?.trim() ??
-      (transcriptPrompt
-        ? removeLastPromptOccurrence(extracted.text, transcriptPrompt)?.trim()
-        : undefined))
-    : transcriptPrompt
-      ? removeLastPromptOccurrence(extracted.text, transcriptPrompt)?.trim()
-      : undefined;
-  const runtimeContext =
-    [hiddenRuntimeContext, extracted.runtimeContext]
-      .filter((value): value is string => Boolean(value?.trim()))
-      .join("\n\n") || (!prompt.trim() ? extracted.text.trim() : undefined);
-  if (!prompt.trim()) {
-    return runtimeContext
-      ? {
-          prompt: OPENCLAW_RUNTIME_EVENT_USER_PROMPT,
-          ...(modelPromptText.trim() && modelPromptText !== OPENCLAW_RUNTIME_EVENT_USER_PROMPT
-            ? { modelPrompt: modelPromptText }
-            : {}),
-          runtimeContext,
-          runtimeOnly: true,
-          runtimeSystemContext: buildRuntimeEventSystemContext(runtimeContext),
-        }
-      : {
-          prompt: "",
-          ...(modelPromptText ? { modelPrompt: modelPromptText } : {}),
-        };
-  }
-
+  fragments?: RuntimeContextFragment[];
+  allowRuntimeOnly?: boolean;
+}) {
+  const fragments = params.fragments?.filter((fragment) => fragment.text.trim());
+  const runtimeContext = fragments?.map((fragment) => fragment.text).join("\n\n") ?? "";
+  const transcriptPrompt = params.transcriptPrompt ?? params.effectivePrompt;
+  const runtimeOnly =
+    !transcriptPrompt.trim() && Boolean(runtimeContext) && params.allowRuntimeOnly !== false;
+  const prompt = runtimeOnly
+    ? OPENCLAW_RUNTIME_EVENT_USER_PROMPT
+    : transcriptPrompt || params.effectivePrompt;
   return {
     prompt,
-    ...(modelPromptText.trim() && modelPromptText !== prompt
-      ? { modelPrompt: modelPromptText }
-      : {}),
-    ...(runtimeContext ? { runtimeContext } : {}),
+    modelPrompt:
+      params.effectivePrompt && params.effectivePrompt !== prompt
+        ? params.effectivePrompt
+        : undefined,
+    runtimeContext: runtimeContext || undefined,
+    ...(runtimeOnly ? { runtimeOnly: true } : {}),
   };
 }
 
-function buildRuntimeContextMessageContent(params: {
-  runtimeContext: string;
-  kind: "next-turn" | "runtime-event";
-}): string {
-  return [
-    params.kind === "runtime-event"
-      ? OPENCLAW_RUNTIME_EVENT_HEADER
-      : OPENCLAW_NEXT_TURN_RUNTIME_CONTEXT_HEADER,
-    OPENCLAW_RUNTIME_CONTEXT_NOTICE,
-    "",
-    params.runtimeContext,
-  ].join("\n");
+export function buildRuntimeContextMessageContent(runtimeContext: string): string {
+  // The stable system prompt explains the markers once; leak strippers use the delimiters.
+  return [INTERNAL_RUNTIME_CONTEXT_BEGIN, runtimeContext, INTERNAL_RUNTIME_CONTEXT_END].join("\n");
 }
 
-export function buildRuntimeContextSystemContext(runtimeContext: string): string {
-  return buildRuntimeContextMessageContent({ runtimeContext, kind: "next-turn" });
-}
-
-export function buildRuntimeEventSystemContext(runtimeContext: string): string {
-  return buildRuntimeContextMessageContent({ runtimeContext, kind: "runtime-event" });
-}
-
+/** Creates a non-displayed custom transcript message for runtime context, if any exists. */
 export function buildRuntimeContextCustomMessage(
   runtimeContext: string | undefined,
+  fragments?: RuntimeContextFragment[],
 ): RuntimeContextCustomMessage | undefined {
   const trimmedRuntimeContext = runtimeContext?.trim();
   if (!trimmedRuntimeContext) {
@@ -168,9 +104,59 @@ export function buildRuntimeContextCustomMessage(
   return {
     role: "custom",
     customType: OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE,
-    content: buildRuntimeContextSystemContext(trimmedRuntimeContext),
+    content: buildRuntimeContextMessageContent(trimmedRuntimeContext),
     display: false,
-    details: { source: "openclaw-runtime-context" },
+    details: {
+      source: "openclaw-runtime-context",
+      runtimeContextCarrier: true,
+      ...(fragments?.length ? { fragments } : {}),
+    },
     timestamp: Date.now(),
   };
+}
+
+/** Project per-request instructions into the transient carrier without changing history. */
+export function prependRuntimeContextForModel(
+  messages: Context["messages"],
+  runtimeContext: string,
+): Context["messages"] {
+  if (!runtimeContext.trim()) {
+    return messages;
+  }
+  const carrierIndex = messages.findIndex(
+    (message) => message.role === "user" && message.runtimeContextCarrier === true,
+  );
+  const carrier = messages[carrierIndex];
+  const prepend = (text: string) =>
+    text.startsWith(`${INTERNAL_RUNTIME_CONTEXT_BEGIN}\n`)
+      ? `${INTERNAL_RUNTIME_CONTEXT_BEGIN}\n${runtimeContext}\n\n${text.slice(INTERNAL_RUNTIME_CONTEXT_BEGIN.length + 1)}`
+      : buildRuntimeContextMessageContent([runtimeContext, text].filter(Boolean).join("\n\n"));
+  if (carrier?.role !== "user") {
+    return [
+      ...messages,
+      {
+        role: "user",
+        content: prepend(""),
+        runtimeContextCarrier: true,
+        timestamp: messages.at(-1)?.timestamp ?? 0,
+      },
+    ];
+  }
+  const content = carrier.content;
+  const firstTextIndex =
+    typeof content === "string" ? -1 : content.findIndex((part) => part.type === "text");
+  const updated: UserMessage = {
+    ...carrier,
+    content:
+      typeof content === "string"
+        ? prepend(content)
+        : firstTextIndex < 0
+          ? [{ type: "text", text: prepend("") }, ...content]
+          : content.map((part, index) =>
+              index === firstTextIndex && part.type === "text"
+                ? Object.assign({}, part, { text: prepend(part.text) })
+                : part,
+            ),
+  };
+  return messages.map((message, index) => (index === carrierIndex ? updated : message));
 }

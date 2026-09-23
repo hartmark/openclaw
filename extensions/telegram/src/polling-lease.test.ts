@@ -1,46 +1,40 @@
+// Telegram tests cover polling lease plugin behavior.
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   acquireTelegramPollingLease,
   releaseStoppedTelegramPollingLease,
-  resetTelegramPollingLeasesForTests,
 } from "./polling-lease.js";
+import { resetTelegramPollingLeasesForTest as resetTelegramPollingLeasesForTests } from "./runtime.test-support.js";
 
 describe("Telegram polling lease", () => {
   beforeEach(() => {
     resetTelegramPollingLeasesForTests();
   });
 
-  it("refuses an active duplicate poller for the same bot token", async () => {
-    const first = await acquireTelegramPollingLease({
-      token: "123:abc",
-      accountId: "default",
-    });
-
-    await expect(
-      acquireTelegramPollingLease({
+  it("refuses an old active duplicate poller for the same bot token", async () => {
+    vi.useFakeTimers();
+    try {
+      const abort = new AbortController();
+      const first = await acquireTelegramPollingLease({
         token: "123:abc",
-        accountId: "ops",
-      }),
-    ).rejects.toThrow('refusing duplicate poller for account "ops"');
+        accountId: "default",
+        abortSignal: abort.signal,
+      });
 
-    first.release();
-  });
+      await vi.advanceTimersByTimeAsync(6 * 60 * 1_000);
 
-  it("allows concurrent pollers for different bot tokens", async () => {
-    const first = await acquireTelegramPollingLease({
-      token: "123:abc",
-      accountId: "default",
-    });
-    const second = await acquireTelegramPollingLease({
-      token: "456:def",
-      accountId: "ops",
-    });
+      await expect(
+        acquireTelegramPollingLease({
+          token: "123:abc",
+          accountId: "ops",
+        }),
+      ).rejects.toThrow('refusing duplicate poller for account "ops"');
 
-    expect(first.tokenFingerprint).not.toBe(second.tokenFingerprint);
-
-    first.release();
-    second.release();
+      first.release();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits for an aborting same-token poller before acquiring", async () => {

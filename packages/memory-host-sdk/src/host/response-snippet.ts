@@ -1,16 +1,22 @@
+import { consumeResponseBytes, decodeTextPrefix } from "@openclaw/normalization-core";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+
 const DEFAULT_ERROR_BODY_MAX_BYTES = 8 * 1024;
 const DEFAULT_ERROR_BODY_MAX_CHARS = 1_000;
 const DEFAULT_JSON_BODY_MAX_BYTES = 64 * 1024 * 1024;
 const TRUNCATED_SUFFIX = "... [truncated]";
 
+// Bounded response readers for provider/remote HTTP errors and JSON bodies.
 type ResponseTextSnippetOptions = {
   maxBytes?: number;
   maxChars?: number;
+  signal?: AbortSignal;
 };
 
 type ResponseJsonOptions = {
   maxBytes?: number;
   errorPrefix: string;
+  signal?: AbortSignal;
 };
 
 type ResponsePrefix = {
@@ -19,28 +25,32 @@ type ResponsePrefix = {
   truncated: boolean;
 };
 
-export async function readResponseTextSnippet(
+/** Read a small collapsed text snippet from a response body. */
+export async function readMemoryHostResponseTextSnippet(
   res: Response,
   options: ResponseTextSnippetOptions = {},
 ): Promise<string> {
   const maxBytes = options.maxBytes ?? DEFAULT_ERROR_BODY_MAX_BYTES;
   const maxChars = options.maxChars ?? DEFAULT_ERROR_BODY_MAX_CHARS;
-  const prefix = await readResponsePrefix(res, maxBytes);
+  const prefix = await readResponsePrefix(res, maxBytes, options.signal);
   if (prefix.length === 0) {
     return "";
   }
 
-  const text = new TextDecoder().decode(joinChunks(prefix.bytes, prefix.length));
+  const text = decodeTextPrefix(joinChunks(prefix.bytes, prefix.length), {
+    truncated: prefix.truncated,
+  });
   const collapsed = text.replace(/\s+/g, " ").trim();
   if (!collapsed) {
     return "";
   }
   if (prefix.truncated || collapsed.length > maxChars) {
-    return `${collapsed.slice(0, maxChars)}${TRUNCATED_SUFFIX}`;
+    return `${truncateUtf16Safe(collapsed, maxChars)}${TRUNCATED_SUFFIX}`;
   }
   return collapsed;
 }
 
+/** Read and parse JSON while enforcing a hard byte limit. */
 export async function readResponseJsonWithLimit(
   res: Response,
   options: ResponseJsonOptions,
@@ -52,7 +62,10 @@ export async function readResponseJsonWithLimit(
     throw responseTooLarge(options.errorPrefix, contentLength, maxBytes);
   }
 
-  const text = await readResponseTextWithLimit(res, maxBytes, options.errorPrefix);
+  const prefix = await readResponsePrefix(res, maxBytes, options.signal, options.errorPrefix);
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(
+    joinChunks(prefix.bytes, prefix.length),
+  );
 
   try {
     return JSON.parse(text);
@@ -61,7 +74,46 @@ export async function readResponseJsonWithLimit(
   }
 }
 
-async function readResponsePrefix(res: Response, maxBytes: number): Promise<ResponsePrefix> {
+function toAbortError(signal: AbortSignal, fallbackMessage: string): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(fallbackMessage);
+}
+
+async function readChunkWithAbort(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal | undefined,
+  fallbackMessage: string,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (!signal) {
+    return await reader.read();
+  }
+  if (signal.aborted) {
+    void reader.cancel().catch(() => undefined);
+    throw toAbortError(signal, fallbackMessage);
+  }
+
+  let removeAbortListener: (() => void) | undefined;
+  const abortPromise = new Promise<ReadableStreamReadResult<Uint8Array>>((_resolve, reject) => {
+    const onAbort = () => {
+      reject(toAbortError(signal, fallbackMessage)); // Cancel resolves pending reads.
+      void reader.cancel().catch(() => undefined);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+  });
+
+  try {
+    return await Promise.race([reader.read(), abortPromise]);
+  } finally {
+    removeAbortListener?.();
+  }
+}
+
+async function readResponsePrefix(
+  res: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+  errorPrefix?: string,
+): Promise<ResponsePrefix> {
   const body = res.body;
   if (!body || typeof body.getReader !== "function") {
     return { bytes: [], length: 0, truncated: false };
@@ -69,82 +121,38 @@ async function readResponsePrefix(res: Response, maxBytes: number): Promise<Resp
 
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
-  let length = 0;
-  let truncated = false;
-
+  let result: { size: number; truncated: boolean };
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      if (!value?.length) {
-        continue;
-      }
-
-      const remaining = maxBytes - length;
-      if (value.length >= remaining) {
-        if (remaining > 0) {
-          chunks.push(value.subarray(0, remaining));
-          length += remaining;
+    result = await consumeResponseBytes({
+      maxBytes,
+      stopAtLimit: errorPrefix === undefined,
+      read: () =>
+        readChunkWithAbort(
+          reader,
+          signal,
+          errorPrefix === undefined
+            ? "Response snippet body read aborted"
+            : `${errorPrefix}: response body read aborted`,
+        ),
+      onChunk: (chunk) => chunks.push(chunk),
+      onLimit: (size) => {
+        void reader.cancel().catch(() => undefined);
+        if (errorPrefix !== undefined) {
+          throw responseTooLarge(errorPrefix, size, maxBytes);
         }
-        truncated = true;
-        await reader.cancel().catch(() => undefined);
-        break;
-      }
-
-      chunks.push(value);
-      length += value.length;
-    }
+      },
+    });
   } finally {
     try {
       reader.releaseLock();
     } catch {}
   }
 
-  return { bytes: chunks, length, truncated };
-}
-
-async function readResponseTextWithLimit(
-  res: Response,
-  maxBytes: number,
-  errorPrefix: string,
-): Promise<string> {
-  const body = res.body;
-  if (!body || typeof body.getReader !== "function") {
-    return "";
-  }
-
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      if (!value?.length) {
-        continue;
-      }
-
-      const nextLength = length + value.length;
-      if (nextLength > maxBytes) {
-        await reader.cancel().catch(() => undefined);
-        throw responseTooLarge(errorPrefix, nextLength, maxBytes);
-      }
-
-      chunks.push(value);
-      length = nextLength;
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {}
-  }
-
-  return new TextDecoder().decode(joinChunks(chunks, length));
+  return {
+    bytes: chunks,
+    length: result.truncated ? Math.max(0, maxBytes) : result.size,
+    truncated: result.truncated,
+  };
 }
 
 async function cancelResponseBody(res: Response): Promise<void> {
@@ -152,7 +160,7 @@ async function cancelResponseBody(res: Response): Promise<void> {
   if (!body || typeof body.cancel !== "function") {
     return;
   }
-  await body.cancel().catch(() => undefined);
+  void body.cancel().catch(() => undefined);
 }
 
 function parseContentLength(raw: string | null, errorPrefix: string): number | undefined {
@@ -160,7 +168,7 @@ function parseContentLength(raw: string | null, errorPrefix: string): number | u
   if (!trimmed) {
     return undefined;
   }
-  if (!/^(0|[1-9]\d*)$/.test(trimmed)) {
+  if (!/^\d+$/.test(trimmed)) {
     throw new Error(`${errorPrefix}: invalid content-length header: ${raw}`);
   }
   const value = Number(trimmed);

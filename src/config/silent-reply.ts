@@ -1,3 +1,4 @@
+// Normalizes silent-reply config for channel response suppression.
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
   classifySilentReplyConversationType,
@@ -26,6 +27,7 @@ function resolveSilentReplyConversationContext(params: ResolveSilentReplyParams)
     conversationType: params.conversationType,
   });
   const normalizedSurface = normalizeLowercaseStringOrEmpty(params.surface);
+  // Surfaces are stored under normalized ids; keep explicit conversationType untouched.
   const surface = normalizedSurface ? params.cfg?.surfaces?.[normalizedSurface] : undefined;
   return {
     conversationType,
@@ -34,6 +36,7 @@ function resolveSilentReplyConversationContext(params: ResolveSilentReplyParams)
   };
 }
 
+/** Resolves the effective silent-reply settings for a routed conversation. */
 export function resolveSilentReplySettings(params: ResolveSilentReplyParams): {
   policy: SilentReplyPolicy;
 } {
@@ -41,8 +44,4 @@ export function resolveSilentReplySettings(params: ResolveSilentReplyParams): {
   return {
     policy: resolveSilentReplyPolicyFromPolicies(context),
   };
-}
-
-export function resolveSilentReplyPolicy(params: ResolveSilentReplyParams): SilentReplyPolicy {
-  return resolveSilentReplySettings(params).policy;
 }

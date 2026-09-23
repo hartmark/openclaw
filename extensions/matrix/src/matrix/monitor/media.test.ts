@@ -1,3 +1,4 @@
+// Matrix tests cover media plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginRuntime } from "../../../runtime-api.js";
 import { setMatrixRuntime } from "../../runtime.js";
@@ -115,6 +116,44 @@ describe("downloadMatrixMedia", () => {
     ).rejects.toBeInstanceOf(MatrixMediaSizeLimitError);
 
     expect(decryptMedia).not.toHaveBeenCalled();
+    expect(saveMediaBuffer).not.toHaveBeenCalled();
+  });
+
+  it("rejects oversized decrypted content before saving", async () => {
+    const { client, decryptMedia } = createEncryptedClient();
+    decryptMedia.mockResolvedValue(Buffer.alloc(1025));
+
+    await expect(
+      downloadMatrixMedia({
+        client,
+        mxcUrl: "mxc://example/file",
+        maxBytes: 1024,
+        file: createEncryptedFile(),
+      }),
+    ).rejects.toBeInstanceOf(MatrixMediaSizeLimitError);
+    expect(saveMediaBuffer).not.toHaveBeenCalled();
+  });
+
+  it.each(["plain", "encrypted"])("preserves %s media error diagnostics", async (kind) => {
+    const { client, decryptMedia } = createEncryptedClient();
+    const error = new Error("download failed");
+    decryptMedia.mockRejectedValue(error);
+    client.downloadContent = vi.fn().mockRejectedValue(error);
+
+    const result = downloadMatrixMedia({
+      client,
+      mxcUrl: "mxc://example/file",
+      maxBytes: 1024,
+      file: kind === "encrypted" ? createEncryptedFile() : undefined,
+    });
+    if (kind === "encrypted") {
+      await expect(result).rejects.toBe(error);
+    } else {
+      await expect(result).rejects.toMatchObject({
+        message: "Matrix media download failed: Error: download failed",
+        cause: error,
+      });
+    }
     expect(saveMediaBuffer).not.toHaveBeenCalled();
   });
 

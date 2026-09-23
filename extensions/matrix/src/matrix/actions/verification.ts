@@ -17,7 +17,7 @@ type MatrixVerificationDmLookupOpts = {
   verificationDmUserId?: string;
 };
 
-export type MatrixSelfVerificationResult = MatrixVerificationSummary & {
+type MatrixSelfVerificationResult = MatrixVerificationSummary & {
   deviceOwnerVerified: boolean;
   ownerVerification: MatrixOwnDeviceVerificationStatus;
 };
@@ -504,6 +504,7 @@ export async function getMatrixVerificationStatus(
       } else {
         await client.prepareForOneOff();
       }
+      await client.refreshOwnDeviceKeys();
       return await readMatrixVerificationStatus(client, opts);
     },
     "discard",

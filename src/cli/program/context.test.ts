@@ -1,3 +1,4 @@
+// Program context tests cover shared CLI context helpers and runtime injections.
 import { describe, expect, it, vi } from "vitest";
 import { createProgramContext } from "./context.js";
 
@@ -17,7 +18,6 @@ describe("createProgramContext", () => {
     const ctx = createProgramContext();
     expect(ctx).toEqual({
       programVersion: "9.9.9-test",
-      channelOptions: ["telegram", "whatsapp"],
       messageChannelOptions: "telegram|whatsapp",
       agentChannelOptions: "last|telegram|whatsapp",
     });
@@ -29,7 +29,6 @@ describe("createProgramContext", () => {
     const ctx = createProgramContext();
     expect(ctx).toEqual({
       programVersion: "9.9.9-test",
-      channelOptions: [],
       messageChannelOptions: "",
       agentChannelOptions: "last",
     });
@@ -45,7 +44,6 @@ describe("createProgramContext", () => {
   it("reuses one channel option resolution across all getters", () => {
     resolveCliChannelOptionsMock.mockClear().mockReturnValue(["telegram"]);
     const ctx = createProgramContext();
-    expect(ctx.channelOptions).toEqual(["telegram"]);
     expect(ctx.messageChannelOptions).toBe("telegram");
     expect(ctx.agentChannelOptions).toBe("last|telegram");
     expect(resolveCliChannelOptionsMock).toHaveBeenCalledOnce();

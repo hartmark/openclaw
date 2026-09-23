@@ -1,44 +1,77 @@
+// Provides the runtime adapter for detached task execution.
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { DetachedTaskAssignmentUnsupportedError } from "./detached-task-runtime-contract.js";
 import type {
+  DetachedRunningTaskCreateParams,
   DetachedTaskRecoveryAttemptParams,
   DetachedTaskRecoveryAttemptResult,
+  DetachedTaskFindParams,
+  DetachedTaskFindResult,
   DetachedTaskFinalizeParams,
   DetachedTaskLifecycleRuntime,
-  DetachedTaskLifecycleRuntimeRegistration,
+  CreatedDetachedTaskRun,
+  DetachedTaskAssignmentTransition,
 } from "./detached-task-runtime-contract.js";
 import {
-  clearDetachedTaskLifecycleRuntimeRegistration,
-  getDetachedTaskLifecycleRuntimeRegistration as getDetachedTaskLifecycleRuntimeRegistrationState,
+  captureDetachedTaskRuntimeOwner,
   getRegisteredDetachedTaskLifecycleRuntime,
-  registerDetachedTaskLifecycleRuntime,
 } from "./detached-task-runtime-state.js";
 import { cancelTaskById as cancelDetachedTaskRunByIdInCore } from "./runtime-internal.js";
+import { createRunningTaskRunCoreWithReceiptAsync } from "./task-executor-create.async.js";
 import {
-  completeTaskRunByRunId as completeTaskRunByRunIdFromExecutor,
-  createQueuedTaskRun as createQueuedTaskRunFromExecutor,
-  createRunningTaskRun as createRunningTaskRunFromExecutor,
-  failTaskRunByRunId as failTaskRunByRunIdFromExecutor,
-  finalizeTaskRunByRunId as finalizeTaskRunByRunIdFromExecutor,
-  recordTaskRunProgressByRunId as recordTaskRunProgressByRunIdFromExecutor,
-  setDetachedTaskDeliveryStatusByRunId as setDetachedTaskDeliveryStatusByRunIdFromExecutor,
-  startTaskRunByRunId as startTaskRunByRunIdFromExecutor,
+  completeTaskRunByRunIdCore,
+  createQueuedTaskRunCore,
+  createRunningTaskRunCore,
+  failTaskRunByRunIdCore,
+  finalizeTaskRunByRunIdCore,
+  recordTaskRunProgressByRunIdCore,
+  setDetachedTaskDeliveryStatusByRunIdCore,
+  startTaskRunByRunIdCore,
 } from "./task-executor.js";
+import { transitionTaskRecordsByRunNative } from "./task-registry-transition.native.js";
 import type { TaskRecord } from "./task-registry.types.js";
+import { findTaskByRunIdForStatus, listTasksForSessionKeyForStatus } from "./task-status-access.js";
 
 const log = createSubsystemLogger("tasks/detached-runtime");
 const DETACHED_TASK_RECOVERY_WARN_MS = 5_000;
 
-export type { DetachedTaskLifecycleRuntime, DetachedTaskLifecycleRuntimeRegistration };
+function taskMatchesFindScope(task: TaskRecord, params: DetachedTaskFindParams): boolean {
+  return (
+    task.runtime === params.runtime &&
+    task.childSessionKey === params.sessionKey &&
+    task.createdAt >= params.createdAtOrAfter &&
+    (params.createdBefore === undefined || task.createdAt < params.createdBefore)
+  );
+}
 
+function taskMatchesFindIdentity(task: TaskRecord, params: DetachedTaskFindParams): boolean {
+  return task.runtime === params.runtime && task.childSessionKey === params.sessionKey;
+}
+
+function findCoreTaskRun(params: DetachedTaskFindParams): TaskRecord | undefined {
+  const direct = findTaskByRunIdForStatus(params.runId);
+  if (direct && taskMatchesFindIdentity(direct, params)) {
+    return direct;
+  }
+  if (params.allowSessionFallback !== true) {
+    return undefined;
+  }
+  return listTasksForSessionKeyForStatus(params.sessionKey).find((task) =>
+    taskMatchesFindScope(task, params),
+  );
+}
+
+// Default runtime keeps detached task APIs usable before plugins install custom lifecycle hooks.
 const DEFAULT_DETACHED_TASK_LIFECYCLE_RUNTIME: DetachedTaskLifecycleRuntime = {
-  createQueuedTaskRun: createQueuedTaskRunFromExecutor,
-  createRunningTaskRun: createRunningTaskRunFromExecutor,
-  startTaskRunByRunId: startTaskRunByRunIdFromExecutor,
-  recordTaskRunProgressByRunId: recordTaskRunProgressByRunIdFromExecutor,
-  finalizeTaskRunByRunId: finalizeTaskRunByRunIdFromExecutor,
-  completeTaskRunByRunId: completeTaskRunByRunIdFromExecutor,
-  failTaskRunByRunId: failTaskRunByRunIdFromExecutor,
-  setDetachedTaskDeliveryStatusByRunId: setDetachedTaskDeliveryStatusByRunIdFromExecutor,
+  createQueuedTaskRun: createQueuedTaskRunCore,
+  createRunningTaskRun: createRunningTaskRunCore,
+  startTaskRunByRunId: startTaskRunByRunIdCore,
+  recordTaskRunProgressByRunId: recordTaskRunProgressByRunIdCore,
+  finalizeTaskRunByRunId: finalizeTaskRunByRunIdCore,
+  completeTaskRunByRunId: completeTaskRunByRunIdCore,
+  failTaskRunByRunId: failTaskRunByRunIdCore,
+  setDetachedTaskDeliveryStatusByRunId: setDetachedTaskDeliveryStatusByRunIdCore,
+  findTaskRun: findCoreTaskRun,
   cancelDetachedTaskRunById: cancelDetachedTaskRunByIdInCore,
 };
 
@@ -46,25 +79,24 @@ export function getDetachedTaskLifecycleRuntime(): DetachedTaskLifecycleRuntime 
   return getRegisteredDetachedTaskLifecycleRuntime() ?? DEFAULT_DETACHED_TASK_LIFECYCLE_RUNTIME;
 }
 
-export function getDetachedTaskLifecycleRuntimeRegistration():
-  | DetachedTaskLifecycleRuntimeRegistration
-  | undefined {
-  return getDetachedTaskLifecycleRuntimeRegistrationState();
-}
-
-export function registerDetachedTaskRuntime(
-  pluginId: string,
-  runtime: DetachedTaskLifecycleRuntime,
-): void {
-  registerDetachedTaskLifecycleRuntime(pluginId, runtime);
-}
-
-export function setDetachedTaskLifecycleRuntime(runtime: DetachedTaskLifecycleRuntime): void {
-  registerDetachedTaskRuntime("__test__", runtime);
-}
-
-export function resetDetachedTaskLifecycleRuntimeForTests(): void {
-  clearDetachedTaskLifecycleRuntimeRegistration();
+/** Exact settlement stays with the registered runtime; unsupported owners never fall through. */
+export function transitionTaskAssignment(params: DetachedTaskAssignmentTransition): TaskRecord[] {
+  const owner = captureDetachedTaskRuntimeOwner();
+  const assertCurrent = () => {
+    owner.assertCurrent();
+    params.assertCurrent();
+  };
+  assertCurrent();
+  if (!owner.runtime) {
+    return transitionTaskRecordsByRunNative(params.transition, {
+      expectedTask: params.expectedTask,
+      assertCurrent,
+    });
+  }
+  if (!owner.runtime.transitionTaskAssignment) {
+    throw new DetachedTaskAssignmentUnsupportedError();
+  }
+  return owner.runtime.transitionTaskAssignment({ ...params, assertCurrent });
 }
 
 export function createQueuedTaskRun(
@@ -77,6 +109,98 @@ export function createRunningTaskRun(
   ...args: Parameters<DetachedTaskLifecycleRuntime["createRunningTaskRun"]>
 ): ReturnType<DetachedTaskLifecycleRuntime["createRunningTaskRun"]> {
   return getDetachedTaskLifecycleRuntime().createRunningTaskRun(...args);
+}
+
+type TaskCreationAdmission = { assertCurrent: () => void };
+
+/** Compatibility adapter for shipped synchronous runtimes; retain the registered owner. */
+function createWithLegacyDetachedTaskRuntime(
+  admission: TaskCreationAdmission,
+  create: () => TaskRecord | null,
+): TaskRecord | null {
+  admission.assertCurrent();
+  return create();
+}
+
+function captureTaskCreationAdmission(
+  assertOwnerCurrent: () => void,
+  assertCurrent?: () => void,
+): { admission: TaskCreationAdmission; close: () => void } {
+  let active = true;
+  return {
+    admission: {
+      assertCurrent() {
+        if (!active) {
+          throw new Error("Detached task creation admission is closed.");
+        }
+        assertCurrent?.();
+        assertOwnerCurrent();
+      },
+    },
+    close() {
+      active = false;
+    },
+  };
+}
+
+export type PreparedDetachedTaskRun =
+  | {
+      kind: "legacy";
+      task: TaskRecord | null;
+      finalizeRun: (params: DetachedTaskFinalizeParams) => TaskRecord[];
+    }
+  | { kind: "receipt"; create: () => Promise<CreatedDetachedTaskRun | null> };
+
+/** Preserve synchronous V1 ordering while worker creation retains exact cleanup receipts. */
+export function prepareRunningTaskRun(
+  params: DetachedRunningTaskCreateParams,
+  assertCurrent?: () => void,
+): PreparedDetachedTaskRun {
+  const owner = captureDetachedTaskRuntimeOwner();
+  const runtime = owner.runtime;
+  owner.assertCurrent();
+  if (!runtime) {
+    return {
+      kind: "receipt",
+      async create() {
+        const { admission, close } = captureTaskCreationAdmission(
+          owner.assertCurrent,
+          assertCurrent,
+        );
+        try {
+          admission.assertCurrent();
+          return await createRunningTaskRunCoreWithReceiptAsync(params, admission.assertCurrent);
+        } finally {
+          close();
+        }
+      },
+    };
+  }
+  const { admission, close } = captureTaskCreationAdmission(owner.assertCurrent, assertCurrent);
+  try {
+    const finalize = runtime.finalizeTaskRunByRunId;
+    const complete = runtime.completeTaskRunByRunId;
+    const fail = runtime.failTaskRunByRunId;
+    const task = createWithLegacyDetachedTaskRuntime(admission, () =>
+      runtime.createRunningTaskRun(params),
+    );
+    return {
+      kind: "legacy",
+      task,
+      finalizeRun(terminal) {
+        // This is the shipped run-scoped operation, not an exact-task cleanup receipt.
+        owner.assertCurrent();
+        if (finalize) {
+          return finalize.call(runtime, terminal);
+        }
+        return terminal.status === "succeeded"
+          ? complete.call(runtime, terminal)
+          : fail.call(runtime, { ...terminal, status: terminal.status });
+      },
+    };
+  } finally {
+    close();
+  }
 }
 
 export function startTaskRunByRunId(
@@ -123,10 +247,24 @@ export function setDetachedTaskDeliveryStatusByRunId(
   return getDetachedTaskLifecycleRuntime().setDetachedTaskDeliveryStatusByRunId(...args);
 }
 
-export function cancelDetachedTaskRunById(
-  ...args: Parameters<DetachedTaskLifecycleRuntime["cancelDetachedTaskRunById"]>
-): ReturnType<DetachedTaskLifecycleRuntime["cancelDetachedTaskRunById"]> {
-  return getDetachedTaskLifecycleRuntime().cancelDetachedTaskRunById(...args);
+export function findDetachedTaskRun(params: DetachedTaskFindParams): DetachedTaskFindResult {
+  const runtime = getDetachedTaskLifecycleRuntime();
+  if (runtime.findTaskRun) {
+    try {
+      return { lookup: "available", task: runtime.findTaskRun(params) };
+    } catch (error) {
+      log.warn("Detached task lookup failed", {
+        runtime: params.runtime,
+        runId: params.runId,
+        error,
+      });
+      return { lookup: "unavailable" };
+    }
+  }
+  const coreTask = findCoreTaskRun(params);
+  // Older custom runtimes may mirror records into core. When they do not, an
+  // empty fallback cannot prove that the runtime-owned task is absent.
+  return coreTask ? { lookup: "available", task: coreTask } : { lookup: "unavailable" };
 }
 
 export async function tryRecoverTaskBeforeMarkLost(
@@ -138,6 +276,7 @@ export async function tryRecoverTaskBeforeMarkLost(
   }
   const startedAt = Date.now();
   try {
+    // Recovery hooks are best-effort; invalid/slow/failing hooks must not block mark-lost cleanup.
     const result = await hook(params);
     const elapsedMs = Date.now() - startedAt;
     if (elapsedMs >= DETACHED_TASK_RECOVERY_WARN_MS) {

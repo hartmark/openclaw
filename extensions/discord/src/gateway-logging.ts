@@ -1,5 +1,5 @@
 import type { EventEmitter } from "node:events";
-import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
+import { logVerbose, warn } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 
 type GatewayEmitter = Pick<EventEmitter, "on" | "removeListener">;
@@ -48,7 +48,9 @@ export function attachDiscordGatewayLogging(params: {
   };
 
   const onGatewayWarning = (warning: unknown) => {
-    logVerbose(`discord gateway warning: ${String(warning)}`);
+    const message = `discord gateway warning: ${String(warning)}`;
+    logVerbose(message);
+    runtime.log?.(warn(message));
   };
 
   const onGatewayMetrics = (metrics: unknown) => {

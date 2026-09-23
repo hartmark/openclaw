@@ -1,0 +1,971 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanupSessionResources } from "../session-resources.js";
+import {
+  claimOpenAIResponsesHttpContinuation,
+  resolveResponsesContinuationRequest,
+  type ResponsesContinuationRequest,
+  type ResponsesContinuationState,
+} from "./openai-responses-continuation.js";
+
+// Must track MAX_HTTP_CONTINUATION_READY_ENTRIES in
+// openai-responses-continuation.ts (a private module constant, not exported
+// -- nothing outside this module or its own test needs it) -- keep this
+// number in sync with the real cap for the eviction tests below to actually
+// exercise the capacity boundary.
+const READY_ENTRY_CAPACITY = 1000;
+// Must track MAX_HTTP_CONTINUATION_RETAINED_BYTES in
+// openai-responses-continuation.ts (a private module constant, not exported)
+// -- keep this number in sync with the real budget for the tests below to
+// actually exercise the byte-budget boundary.
+const RETAINED_BYTES_BUDGET = 64 * 1024 * 1024;
+
+const firstUser = {
+  type: "message",
+  role: "user",
+  content: [{ type: "input_text", text: "first" }],
+};
+const assistantOutput = {
+  id: "msg_1",
+  type: "message",
+  role: "assistant",
+  status: "completed",
+  phase: "final_answer",
+  content: [
+    {
+      type: "output_text",
+      text: "answer",
+      annotations: [
+        {
+          type: "url_citation",
+          url: "https://example.test/source",
+          title: "source",
+          start_index: 0,
+          end_index: 6,
+        },
+      ],
+      logprobs: [{ token: "answer", logprob: -0.1, bytes: [], top_logprobs: [] }],
+    },
+  ],
+} satisfies ResponsesContinuationState["lastResponseItems"][number];
+
+/** Builds response.output content whose serialized size is at least `bytes`
+ * -- used to exercise the byte-budget boundary without depending on the
+ * production estimator's exact formula. */
+function oversizedResponseItems(bytes: number): unknown[] {
+  return [
+    {
+      ...assistantOutput,
+      content: [{ type: "output_text", text: "x".repeat(bytes), annotations: [], logprobs: [] }],
+    },
+  ];
+}
+
+function continuationState(): ResponsesContinuationState {
+  return {
+    lastRequest: {
+      model: "gpt-5.6-luna",
+      store: true,
+      max_output_tokens: undefined,
+      metadata: { stable: "yes", openclaw_turn_id: "turn-1", openclaw_turn_attempt: "1" },
+      input: [firstUser] as never,
+    },
+    lastResponseId: "resp_1",
+    lastResponseItems: [assistantOutput],
+  };
+}
+
+function nextRequest(phase = "final_answer"): ResponsesContinuationRequest {
+  return {
+    input: [
+      firstUser,
+      {
+        type: "message",
+        role: "assistant",
+        phase,
+        content: [{ type: "output_text", text: "answer", annotations: [] }],
+      },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "second" }] },
+    ] as never,
+    metadata: { openclaw_turn_attempt: "2", openclaw_turn_id: "turn-2", stable: "yes" },
+    store: true,
+    model: "gpt-5.6-luna",
+  };
+}
+
+/** Like nextRequest(), but echoes back the same oversized assistant reply
+ * text oversizedResponseItems(bytes) committed -- resolveResponsesContinuationRequest
+ * requires the replayed assistant turn to match the retained baseline
+ * verbatim, so a plain nextRequest() (hardcoded small "answer" text) would
+ * correctly report history_changed against an oversized baseline, not
+ * "continued" -- that's the resolver working, not the eviction bug this
+ * test targets. */
+function nextRequestAfterOversized(bytes: number): ResponsesContinuationRequest {
+  return {
+    input: [
+      firstUser,
+      {
+        type: "message",
+        role: "assistant",
+        phase: "final_answer",
+        content: [{ type: "output_text", text: "x".repeat(bytes), annotations: [] }],
+      },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "second" }] },
+    ] as never,
+    metadata: { openclaw_turn_attempt: "2", openclaw_turn_id: "turn-2", stable: "yes" },
+    store: true,
+    model: "gpt-5.6-luna",
+  };
+}
+
+function claim(params: {
+  sessionId?: string;
+  authorization?: string;
+  turn?: string;
+  request?: ResponsesContinuationRequest;
+}) {
+  return claimOpenAIResponsesHttpContinuation({
+    sessionId: params.sessionId ?? "session-1",
+    apiKey: "api-key",
+    baseUrl: "https://api.openai.com/v1",
+    headers: {
+      Authorization: params.authorization ?? "Bearer tenant-a",
+      traceparent: `trace-${params.turn ?? "1"}`,
+      "x-openclaw-turn-id": `turn-${params.turn ?? "1"}`,
+      "x-openclaw-turn-attempt": params.turn ?? "1",
+      "x-stable-route": "route-a",
+    },
+    request: params.request ?? continuationState().lastRequest,
+  });
+}
+
+afterEach(() => {
+  cleanupSessionResources();
+  vi.useRealTimers();
+});
+
+describe("OpenAI Responses continuation", () => {
+  it("matches JSON wire semantics and provider-only assistant replay metadata", () => {
+    const continued = resolveResponsesContinuationRequest(continuationState(), nextRequest());
+    expect(continued).toMatchObject({
+      continuationStatus: "continued",
+      request: {
+        previous_response_id: "resp_1",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "second" }],
+          },
+        ],
+      },
+    });
+
+    expect(
+      resolveResponsesContinuationRequest(continuationState(), nextRequest("commentary"))
+        .continuationStatus,
+    ).toBe("history_changed");
+    const explicit = { ...nextRequest(), previous_response_id: "resp_explicit" };
+    expect(resolveResponsesContinuationRequest(continuationState(), explicit)).toEqual({
+      request: explicit,
+      continuationStatus: "explicit_previous_response_id",
+    });
+  });
+
+  it("continues across user turns when runtime context stays before the prior tool round", () => {
+    const state = continuationState();
+    const carrier = (text: string) => ({
+      type: "message" as const,
+      role: "user" as const,
+      content: [
+        {
+          type: "input_text" as const,
+          text: `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n${text}\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>`,
+        },
+      ],
+    });
+    const firstCarrier = carrier("first turn metadata");
+    state.lastRequest.input = [
+      ...(state.lastRequest.input ?? []),
+      firstCarrier,
+      { type: "function_call", call_id: "call_1", name: "lookup", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_1", output: "lookup result" },
+    ];
+    const nextTurn = [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "second" }] },
+      carrier("second turn metadata"),
+    ] satisfies NonNullable<ResponsesContinuationRequest["input"]>;
+    const request: ResponsesContinuationRequest = {
+      ...state.lastRequest,
+      input: [...(state.lastRequest.input ?? []), assistantOutput, ...nextTurn],
+    };
+
+    expect(resolveResponsesContinuationRequest(state, request)).toMatchObject({
+      continuationStatus: "continued",
+      request: { previous_response_id: "resp_1", input: nextTurn },
+    });
+    const withoutPreviousCarrier = {
+      ...request,
+      input: request.input?.filter((item) => item !== firstCarrier),
+    };
+    expect(resolveResponsesContinuationRequest(state, withoutPreviousCarrier)).toEqual({
+      continuationStatus: "history_changed",
+      request: withoutPreviousCarrier,
+    });
+  });
+
+  it.each([
+    {
+      name: "instructions",
+      previous: { instructions: "Active background tasks: none." },
+      current: { instructions: "Active background tasks: 1 running." },
+    },
+    {
+      name: "tools",
+      previous: { tools: [{ type: "function", name: "read", parameters: { type: "object" } }] },
+      current: { tools: [{ type: "function", name: "write", parameters: { type: "object" } }] },
+    },
+  ])("keeps current $name while continuing unchanged history", ({ previous, current }) => {
+    const state = continuationState();
+    state.lastRequest = { ...state.lastRequest, ...previous };
+    const request = { ...nextRequest(), ...current };
+    const before = structuredClone({ state, request });
+
+    const resolved = resolveResponsesContinuationRequest(state, request);
+
+    expect(resolved.continuationStatus).toBe("continued");
+    expect(resolved.request).toMatchObject({ ...current, previous_response_id: "resp_1" });
+    expect(resolved.request.input).toHaveLength(1);
+    expect({ state, request }).toEqual(before);
+  });
+
+  it.each([
+    [
+      "unsafe integer round-trip",
+      '{"n":9007199254740993}',
+      '{"n":"9007199254740993"}',
+      "continued",
+    ],
+    [
+      "negative unsafe round-trip",
+      '{"n":-9007199254740993}',
+      '{"n":"-9007199254740993"}',
+      "continued",
+    ],
+    [
+      "provider whitespace in nested arguments",
+      '{ "b": {"n":9007199254740993,"a":true},"a":[1] }',
+      '{"b":{"n":"9007199254740993","a":true},"a":[1]}',
+      "continued",
+    ],
+    [
+      "reordered keys remain conservative",
+      '{"b":{"n":9007199254740993,"a":true},"a":[1]}',
+      '{"a":[1],"b":{"a":true,"n":"9007199254740993"}}',
+      "history_changed",
+    ],
+    [
+      "positive binary64 collision",
+      '{"n":9007199254740992}',
+      '{"n":9007199254740993}',
+      "history_changed",
+    ],
+    [
+      "negative binary64 collision",
+      '{"n":-9007199254740992}',
+      '{"n":-9007199254740993}',
+      "history_changed",
+    ],
+    [
+      "edited preserved integer",
+      '{"n":9007199254740993}',
+      '{"n":"9007199254740992"}',
+      "history_changed",
+    ],
+    [
+      "provider string changed to bare unsafe integer",
+      '{"n":"9007199254740992"}',
+      '{"n":9007199254740992}',
+      "history_changed",
+    ],
+    [
+      "admitted integer string changed to Number",
+      '{"n":9007199254740992}',
+      '{"n":9007199254740992}',
+      "history_changed",
+    ],
+    ["safe integer versus string", '{"n":42}', '{"n":"42"}', "history_changed"],
+    [
+      "safe boundary versus string",
+      '{"n":9007199254740991}',
+      '{"n":"9007199254740991"}',
+      "history_changed",
+    ],
+    [
+      "quoted digits and escapes",
+      '{"text":"\\\"9007199254740993\\\"","n":9007199254740993}',
+      '{"text":"\\\"9007199254740993\\\"","n":"9007199254740993"}',
+      "continued",
+    ],
+    ["unchanged incomplete JSON", '{"n":', '{"n":', "continued"],
+    ["changed incomplete JSON", '{"n":', '{"n": }', "history_changed"],
+    [
+      "invalid leading zero",
+      '{"n":09007199254740993}',
+      '{"n":"9007199254740993"}',
+      "history_changed",
+    ],
+    ["non-object array", "[42]", "[42.0]", "history_changed"],
+    ["non-object null", "null", " null ", "history_changed"],
+    ["safe fraction", '{"n":4.20}', '{"n":4.2}', "continued"],
+    ["safe exponent", '{"n":4.2e1}', '{"n":42}', "continued"],
+    ["safe exponent versus string", '{"n":4.2e1}', '{"n":"42"}', "history_changed"],
+    [
+      "unsafe exponent follows terminal Number serialization",
+      '{"n":1e16}',
+      '{"n":10000000000000000}',
+      "continued",
+    ],
+    [
+      "unsafe fraction follows terminal Number serialization",
+      '{"n":10000000000000000.0}',
+      '{"n":10000000000000000}',
+      "continued",
+    ],
+  ] as const)(
+    "compares admitted provider tool arguments: %s",
+    (_name, rawArguments, replayedArguments, expectedStatus) => {
+      const state = continuationState();
+      const call = {
+        type: "function_call" as const,
+        id: "fc_1",
+        status: "completed" as const,
+        call_id: "call_1",
+        name: "record_value",
+        arguments: rawArguments,
+      };
+      state.lastResponseItems = [call];
+      const output = {
+        type: "function_call_output" as const,
+        call_id: "call_1",
+        output: "recorded",
+      };
+      const request = {
+        ...state.lastRequest,
+        input: [
+          ...(state.lastRequest.input ?? []),
+          { ...call, arguments: replayedArguments },
+          output,
+        ],
+      };
+      const before = structuredClone({ state, request });
+      const resolved = resolveResponsesContinuationRequest(state, request);
+      expect(resolved.continuationStatus).toBe(expectedStatus);
+      if (expectedStatus === "continued") {
+        expect(resolved.request).toMatchObject({ previous_response_id: "resp_1", input: [output] });
+      } else {
+        expect(resolved.request).toBe(request);
+      }
+      expect({ state, request }).toEqual(before);
+    },
+  );
+
+  it.each([
+    ['{"n":9007199254740992}', '{"n":"9007199254740992"}', "history_changed"],
+    ['{"n":"9007199254740992"}', '{"n":9007199254740992}', "history_changed"],
+    ['{"n":9007199254740992}', '{"n":9007199254740993}', "history_changed"],
+    ['{"n":9007199254740992}', '{"n":9007199254740992}', "continued"],
+  ] as const)("keeps already-sent arguments strict: %s -> %s", (sent, current, expectedStatus) => {
+    const state = continuationState();
+    const call = {
+      type: "function_call" as const,
+      call_id: "sent_call",
+      name: "record_value",
+      arguments: sent,
+    };
+    const output = {
+      type: "function_call_output" as const,
+      call_id: "sent_call",
+      output: "recorded",
+    };
+    state.lastRequest.input = [...(state.lastRequest.input ?? []), call, output];
+    const request = nextRequest();
+    const [user, ...next] = request.input ?? [];
+    if (!user) {
+      throw new Error("Expected the fixture's first user message");
+    }
+    request.input = [user, { ...call, arguments: current }, output, ...next];
+    const before = structuredClone({ state, request });
+    const resolved = resolveResponsesContinuationRequest(state, request);
+    expect(resolved.continuationStatus).toBe(expectedStatus);
+    if (expectedStatus === "history_changed") {
+      expect(resolved.request).toBe(request);
+    }
+    expect({ state, request }).toEqual(before);
+  });
+
+  it("continues a tool-calling round despite replay re-sanitizing call_id, and restores the raw call_id on the wire delta", () => {
+    // Real shape: the cached lastResponseItems is the raw provider response
+    // (bare call_id), but replaying history for the next round runs it
+    // through normalizeOpenAIResponsesToolCallIds (embedded-agent-helpers)
+    // for provider-format compatibility -- a real, necessary id reshape, not
+    // a change to what the model actually said. Before this fixed, that
+    // reshape made every multi-round tool-calling turn permanently
+    // ineligible for continuation (history_changed on every attempt,
+    // confirmed live against a real gateway).
+    const rawCallId = "chatcmpl-tool-20cf1f2fabdd434da069764b4dca72eb";
+    const toolCall = {
+      type: "function_call",
+      id: "fc_1",
+      status: "completed",
+      call_id: rawCallId,
+      name: "exec",
+      arguments: '{"command":"echo hi"}',
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [{ type: "reasoning" }, toolCall] as never,
+    };
+    // The exact reshape normalizeOpenAIResponsesToolCallIds would have
+    // produced for the paired "rawCallId|fc_1" (verified against
+    // normalizeOpenAIResponsesFunctionCallId directly, then split back to
+    // just the call_id half the way the request builder splits it onto the
+    // wire) -- not a hand-approximated shape, so the restore-to-raw path
+    // under test actually has to recognize it via the real transform, not a
+    // lucky string match.
+    const reshapedCallId = "call_chatcmpl-tool-20cf1f2fabdd434da069764b4dca72eb_f_3b92d47627";
+    const replayedToolCall = {
+      ...toolCall,
+      id: "fc_1",
+      call_id: reshapedCallId,
+    };
+    const toolResult = {
+      type: "function_call_output",
+      call_id: reshapedCallId,
+      output: "hi\n",
+    };
+    const nextRoundRequest: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [firstUser, { type: "reasoning" }, replayedToolCall, toolResult] as never,
+    };
+
+    const result = resolveResponsesContinuationRequest(state, nextRoundRequest);
+
+    // The wire delta must carry the RAW call_id the provider actually
+    // returned, not the client's replay-local reshape of it -- a server
+    // that reconstructs full history from its own cached copy of the raw
+    // response (e.g. a proxy virtualizing previous_response_id
+    // server-side) has no way to know about the client's reshape, and
+    // pairs function_call_output.call_id against the function_call it
+    // cached verbatim.
+    expect(result).toMatchObject({
+      continuationStatus: "continued",
+      request: {
+        previous_response_id: "resp_1",
+        input: [{ type: "function_call_output", call_id: rawCallId, output: "hi\n" }],
+      },
+    });
+  });
+
+  it("continues a tool-calling round when replay preserves the raw non-canonical call_id/id pair unchanged", () => {
+    // Real shape for a direct Responses transport caller that never runs
+    // history through the agent-level normalizer: transcript-transform.ts's
+    // transformMessages preserves same-model tool-call ids verbatim on its
+    // same-model branch, so this replayed function_call/function_call_output
+    // pair carries the exact same raw, non-canonical call_id and item id the
+    // provider originally returned -- not the agent-reshaped composite the
+    // sibling test above covers. Before this fixed, the cached side
+    // canonicalized the call_id/id *pair*, while the replayed side
+    // canonicalized only the bare call_id, so this exact case -- nothing
+    // about the call actually changed -- permanently forced history_changed
+    // and resent the whole conversation every round.
+    const rawCallId = "functions.gateway:0";
+    const rawItemId = "fc_tmp_kegospxl46";
+    const toolCall = {
+      type: "function_call",
+      id: rawItemId,
+      status: "completed",
+      call_id: rawCallId,
+      name: "exec",
+      arguments: '{"command":"echo hi"}',
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [{ type: "reasoning" }, toolCall] as never,
+    };
+    // Replayed completely unchanged -- same raw call_id, same raw id, no
+    // agent-level reshape applied at all.
+    const replayedToolCall = { ...toolCall };
+    const toolResult = {
+      type: "function_call_output",
+      call_id: rawCallId,
+      output: "hi\n",
+    };
+    const nextRoundRequest: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [firstUser, { type: "reasoning" }, replayedToolCall, toolResult] as never,
+    };
+
+    const result = resolveResponsesContinuationRequest(state, nextRoundRequest);
+
+    expect(result).toMatchObject({
+      continuationStatus: "continued",
+      request: {
+        previous_response_id: "resp_1",
+        input: [{ type: "function_call_output", call_id: rawCallId, output: "hi\n" }],
+      },
+    });
+  });
+
+  it("continues a tool-calling round when replay omits the item id entirely (replayResponsesItemIds:false)", () => {
+    // A connection configured with replayResponsesItemIds:false (e.g. the
+    // ChatGPT-Responses provider) omits function_call.id from the wire
+    // while preserving its raw call_id verbatim -- openai-responses-replay-
+    // messages-internal.ts's toolCall handling literally never puts `id` on
+    // the item in that case. The cached side still has the full raw
+    // call_id/id pair (from the provider's own response), so pairing it
+    // unconditionally (as the sibling "unchanged pair" test above requires)
+    // would hash a different input than this replay's un-pairable bare
+    // call_id ever could, permanently forcing history_changed for a call
+    // that didn't actually change -- a real regression the pairing fix
+    // above introduced for this equally real replay shape.
+    const rawCallId = "functions.gateway:0";
+    const rawItemId = "fc_tmp_kegospxl46";
+    const toolCall = {
+      type: "function_call",
+      id: rawItemId,
+      status: "completed",
+      call_id: rawCallId,
+      name: "exec",
+      arguments: '{"command":"echo hi"}',
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [{ type: "reasoning" }, toolCall] as never,
+    };
+    // Replayed with the same raw call_id but no `id` field at all -- exactly
+    // what a replayResponsesItemIds:false connection sends. Everything else
+    // about the item is otherwise unchanged from the cached one.
+    const { id: _unusedItemId, ...replayedToolCall } = toolCall;
+    const toolResult = {
+      type: "function_call_output",
+      call_id: rawCallId,
+      output: "hi\n",
+    };
+    const nextRoundRequest: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [firstUser, { type: "reasoning" }, replayedToolCall, toolResult] as never,
+    };
+
+    const result = resolveResponsesContinuationRequest(state, nextRoundRequest);
+
+    expect(result).toMatchObject({
+      continuationStatus: "continued",
+      request: {
+        previous_response_id: "resp_1",
+        input: [{ type: "function_call_output", call_id: rawCallId, output: "hi\n" }],
+      },
+    });
+  });
+
+  it("does not tolerate an unrelated function-call id change as the known replay reshape", () => {
+    // A changed call_id that ISN'T the client's own reshape of the cached raw
+    // id (e.g. the model made a genuinely different tool call, or a
+    // corrupted replay) must still be treated as real history drift --
+    // canonicalizeReplayedCallId only forgives ids that reshape TO the same
+    // value as the cached raw one, never an arbitrary difference.
+    const toolCall = {
+      type: "function_call",
+      id: "fc_1",
+      status: "completed",
+      call_id: "call_original_abc",
+      name: "exec",
+      arguments: '{"command":"echo hi"}',
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [toolCall] as never,
+    };
+    const replayedToolCall = { ...toolCall, call_id: "call_unrelated_xyz" };
+    const toolResult = {
+      type: "function_call_output",
+      call_id: "call_unrelated_xyz",
+      output: "hi\n",
+    };
+    const nextRoundRequest: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [firstUser, replayedToolCall, toolResult] as never,
+    };
+
+    expect(resolveResponsesContinuationRequest(state, nextRoundRequest).continuationStatus).toBe(
+      "history_changed",
+    );
+  });
+
+  it("ignores turn correlation headers but isolates explicit authorization", () => {
+    const first = claim({ turn: "1" });
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_1",
+      output: continuationState().lastResponseItems,
+    });
+
+    const sameTenant = claim({ turn: "2", request: nextRequest() });
+    expect(sameTenant?.request.previous_response_id).toBe("resp_1");
+    sameTenant?.commit(nextRequest(), { id: "resp_2", output: [] });
+
+    const rotated = claim({
+      turn: "3",
+      authorization: "Bearer tenant-b",
+      request: nextRequest(),
+    });
+    expect(rotated?.request.previous_response_id).toBeUndefined();
+    rotated?.release();
+  });
+
+  it("grants one claim and prevents a concurrent non-owner from overwriting it", () => {
+    const owner = claim({});
+    expect(claim({})).toBeUndefined();
+
+    owner?.commit(continuationState().lastRequest, {
+      id: "resp_owner",
+      output: continuationState().lastResponseItems,
+    });
+    expect(claim({ request: nextRequest() })?.request.previous_response_id).toBe("resp_owner");
+  });
+
+  it("prevents cleanup-time claims from resurrecting session state", () => {
+    const stale = claim({});
+    cleanupSessionResources("session-1");
+    stale?.commit(continuationState().lastRequest, {
+      id: "resp_stale",
+      output: continuationState().lastResponseItems,
+    });
+
+    const next = claim({ request: nextRequest() });
+    expect(next?.request.previous_response_id).toBeUndefined();
+    next?.release();
+  });
+
+  it("keeps preparation exclusive and preserves a cleanup-time replacement after failure", () => {
+    claim({})?.commit(continuationState().lastRequest, {
+      id: "resp_first",
+      output: continuationState().lastResponseItems,
+    });
+    let replacement: ReturnType<typeof claim>;
+    const request = {
+      ...nextRequest(),
+      metadata: {
+        value: {
+          toJSON() {
+            expect(claim({})).toBeUndefined();
+            cleanupSessionResources("session-1");
+            replacement = claim({});
+            throw new Error("serialization failed after replacement");
+          },
+        },
+      },
+    };
+    expect(() => claim({ request })).toThrow("serialization failed after replacement");
+    expect(replacement).toBeDefined();
+    expect(claim({})).toBeUndefined();
+    replacement?.commit(continuationState().lastRequest, {
+      id: "resp_replacement",
+      output: continuationState().lastResponseItems,
+    });
+    const next = claim({ request: nextRequest() });
+    expect(next?.request.previous_response_id).toBe("resp_replacement");
+    next?.release();
+  });
+
+  it("expires completed continuation state after the default 90-minute idle TTL", () => {
+    vi.useFakeTimers();
+    const first = claim({});
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_expiring",
+      output: continuationState().lastResponseItems,
+    });
+    // Must track HTTP_CONTINUATION_IDLE_TTL_MS in openai-responses-continuation.ts
+    // (a private module constant, not exported) -- this advance needs to
+    // exceed the real idle TTL for the expiry to actually fire.
+    vi.advanceTimersByTime(90 * 60 * 1000 + 1);
+
+    const next = claim({ request: nextRequest() });
+    expect(next?.request.previous_response_id).toBeUndefined();
+    next?.release();
+  });
+
+  it("survives a gap shorter than the default 90-minute idle TTL", () => {
+    vi.useFakeTimers();
+    const first = claim({});
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_surviving",
+      output: continuationState().lastResponseItems,
+    });
+    vi.advanceTimersByTime(89 * 60 * 1000);
+
+    const next = claim({ request: nextRequest() });
+    expect(next?.request.previous_response_id).toBe("resp_surviving");
+    next?.release();
+  });
+
+  it("honors a shorter per-model idleTtlMs override", () => {
+    vi.useFakeTimers();
+    // Mirrors claim()'s own header set exactly (Authorization plus the
+    // turn/route headers it always adds), not just Authorization -- headers
+    // participate in the cache key via connectionIdentity(), so a claim with
+    // a narrower header set than a later claim() call would land at a
+    // *different* key and always miss regardless of whether idleTtlMs is
+    // honored at all, silently making this test's assertion vacuous. Every
+    // claim below goes through this same helper (not the file's shared
+    // claim(), which doesn't accept an override) so the short TTL applies
+    // consistently across the whole chain instead of reverting to the
+    // module default the moment any commit omits it.
+    const claimWithOverride = (request: ResponsesContinuationRequest) =>
+      claimOpenAIResponsesHttpContinuation({
+        sessionId: "session-1",
+        apiKey: "api-key",
+        baseUrl: "https://api.openai.com/v1",
+        headers: {
+          Authorization: "Bearer tenant-a",
+          traceparent: "trace-1",
+          "x-openclaw-turn-id": "turn-1",
+          "x-openclaw-turn-attempt": "1",
+          "x-stable-route": "route-a",
+        },
+        request,
+        idleTtlMs: 60_000,
+      });
+
+    const first = claimWithOverride(continuationState().lastRequest);
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_custom_ttl",
+      output: continuationState().lastResponseItems,
+    });
+
+    // Establish a real pre-expiry hit first, under the identical identity
+    // and the same override, so the miss below actually demonstrates the
+    // override's TTL firing rather than some other, unrelated identity
+    // mismatch that would miss regardless.
+    const withinTtl = claimWithOverride(nextRequest());
+    expect(withinTtl?.request.previous_response_id).toBe("resp_custom_ttl");
+    withinTtl?.commit(withinTtl.fullRequest, {
+      id: "resp_custom_ttl_2",
+      output: continuationState().lastResponseItems,
+    });
+
+    vi.advanceTimersByTime(60_000 + 1);
+
+    // The cached baseline is now two rounds deep (round 1's response plus
+    // round 2's own committed response), so the third claim's own request
+    // must extend that same history -- reusing bare nextRequest() here (only
+    // 3 input items, one round short of the real baseline) would make
+    // currentInput.length < baselineLength return "history_shorter" on its
+    // own, passing this test's previous_response_id assertion for the wrong
+    // reason regardless of whether the override's TTL actually fired.
+    const thirdRoundRequest: ResponsesContinuationRequest = {
+      ...nextRequest(),
+      input: [
+        ...(nextRequest().input ?? []),
+        assistantOutput,
+        { type: "message", role: "user", content: [{ type: "input_text", text: "third" }] },
+      ] as never,
+    };
+    const next = claimWithOverride(thirdRoundRequest);
+    expect(next?.request.previous_response_id).toBeUndefined();
+    // A genuine expiry (no cached baseline found at all) returns the request
+    // untouched -- still carrying the full history above, not a trimmed
+    // delta -- which is what actually distinguishes this from a
+    // coincidental "history_shorter" pass on a too-short request.
+    expect(next?.request.input).toEqual(thirdRoundRequest.input);
+    next?.release();
+  });
+
+  it("evicts the oldest ready entry once the process-wide capacity is reached", () => {
+    // Fill the cache to capacity with distinct sessions, oldest first, so
+    // the default 90-minute idle TTL alone can't be relied on to bound
+    // memory during a burst of concurrent sessions.
+    for (let i = 0; i < READY_ENTRY_CAPACITY; i++) {
+      const c = claim({ sessionId: `session-${i}` });
+      c?.commit(continuationState().lastRequest, {
+        id: `resp-${i}`,
+        output: continuationState().lastResponseItems,
+      });
+    }
+
+    // One more commit pushes the map over capacity; the oldest-committed
+    // entry (session-0) should be evicted to make room.
+    const overflow = claim({ sessionId: "session-overflow" });
+    overflow?.commit(continuationState().lastRequest, {
+      id: "resp-overflow",
+      output: continuationState().lastResponseItems,
+    });
+
+    const evicted = claim({ sessionId: "session-0", request: nextRequest() });
+    expect(evicted?.request.previous_response_id).toBeUndefined();
+    evicted?.release();
+
+    const survivorId = `session-${READY_ENTRY_CAPACITY - 1}`;
+    const survivor = claim({ sessionId: survivorId, request: nextRequest() });
+    expect(survivor?.request.previous_response_id).toBe(`resp-${READY_ENTRY_CAPACITY - 1}`);
+    survivor?.release();
+  });
+
+  it("evicts by true commit order, not Map iteration position, when a reclaim lands in the same millisecond", () => {
+    // Date.now() is not a unique completion order: a Map re-set on an
+    // existing key keeps that key's original iteration position, so a
+    // session reclaimed (claimed again, then re-committed) in the same
+    // millisecond as the rest of a full cache still iterates first --
+    // exactly where a strict `<` timestamp comparison would keep it as
+    // "oldest" even though it just became the freshest entry. Freeze time
+    // so every commit below shares one timestamp, isolating the ordering
+    // fix from real wall-clock progression.
+    vi.useFakeTimers();
+    try {
+      for (let i = 0; i < READY_ENTRY_CAPACITY; i++) {
+        const c = claim({ sessionId: `reclaim-session-${i}` });
+        c?.commit(continuationState().lastRequest, {
+          id: `reclaim-resp-${i}`,
+          output: continuationState().lastResponseItems,
+        });
+      }
+
+      // Reclaim session-0: consumes its ready entry (claim), then commits a
+      // fresh one -- Map.set on the existing key keeps it at iteration
+      // position 0, but it is now the most-recently-committed entry.
+      const reclaimed = claim({ sessionId: "reclaim-session-0", request: nextRequest() });
+      expect(reclaimed?.request.previous_response_id).toBe("reclaim-resp-0");
+      reclaimed?.commit(continuationState().lastRequest, {
+        id: "reclaim-resp-0-refreshed",
+        output: continuationState().lastResponseItems,
+      });
+
+      // One more commit pushes the map over capacity again.
+      const overflow = claim({ sessionId: "reclaim-session-overflow" });
+      overflow?.commit(continuationState().lastRequest, {
+        id: "reclaim-resp-overflow",
+        output: continuationState().lastResponseItems,
+      });
+
+      // The just-reclaimed entry must survive -- it is the newest by true
+      // commit order, regardless of its Map position or tied timestamp.
+      const stillReady = claim({ sessionId: "reclaim-session-0", request: nextRequest() });
+      expect(stillReady?.request.previous_response_id).toBe("reclaim-resp-0-refreshed");
+      stillReady?.release();
+
+      // The entry actually oldest by commit order (never reclaimed) is the
+      // one that gets evicted instead.
+      const evicted = claim({ sessionId: "reclaim-session-1", request: nextRequest() });
+      expect(evicted?.request.previous_response_id).toBeUndefined();
+      evicted?.release();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips caching a single entry that alone exceeds the retained-byte budget", () => {
+    const first = claim({});
+    // Evicting every other entry still wouldn't make this one fit, so the
+    // commit must be a no-op for caching purposes rather than trying to make
+    // room for it.
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_oversized",
+      output: oversizedResponseItems(RETAINED_BYTES_BUDGET + 1) as never,
+    });
+
+    // Not cached: the next claim for the same session sees no baseline.
+    const afterOversized = claim({ request: nextRequest() });
+    expect(afterOversized?.request.previous_response_id).toBeUndefined();
+
+    // The oversized commit must not leave the entry stuck "claimed" forever
+    // -- a normal-sized commit right after succeeds and is retained.
+    afterOversized?.commit(continuationState().lastRequest, {
+      id: "resp_normal",
+      output: continuationState().lastResponseItems,
+    });
+    const afterNormal = claim({ request: nextRequest() });
+    expect(afterNormal?.request.previous_response_id).toBe("resp_normal");
+    afterNormal?.release();
+  });
+
+  it("evicts the oldest ready entries once the aggregate retained-byte budget is reached, well below the count cap", () => {
+    // Each entry is sized well under a quarter of the budget (leaving slack
+    // for the surrounding JSON structure's own bytes, on top of the raw
+    // text run sized here) so 4 entries stay comfortably under budget and
+    // the 5th genuinely pushes the running total over it -- the budget, not
+    // the 1000-entry count cap, is what forces eviction here.
+    const entryBytes = Math.floor(RETAINED_BYTES_BUDGET / 5);
+    const fillEntries = 4;
+    for (let i = 0; i < fillEntries; i++) {
+      const c = claim({ sessionId: `budget-session-${i}` });
+      c?.commit(continuationState().lastRequest, {
+        id: `budget-resp-${i}`,
+        output: oversizedResponseItems(entryBytes) as never,
+      });
+    }
+
+    // One more commit of the same size pushes the running total over budget;
+    // the oldest entry (budget-session-0) must be evicted to make room, well
+    // short of the 1000-entry count cap.
+    const overflow = claim({ sessionId: "budget-session-overflow" });
+    overflow?.commit(continuationState().lastRequest, {
+      id: "budget-resp-overflow",
+      output: oversizedResponseItems(entryBytes) as never,
+    });
+
+    const evicted = claim({
+      sessionId: "budget-session-0",
+      request: nextRequestAfterOversized(entryBytes),
+    });
+    expect(evicted?.request.previous_response_id).toBeUndefined();
+    evicted?.release();
+
+    const survivorId = `budget-session-${fillEntries - 1}`;
+    const survivor = claim({
+      sessionId: survivorId,
+      request: nextRequestAfterOversized(entryBytes),
+    });
+    expect(survivor?.request.previous_response_id).toBe(`budget-resp-${fillEntries - 1}`);
+    survivor?.release();
+  });
+
+  it("does not overwrite a replacement claim that starts while the stale commit is still serializing", () => {
+    // estimateRetainedBytes runs JSON.stringify over the committed
+    // request/response to size it against the byte budget. That stringify
+    // synchronously invokes any toJSON a caller-supplied value defines --
+    // this simulates a caller whose toJSON callback runs session cleanup and
+    // starts a brand-new claim at the exact same key, mid-serialization, the
+    // same way a genuinely concurrent turn's cleanup + reclaim could
+    // interleave with this commit's own (already in-flight) work.
+    const raceParams = { sessionId: "toJSON-race-session" };
+    const first = claim(raceParams);
+    let replacement: ReturnType<typeof claim>;
+    const raceOutput = {
+      ...assistantOutput,
+      toJSON() {
+        cleanupSessionResources(raceParams.sessionId);
+        replacement = claim(raceParams);
+        return { ...assistantOutput };
+      },
+    };
+    first?.commit(continuationState().lastRequest, {
+      id: "resp_race",
+      output: [raceOutput] as never,
+    });
+
+    // The replacement claim must still own the key afterward: a fixed commit
+    // re-checks ownership right after serialization and bails out instead of
+    // clobbering the replacement with a stale "ready" entry. If it didn't,
+    // a third claim attempt here would wrongly succeed against resurrected
+    // state instead of correctly finding the key still busy.
+    expect(replacement).toBeDefined();
+    expect(claim(raceParams)).toBeUndefined();
+    replacement?.release();
+  });
+});

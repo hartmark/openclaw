@@ -1,10 +1,21 @@
-import { beforeEach, describe, expect, it } from "vitest";
+/**
+ * Tests agent-specific exec defaults in assembled coding tools.
+ * Verifies per-agent exec host policy affects lazy exec/process behavior.
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "./test-helpers/fast-coding-tools.js";
 import "./test-helpers/fast-openclaw-tools.js";
+import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createSessionConversationTestRegistry } from "../test-utils/session-conversation-registry.js";
 import { createOpenClawCodingTools } from "./agent-tools.js";
+import { getFinishedSession } from "./bash-process-registry.js";
+import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
+import { pinExecToolTarget } from "./exec-tool-target-pinning.js";
+import { resolveExecToolConfig } from "./lazy-exec-tool.js";
 
 function createExecHostDefaultsConfig(
   agents: Array<{ id: string; execHost?: "auto" | "gateway" | "sandbox" }>,
@@ -13,8 +24,7 @@ function createExecHostDefaultsConfig(
     tools: {
       exec: {
         host: "auto",
-        security: "full",
-        ask: "off",
+        mode: "full",
       },
     },
     agents: {
@@ -42,9 +52,164 @@ function requireExecTool(tools: ReturnType<typeof createOpenClawCodingTools>) {
   return execTool;
 }
 
+function schemaPropertyNames(tool: ReturnType<typeof requireExecTool>): string[] {
+  const schema = tool.parameters as { properties?: Record<string, unknown> };
+  return Object.keys(schema.properties ?? {});
+}
+
+const tempDirs = createTempDirTracker();
+
+function createTempAgentDirs(prefix: string) {
+  const root = tempDirs.make(`${prefix}-`);
+  const workspaceDir = path.join(root, "workspace");
+  const agentDir = path.join(root, "agent");
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  fs.mkdirSync(agentDir, { recursive: true });
+  return { workspaceDir, agentDir };
+}
+
 describe("Agent-specific exec tool defaults", () => {
   beforeEach(() => {
     setActivePluginRegistry(createSessionConversationTestRegistry());
+  });
+
+  afterEach(() => {
+    resetProcessRegistryForTests();
+    vi.useRealTimers();
+    tempDirs.cleanup();
+  });
+
+  it.each([
+    { agentId: "main", runtimeTimeoutSec: undefined, expectedMs: 130_000 },
+    { agentId: "helper", runtimeTimeoutSec: undefined, expectedMs: 55_000 },
+    { agentId: "main", runtimeTimeoutSec: 180, expectedMs: 190_000 },
+  ])(
+    "carries $agentId's effective exec timeout through assembled node projection",
+    ({ agentId, runtimeTimeoutSec, expectedMs }) => {
+      const config: OpenClawConfig = {
+        tools: { exec: { timeoutSeconds: 45 } },
+        agents: {
+          list: [{ id: "main", tools: { exec: { timeoutSeconds: 120 } } }, { id: "helper" }],
+        },
+      };
+      const tools = createOpenClawCodingTools({
+        config,
+        agentId,
+        exec: { timeoutSec: runtimeTimeoutSec },
+      });
+      const nodeTool = pinExecToolTarget(requireExecTool(tools), { host: "node" });
+      expect(nodeTool.getExecutionTimeoutMs?.({ command: "echo ready" })).toBe(expectedMs);
+      expect(nodeTool.getExecutionTimeoutMs?.({ command: "echo ready", timeoutSeconds: 0 })).toBe(
+        expectedMs,
+      );
+    },
+  );
+
+  it("keeps each actual exec result for its own agent retention after another process tool loads", async () => {
+    vi.useFakeTimers({
+      toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    const config: OpenClawConfig = {
+      tools: { exec: { host: "gateway", mode: "full", cleanupMs: 60_000 } },
+      agents: {
+        ownership: "explicit",
+        list: [{ id: "main", tools: { exec: { cleanupMs: 180_000 } } }, { id: "helper" }],
+      },
+    };
+    const toolsFor = (agentId: string) =>
+      createOpenClawCodingTools({
+        config,
+        sessionKey: `agent:${agentId}:main`,
+        exec: { backgroundMs: 0, notifyOnExit: false },
+        ...createTempAgentDirs(`retention-${agentId}`),
+      });
+    const longTools = toolsFor("main");
+    const shortTools = toolsFor("helper");
+    const start = async (tools: ReturnType<typeof toolsFor>, callId: string) => {
+      const result = await requireExecTool(tools).execute(callId, {
+        command: "echo retention-result",
+        background: true,
+      });
+      const sessionId = (result.details as { sessionId?: string }).sessionId;
+      if (!sessionId) {
+        throw new Error("Expected an actual background process session");
+      }
+      await vi.waitFor(() =>
+        expect(getFinishedSession(sessionId)).toMatchObject({
+          exitCode: 0,
+          terminalStatus: "completed",
+        }),
+      );
+      return sessionId;
+    };
+    // Neither lazy process tool has run when these processes are admitted.
+    const longId = await start(longTools, "long-retention");
+    const shortId = await start(shortTools, "short-retention");
+    const shortProcess = shortTools.find((tool) => tool.name === "process");
+    const longProcess = longTools.find((tool) => tool.name === "process");
+    if (!shortProcess || !longProcess) {
+      throw new Error("Expected process tools for both agents");
+    }
+    await shortProcess.execute("load-short-process", { action: "list" });
+    // The old 60s global TTL sweeps every 30s, so allow its next full sweep.
+    await vi.advanceTimersByTimeAsync(95_000);
+    const longResult = await longProcess.execute("long-retention-log", {
+      action: "log",
+      sessionId: longId,
+    });
+    const shortResult = await shortProcess.execute("short-retention-log", {
+      action: "log",
+      sessionId: shortId,
+    });
+    expect(shortResult.details).toMatchObject({ status: "failed" });
+    expect(longResult.details).toMatchObject({ status: "completed" });
+    expect(longResult.content[0]).toMatchObject({
+      text: expect.stringContaining("retention-result"),
+    });
+  });
+
+  it.each([0, 3_000])(
+    "inherits the global exec approval running notice delay %i",
+    (approvalRunningNoticeMs) => {
+      expect(
+        resolveExecToolConfig({
+          cfg: {
+            tools: {
+              exec: {
+                approvalRunningNoticeMs,
+              },
+            },
+          },
+          agentId: "main",
+        }).approvalRunningNoticeMs,
+      ).toBe(approvalRunningNoticeMs);
+    },
+  );
+
+  it("lets a per-agent exec approval running notice disable the inherited global delay", () => {
+    expect(
+      resolveExecToolConfig({
+        cfg: {
+          tools: {
+            exec: {
+              approvalRunningNoticeMs: 3_000,
+            },
+          },
+          agents: {
+            entries: {
+              main: {
+                tools: {
+                  exec: {
+                    approvalRunningNoticeMs: 0,
+                  },
+                },
+              },
+            },
+          },
+        },
+        agentId: "main",
+      }).approvalRunningNoticeMs,
+    ).toBe(0);
   });
 
   it("should run exec synchronously when process is denied", async () => {
@@ -53,8 +218,7 @@ describe("Agent-specific exec tool defaults", () => {
         deny: ["process"],
         exec: {
           host: "gateway",
-          security: "full",
-          ask: "off",
+          mode: "full",
         },
       },
     };
@@ -62,8 +226,7 @@ describe("Agent-specific exec tool defaults", () => {
     const tools = createOpenClawCodingTools({
       config: cfg,
       sessionKey: "agent:main:main",
-      workspaceDir: "/tmp/test-main",
-      agentDir: "/tmp/agent-main",
+      ...createTempAgentDirs("test-main"),
     });
     const execTool = requireExecTool(tools);
 
@@ -76,21 +239,56 @@ describe("Agent-specific exec tool defaults", () => {
     expect(resultDetails?.status).toBe("completed");
   });
 
+  it("makes exec completion-only when the final runtime allowlist removes process", async () => {
+    const tools = createOpenClawCodingTools({
+      config: {
+        tools: {
+          exec: {
+            host: "gateway",
+            mode: "full",
+          },
+        },
+      },
+      runtimeToolAllowlist: ["exec"],
+      inheritRuntimeToolAllowlist: true,
+      sessionKey: "agent:main:main",
+      ...createTempAgentDirs("test-main-runtime-exec-only"),
+    });
+    const execTool = requireExecTool(tools);
+
+    expect.soft(tools.map((tool) => tool.name)).not.toContain("process");
+    expect.soft(execTool.description).not.toMatch(/background|yieldMs|process/);
+    expect.soft(schemaPropertyNames(execTool)).not.toContain("background");
+    expect.soft(schemaPropertyNames(execTool)).not.toContain("yieldMs");
+    expect.soft(schemaPropertyNames(execTool)).not.toContain("security");
+
+    const result = await execTool.execute("call-runtime-exec-only", {
+      command: `${JSON.stringify(process.execPath)} -e "setTimeout(() => {}, 250)"`,
+      background: true,
+      yieldMs: 10,
+      timeoutSeconds: 0.05,
+    });
+
+    expect.soft(result.details).toMatchObject({ status: "failed", timedOut: true });
+    const text = (result.content[0] as { text?: string } | undefined)?.text ?? "";
+    expect.soft(text).toContain("Verify the resulting state before retrying");
+    expect.soft(text).not.toMatch(/process|background|yieldMs|poll|trailing &/i);
+  });
+
   it("routes implicit auto exec to gateway without a sandbox runtime", async () => {
     const tools = createOpenClawCodingTools({
       config: {
         tools: {
           exec: {
-            security: "full",
-            ask: "off",
+            mode: "full",
           },
         },
       },
       sessionKey: "agent:main:main",
-      workspaceDir: "/tmp/test-main-implicit-gateway",
-      agentDir: "/tmp/agent-main-implicit-gateway",
+      ...createTempAgentDirs("test-main-implicit-gateway"),
     });
     const execTool = requireExecTool(tools);
+    expect.soft(schemaPropertyNames(execTool)).not.toContain("security");
 
     const result = await execTool.execute("call-implicit-auto-default", {
       command: "echo done",
@@ -109,8 +307,7 @@ describe("Agent-specific exec tool defaults", () => {
         },
       },
       sessionKey: "agent:main:main",
-      workspaceDir: "/tmp/test-main-mode-deny",
-      agentDir: "/tmp/agent-main-mode-deny",
+      ...createTempAgentDirs("test-main-mode-deny"),
     });
     const execTool = requireExecTool(tools);
 
@@ -131,8 +328,7 @@ describe("Agent-specific exec tool defaults", () => {
         },
       },
       sessionKey: "agent:main:main",
-      workspaceDir: "/tmp/test-main-mode-call-security",
-      agentDir: "/tmp/agent-main-mode-call-security",
+      ...createTempAgentDirs("test-main-mode-call-security"),
     });
     const execTool = requireExecTool(tools);
 
@@ -159,7 +355,7 @@ describe("Agent-specific exec tool defaults", () => {
               id: "main",
               tools: {
                 exec: {
-                  ask: "off",
+                  mode: "allowlist",
                 },
               },
             },
@@ -167,8 +363,7 @@ describe("Agent-specific exec tool defaults", () => {
         },
       },
       sessionKey: "agent:main:main",
-      workspaceDir: "/tmp/test-main-mode-partial-agent",
-      agentDir: "/tmp/agent-main-mode-partial-agent",
+      ...createTempAgentDirs("test-main-mode-partial-agent"),
     });
     const execTool = requireExecTool(tools);
 
@@ -193,8 +388,7 @@ describe("Agent-specific exec tool defaults", () => {
         security: "deny",
       },
       sessionKey: "agent:main:main",
-      workspaceDir: "/tmp/test-main-session-legacy-override",
-      agentDir: "/tmp/agent-main-session-legacy-override",
+      ...createTempAgentDirs("test-main-session-legacy-override"),
     });
     const execTool = requireExecTool(tools);
 
@@ -209,8 +403,7 @@ describe("Agent-specific exec tool defaults", () => {
     const tools = createOpenClawCodingTools({
       config: {},
       sessionKey: "agent:main:main",
-      workspaceDir: "/tmp/test-main-fail-closed",
-      agentDir: "/tmp/agent-main-fail-closed",
+      ...createTempAgentDirs("test-main-fail-closed"),
     });
     const execTool = requireExecTool(tools);
     await expect(
@@ -230,8 +423,7 @@ describe("Agent-specific exec tool defaults", () => {
     const mainTools = createOpenClawCodingTools({
       config: cfg,
       sessionKey: "agent:main:main",
-      workspaceDir: "/tmp/test-main-exec-defaults",
-      agentDir: "/tmp/agent-main-exec-defaults",
+      ...createTempAgentDirs("test-main-exec-defaults"),
     });
     const mainExecTool = requireExecTool(mainTools);
     const mainResult = await mainExecTool.execute("call-main-default", {
@@ -250,8 +442,7 @@ describe("Agent-specific exec tool defaults", () => {
     const helperTools = createOpenClawCodingTools({
       config: cfg,
       sessionKey: "agent:helper:main",
-      workspaceDir: "/tmp/test-helper-exec-defaults",
-      agentDir: "/tmp/agent-helper-exec-defaults",
+      ...createTempAgentDirs("test-helper-exec-defaults"),
     });
     const helperExecTool = requireExecTool(helperTools);
     const helperResult = await helperExecTool.execute("call-helper-default", {
@@ -276,8 +467,7 @@ describe("Agent-specific exec tool defaults", () => {
       config: cfg,
       agentId: "main",
       sessionKey: "run-opaque-123",
-      workspaceDir: "/tmp/test-main-opaque-session",
-      agentDir: "/tmp/agent-main-opaque-session",
+      ...createTempAgentDirs("test-main-opaque-session"),
     });
     const execTool = requireExecTool(tools);
     const result = await execTool.execute("call-main-opaque-session", {

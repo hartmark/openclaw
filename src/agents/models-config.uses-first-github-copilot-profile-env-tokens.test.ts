@@ -1,9 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
-import {
-  planOpenClawModelsJson,
-  planOpenClawModelsJsonWithDeps,
-  type ResolveImplicitProvidersForModelsJson,
-} from "./models-config.plan.js";
+// Verifies GitHub Copilot profile token fallback and implicit provider planning.
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { planOpenClawModelsJson } from "./models-config.plan.js";
+import { planModelsJsonForTest } from "./models-config.plan.test-support.js";
+import { resolveImplicitProviders } from "./models-config.providers.js";
 import type { ProviderConfig } from "./models-config.providers.secrets.js";
 import { createProviderAuthResolver } from "./models-config.providers.secrets.js";
 
@@ -18,8 +17,6 @@ vi.mock("./provider-auth-aliases.js", () => ({
 
 vi.mock("./model-auth-env-vars.js", () => ({
   listKnownProviderEnvApiKeyNames: () => [],
-  resolveProviderEnvApiKeyCandidates: () => ({}),
-  resolveProviderEnvAuthEvidence: () => ({}),
   resolveProviderEnvAuthLookupMaps: () => ({
     aliasMap: {},
     envCandidateMap: {},
@@ -32,16 +29,20 @@ vi.mock("../plugins/provider-runtime.js", () => ({
 }));
 
 vi.mock("./models-config.providers.js", () => ({
-  applyNativeStreamingUsageCompat: (providers: unknown) => providers,
+  materializeConfiguredProviderCatalogModels: (providers: unknown) => providers,
   enforceSourceManagedProviderSecrets: ({ providers }: { providers: unknown }) => providers,
   normalizeProviderCatalogModelsForConfig: (providers: unknown) => providers,
   normalizeProviders: ({ providers }: { providers: unknown }) => providers,
-  resolveImplicitProviders: async ({
-    explicitProviders,
-  }: {
-    explicitProviders?: Record<string, unknown>;
-  }) => explicitProviders ?? {},
+  resolveImplicitProviders: vi.fn(),
 }));
+
+const resolveImplicitProvidersMock = vi.mocked(resolveImplicitProviders);
+
+beforeEach(() => {
+  resolveImplicitProvidersMock
+    .mockReset()
+    .mockImplementation(async ({ explicitProviders }) => explicitProviders ?? {});
+});
 
 describe("models-config", () => {
   it("uses the first github-copilot profile when env tokens are missing", () => {
@@ -71,20 +72,27 @@ describe("models-config", () => {
   });
 
   it("does not override explicit github-copilot provider config", async () => {
-    const plan = await planOpenClawModelsJson({
-      cfg: {
-        models: {
-          providers: {
-            "github-copilot": {
-              baseUrl: "https://copilot.local",
-              api: "openai-responses",
-              models: [],
-            },
+    const cfg = {
+      models: {
+        providers: {
+          "github-copilot": {
+            baseUrl: "https://copilot.local",
+            api: "openai-responses" as const,
+            models: [],
           },
         },
       },
-      agentDir: "/tmp/openclaw-agent",
-      env: {} as NodeJS.ProcessEnv,
+    };
+    const env = {} as NodeJS.ProcessEnv;
+    const plan = await planOpenClawModelsJson({
+      context: {
+        cfg,
+        discoveryAuthConfig: cfg,
+        sourceConfigForSecrets: cfg,
+        agentDir: "/tmp/openclaw-agent",
+        env,
+        envFingerprint: env,
+      },
       existingRaw: "",
       existingParsed: null,
     });
@@ -102,35 +110,28 @@ describe("models-config", () => {
   });
 
   it("passes explicit provider config to implicit discovery so plugins can skip duplicates", async () => {
-    const resolveImplicitProviders = vi.fn<ResolveImplicitProvidersForModelsJson>(
-      async ({ explicitProviders }) => {
-        expect(explicitProviders.vllm?.baseUrl).toBe("http://127.0.0.1:8000/v1");
-        return {};
-      },
-    );
+    resolveImplicitProvidersMock.mockImplementationOnce(async ({ explicitProviders }) => {
+      expect(explicitProviders?.vllm?.baseUrl).toBe("http://127.0.0.1:8000/v1");
+      return {};
+    });
 
-    const plan = await planOpenClawModelsJsonWithDeps(
-      {
-        cfg: {
-          models: {
-            providers: {
-              vllm: {
-                baseUrl: "http://127.0.0.1:8000/v1",
-                api: "openai-completions",
-                models: [],
-              },
+    const plan = await planModelsJsonForTest({
+      cfg: {
+        models: {
+          providers: {
+            vllm: {
+              baseUrl: "http://127.0.0.1:8000/v1",
+              api: "openai-completions",
+              models: [],
             },
           },
         },
-        agentDir: "/tmp/openclaw-agent",
-        env: { VLLM_API_KEY: "test-vllm-key" } as NodeJS.ProcessEnv,
-        existingRaw: "",
-        existingParsed: null,
       },
-      { resolveImplicitProviders },
-    );
+      agentDir: "/tmp/openclaw-agent",
+      env: { VLLM_API_KEY: "test-vllm-key" } as NodeJS.ProcessEnv,
+    });
 
-    expect(resolveImplicitProviders).toHaveBeenCalledOnce();
+    expect(resolveImplicitProvidersMock).toHaveBeenCalledOnce();
     expect(plan).toEqual({
       action: "write",
       pluginCatalogWrites: {},
@@ -170,31 +171,27 @@ describe("models-config", () => {
       2,
     )}\n`;
 
-    const plan = await planOpenClawModelsJsonWithDeps(
-      {
-        cfg: {
-          models: {
-            providers: {
-              kilocode: kilocodeProvider,
-            },
+    resolveImplicitProvidersMock.mockResolvedValueOnce({});
+    const plan = await planModelsJsonForTest({
+      cfg: {
+        models: {
+          providers: {
+            kilocode: kilocodeProvider,
           },
         },
-        sourceConfigForSecrets: {
-          models: {
-            providers: {
-              kilocode: kilocodeProvider,
-            },
+      },
+      sourceConfigForSecrets: {
+        models: {
+          providers: {
+            kilocode: kilocodeProvider,
           },
         },
-        agentDir: "/tmp/openclaw-agent",
-        env: {} as NodeJS.ProcessEnv,
-        existingRaw: existingContents,
-        existingParsed: JSON.parse(existingContents),
       },
-      {
-        resolveImplicitProviders: async () => ({}),
-      },
-    );
+      agentDir: "/tmp/openclaw-agent",
+      env: {} as NodeJS.ProcessEnv,
+      existingRaw: existingContents,
+      existingParsed: JSON.parse(existingContents),
+    });
 
     expect(plan).toEqual({ action: "noop", pluginCatalogWrites: {} });
   });
@@ -248,30 +245,19 @@ describe("models-config", () => {
   });
 });
 
-function createCopilotImplicitResolver(
-  provider: ProviderConfig,
-): ResolveImplicitProvidersForModelsJson {
-  return async () => ({ "github-copilot": provider });
-}
-
 async function planCopilotWithImplicitProvider(params: { provider: ProviderConfig }) {
-  return await planOpenClawModelsJsonWithDeps(
-    {
-      cfg: { models: { providers: {} } },
-      agentDir: "/tmp/openclaw-agent",
-      env: {} as NodeJS.ProcessEnv,
-      existingRaw: "",
-      existingParsed: null,
-    },
-    {
-      resolveImplicitProviders: createCopilotImplicitResolver(params.provider),
-    },
-  );
+  resolveImplicitProvidersMock.mockResolvedValueOnce({ "github-copilot": params.provider });
+  return await planModelsJsonForTest({
+    cfg: { models: { providers: {} } },
+    agentDir: "/tmp/openclaw-agent",
+    env: {} as NodeJS.ProcessEnv,
+  });
 }
 
 function expectCopilotProviderFromPlan(
   plan: Awaited<ReturnType<typeof planCopilotWithImplicitProvider>>,
 ) {
+  // Keep assertions on the emitted provider payload, not planner implementation details.
   expect(plan.action).toBe("write");
   const parsed =
     plan.action === "write"

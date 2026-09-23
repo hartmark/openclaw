@@ -1,3 +1,4 @@
+// QR terminal render tests cover terminal QR output formatting.
 import QRCode from "qrcode";
 import { describe, expect, it } from "vitest";
 import { renderQrTerminal } from "./qr-terminal.ts";
@@ -53,9 +54,19 @@ function decodeCompactQr(output: string, size: number): boolean[] {
 }
 
 describe("renderQrTerminal (real qrcode runtime)", () => {
-  it("keeps per-row ANSI sequence counts in line with typical rows", async () => {
+  it("rejects empty input through qrcode", async () => {
+    await expect(renderQrTerminal("")).rejects.toThrow("No input text");
+  });
+
+  it.each([
+    { label: "default", options: undefined },
+    { label: "compact", options: { small: true } },
+  ])("keeps $label per-row ANSI sequence counts in line with typical rows", async ({ options }) => {
     const sample = "https://wa.me/login/2@SAMPLE-TOKEN-1234567890ABCDEF";
-    const rendered = await renderQrTerminal(sample);
+    const rendered = await renderQrTerminal(sample, options);
+    if (options === undefined) {
+      expect(rendered).toBe(await QRCode.toString(sample, { small: false, type: "terminal" }));
+    }
     const escCounts = rendered
       .split(/\r?\n/)
       .map((line) => (line.match(ansiSgr) ?? []).length)

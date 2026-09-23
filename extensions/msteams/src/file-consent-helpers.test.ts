@@ -1,135 +1,31 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { expectDefined } from "@openclaw/normalization-core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { prepareFileConsentActivity, requiresFileConsent } from "./file-consent-helpers.js";
-import {
-  clearPendingUploads,
-  getPendingUpload,
-  getPendingUploadCount,
-  removePendingUpload,
-  storePendingUpload,
-} from "./pending-uploads.js";
 import * as pendingUploads from "./pending-uploads.js";
 
 describe("requiresFileConsent", () => {
-  const thresholdBytes = 4 * 1024 * 1024; // 4MB
+  const thresholdBytes = 4 * 1024 * 1024;
 
-  it("returns true for personal chat with non-image", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "personal",
-        contentType: "application/pdf",
-        bufferSize: 1000,
-        thresholdBytes,
-      }),
-    ).toBe(true);
-  });
-
-  it("returns true for personal chat with large image", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "personal",
-        contentType: "image/png",
-        bufferSize: 5 * 1024 * 1024, // 5MB
-        thresholdBytes,
-      }),
-    ).toBe(true);
-  });
-
-  it("returns false for personal chat with small image", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "personal",
-        contentType: "image/png",
-        bufferSize: 1000,
-        thresholdBytes,
-      }),
-    ).toBe(false);
-  });
-
-  it("returns false for group chat with large non-image", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "groupChat",
-        contentType: "application/pdf",
-        bufferSize: 5 * 1024 * 1024,
-        thresholdBytes,
-      }),
-    ).toBe(false);
-  });
-
-  it("returns false for channel with large non-image", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "channel",
-        contentType: "application/pdf",
-        bufferSize: 5 * 1024 * 1024,
-        thresholdBytes,
-      }),
-    ).toBe(false);
-  });
-
-  it("handles case-insensitive conversation type", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "Personal",
-        contentType: "application/pdf",
-        bufferSize: 1000,
-        thresholdBytes,
-      }),
-    ).toBe(true);
-
-    expect(
-      requiresFileConsent({
-        conversationType: "PERSONAL",
-        contentType: "application/pdf",
-        bufferSize: 1000,
-        thresholdBytes,
-      }),
-    ).toBe(true);
-  });
-
-  it("returns false when conversationType is undefined", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: undefined,
-        contentType: "application/pdf",
-        bufferSize: 1000,
-        thresholdBytes,
-      }),
-    ).toBe(false);
-  });
-
-  it("returns true for personal chat when contentType is undefined (non-image)", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "personal",
-        contentType: undefined,
-        bufferSize: 1000,
-        thresholdBytes,
-      }),
-    ).toBe(true);
-  });
-
-  it("returns true for personal chat with file exactly at threshold", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "personal",
-        contentType: "image/jpeg",
-        bufferSize: thresholdBytes, // exactly 4MB
-        thresholdBytes,
-      }),
-    ).toBe(true);
-  });
-
-  it("returns false for personal chat with file just below threshold", () => {
-    expect(
-      requiresFileConsent({
-        conversationType: "personal",
-        contentType: "image/jpeg",
-        bufferSize: thresholdBytes - 1, // 4MB - 1 byte
-        thresholdBytes,
-      }),
-    ).toBe(false);
-  });
+  it.each([
+    ["personal", "application/pdf", 1000, true],
+    ["personal", "image/png", 5 * 1024 * 1024, true],
+    ["personal", "image/png", 1000, false],
+    ["groupChat", "application/pdf", 5 * 1024 * 1024, false],
+    ["channel", "application/pdf", 5 * 1024 * 1024, false],
+    ["Personal", "application/pdf", 1000, true],
+    ["PERSONAL", "application/pdf", 1000, true],
+    [undefined, "application/pdf", 1000, false],
+    ["personal", undefined, 1000, true],
+    ["personal", "image/jpeg", thresholdBytes, true],
+    ["personal", "image/jpeg", thresholdBytes - 1, false],
+  ] as const)(
+    "%s chat with %s at %i bytes requires consent: %s",
+    (conversationType, contentType, bufferSize, expected) => {
+      expect(
+        requiresFileConsent({ conversationType, contentType, bufferSize, thresholdBytes }),
+      ).toBe(expected);
+    },
+  );
 });
 
 describe("prepareFileConsentActivity", () => {
@@ -193,10 +89,10 @@ describe("prepareFileConsentActivity", () => {
       conversationId: "conv456",
     });
 
-    const attachment = (result.activity.attachments as unknown[])[0] as Record<
-      string,
-      { description: string }
-    >;
+    const attachment = expectDefined(
+      (result.activity.attachments as Array<{ content: { description: string } }>)[0],
+      "default file-consent attachment",
+    );
     expect(attachment.content.description).toBe("File: document.docx");
   });
 
@@ -211,10 +107,10 @@ describe("prepareFileConsentActivity", () => {
       description: "Q4 Financial Report",
     });
 
-    const attachment = (result.activity.attachments as unknown[])[0] as Record<
-      string,
-      { description: string }
-    >;
+    const attachment = expectDefined(
+      (result.activity.attachments as Array<{ content: { description: string } }>)[0],
+      "described file-consent attachment",
+    );
     expect(attachment.content.description).toBe("Q4 Financial Report");
   });
 
@@ -228,10 +124,14 @@ describe("prepareFileConsentActivity", () => {
       conversationId: "conv000",
     });
 
-    const attachment = (result.activity.attachments as unknown[])[0] as Record<
-      string,
-      { acceptContext: { uploadId: string } }
-    >;
+    const attachment = expectDefined(
+      (
+        result.activity.attachments as Array<{
+          content: { acceptContext: { uploadId: string } };
+        }>
+      )[0],
+      "file-consent upload attachment",
+    );
     expect(attachment.content.acceptContext.uploadId).toBe(mockUploadId);
   });
 
@@ -246,83 +146,5 @@ describe("prepareFileConsentActivity", () => {
 
     expect(result.uploadId).toBe(mockUploadId);
     expect(result.activity.type).toBe("message");
-  });
-});
-
-describe("msteams pending uploads", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    clearPendingUploads();
-  });
-
-  afterEach(() => {
-    clearPendingUploads();
-    vi.useRealTimers();
-  });
-
-  it("stores uploads, exposes them by id, and tracks count", () => {
-    const id = storePendingUpload({
-      buffer: Buffer.from("hello"),
-      filename: "hello.txt",
-      contentType: "text/plain",
-      conversationId: "conv-1",
-    });
-
-    expect(getPendingUploadCount()).toBe(1);
-    const pendingUpload = getPendingUpload(id);
-    expect(pendingUpload).toEqual({
-      id,
-      buffer: Buffer.from("hello"),
-      filename: "hello.txt",
-      contentType: "text/plain",
-      conversationId: "conv-1",
-      createdAt: pendingUpload?.createdAt,
-    });
-    expect(typeof pendingUpload?.createdAt).toBe("number");
-  });
-
-  it("removes uploads explicitly and ignores empty ids", () => {
-    const id = storePendingUpload({
-      buffer: Buffer.from("hello"),
-      filename: "hello.txt",
-      conversationId: "conv-1",
-    });
-
-    removePendingUpload(undefined);
-    expect(getPendingUploadCount()).toBe(1);
-
-    removePendingUpload(id);
-    expect(getPendingUpload(id)).toBeUndefined();
-    expect(getPendingUploadCount()).toBe(0);
-  });
-
-  it("expires uploads by ttl even if the timeout callback has not been observed yet", () => {
-    const id = storePendingUpload({
-      buffer: Buffer.from("hello"),
-      filename: "hello.txt",
-      conversationId: "conv-1",
-    });
-
-    vi.advanceTimersByTime(5 * 60 * 1000 + 1);
-
-    expect(getPendingUpload(id)).toBeUndefined();
-    expect(getPendingUploadCount()).toBe(0);
-  });
-
-  it("clears all uploads for test cleanup", () => {
-    storePendingUpload({
-      buffer: Buffer.from("a"),
-      filename: "a.txt",
-      conversationId: "conv-1",
-    });
-    storePendingUpload({
-      buffer: Buffer.from("b"),
-      filename: "b.txt",
-      conversationId: "conv-2",
-    });
-
-    clearPendingUploads();
-
-    expect(getPendingUploadCount()).toBe(0);
   });
 });

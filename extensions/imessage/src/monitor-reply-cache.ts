@@ -1,15 +1,24 @@
-import { createHash } from "node:crypto";
-import type { PluginStateSyncKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
+import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  isPositiveIMessageChatMatch,
+  resolveIMessageChatMatch,
+  type IMessageChatContext,
+} from "./chat-context.js";
 import { getIMessageRuntime } from "./runtime.js";
+import {
+  IMESSAGE_REPLY_CACHE_NAMESPACE,
+  IMESSAGE_REPLY_CACHE_MAX_ENTRIES,
+  IMESSAGE_REPLY_CACHE_COUNTER_NAMESPACE,
+  IMESSAGE_REPLY_CACHE_COUNTER_MAX_ENTRIES,
+  IMESSAGE_REPLY_CACHE_COUNTER_KEY,
+  IMESSAGE_REPLY_CACHE_TTL_MS,
+  resolveIMessageReplyCacheEntryKey,
+} from "./state-contract.js";
 
-export const IMESSAGE_REPLY_CACHE_NAMESPACE = "imessage.reply-cache";
-export const IMESSAGE_REPLY_CACHE_MAX_ENTRIES = 2000;
-export const IMESSAGE_REPLY_CACHE_COUNTER_NAMESPACE = "imessage.reply-cache-counter";
-export const IMESSAGE_REPLY_CACHE_COUNTER_MAX_ENTRIES = 1;
-export const IMESSAGE_REPLY_CACHE_COUNTER_KEY = "short-id-counter";
-const REPLY_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+export type { IMessageChatContext } from "./chat-context.js";
+
 /** Recency window for the "react to the latest message" fallback. */
 const LATEST_FALLBACK_MS = 10 * 60 * 1000;
 let persistenceFailureLogged = false;
@@ -20,12 +29,6 @@ function reportPersistenceFailure(scope: string, err: unknown): void {
   persistenceFailureLogged = true;
   logVerbose(`imessage reply-cache: ${scope} disabled after first failure: ${String(err)}`);
 }
-
-export type IMessageChatContext = {
-  chatGuid?: string;
-  chatIdentifier?: string;
-  chatId?: number;
-};
 
 type IMessageReplyCacheEntry = IMessageChatContext & {
   accountId: string;
@@ -50,7 +53,7 @@ type IMessageReplyCacheEntry = IMessageChatContext & {
   isFromMe?: boolean;
 };
 
-type IMessageReplyCacheStore = PluginStateSyncKeyedStore<IMessageReplyCacheEntry>;
+type IMessageReplyCacheStore = PluginStateKeyedStore<IMessageReplyCacheEntry>;
 type IMessageReplyCacheCounter = { counter: number };
 
 const imessageReplyCacheByMessageId = new Map<string, IMessageReplyCacheEntry>();
@@ -58,96 +61,128 @@ const imessageShortIdToUuid = new Map<string, string>();
 const imessageUuidToShortId = new Map<string, string>();
 let imessageShortIdCounter = 0;
 
-export function resolveIMessageReplyCacheEntryKey(messageId: string): string {
-  return createHash("sha256").update(messageId, "utf8").digest("hex").slice(0, 32);
-}
-
 function openReplyCacheStore(): IMessageReplyCacheStore {
-  return getIMessageRuntime().state.openSyncKeyedStore<IMessageReplyCacheEntry>({
+  return getIMessageRuntime().state.openKeyedStore<IMessageReplyCacheEntry>({
     namespace: IMESSAGE_REPLY_CACHE_NAMESPACE,
     maxEntries: IMESSAGE_REPLY_CACHE_MAX_ENTRIES,
   });
 }
 
-function openReplyCacheCounterStore(): PluginStateSyncKeyedStore<IMessageReplyCacheCounter> {
-  return getIMessageRuntime().state.openSyncKeyedStore<IMessageReplyCacheCounter>({
+function openReplyCacheCounterStore(): PluginStateKeyedStore<IMessageReplyCacheCounter> {
+  return getIMessageRuntime().state.openKeyedStore<IMessageReplyCacheCounter>({
     namespace: IMESSAGE_REPLY_CACHE_COUNTER_NAMESPACE,
     maxEntries: IMESSAGE_REPLY_CACHE_COUNTER_MAX_ENTRIES,
   });
 }
 
 function remainingTtlMs(timestamp: number): number | undefined {
-  const remaining = REPLY_CACHE_TTL_MS - Math.max(0, Date.now() - timestamp);
+  const remaining = IMESSAGE_REPLY_CACHE_TTL_MS - Math.max(0, Date.now() - timestamp);
   return remaining > 0 ? remaining : undefined;
 }
 
 let hydrated = false;
-function hydrateFromStoreOnce(): void {
-  if (hydrated) {
-    return;
+let hydration: Promise<void> | undefined;
+let persistence: Promise<void> = Promise.resolve();
+
+function hydrateCounter(counter: IMessageReplyCacheCounter | undefined): void {
+  if (counter && Number.isSafeInteger(counter.counter) && counter.counter > 0) {
+    imessageShortIdCounter = Math.max(imessageShortIdCounter, counter.counter);
   }
-  hydrated = true;
-  const cutoff = Date.now() - REPLY_CACHE_TTL_MS;
-  let entries: IMessageReplyCacheEntry[];
-  try {
-    const counter = openReplyCacheCounterStore().lookup(IMESSAGE_REPLY_CACHE_COUNTER_KEY);
-    if (counter && Number.isSafeInteger(counter.counter) && counter.counter > 0) {
-      imessageShortIdCounter = Math.max(imessageShortIdCounter, counter.counter);
+}
+
+function hydrateRows(entries: IMessageReplyCacheEntry[]): void {
+  const cutoff = Date.now() - IMESSAGE_REPLY_CACHE_TTL_MS;
+  for (const entry of entries
+    .filter((cached) => cached.timestamp >= cutoff)
+    .toSorted((a, b) => a.timestamp - b.timestamp)
+    .slice(-IMESSAGE_REPLY_CACHE_MAX_ENTRIES)) {
+    const numeric = Number.parseInt(entry.shortId, 10);
+    if (Number.isFinite(numeric) && numeric > imessageShortIdCounter) {
+      imessageShortIdCounter = numeric;
     }
-    const store = openReplyCacheStore();
-    entries = store
-      .entries()
-      .map(({ value }) => value)
-      .filter((entry) => entry.timestamp >= cutoff)
-      .toSorted((a, b) => a.timestamp - b.timestamp)
-      .slice(-IMESSAGE_REPLY_CACHE_MAX_ENTRIES);
-    for (const entry of entries) {
-      const numeric = Number.parseInt(entry.shortId, 10);
-      if (Number.isFinite(numeric) && numeric > imessageShortIdCounter) {
-        imessageShortIdCounter = numeric;
-      }
-    }
-  } catch (err) {
-    reportPersistenceFailure("read", err);
-    return;
-  }
-  if (entries.length === 0) {
-    return;
-  }
-  for (const entry of entries) {
     imessageReplyCacheByMessageId.set(entry.messageId, entry);
     imessageShortIdToUuid.set(entry.shortId, entry.messageId);
     imessageUuidToShortId.set(entry.messageId, entry.shortId);
   }
 }
 
-function persistReplyCacheEntry(entry: IMessageReplyCacheEntry): void {
+async function hydrateFromStoreOnce(): Promise<void> {
+  if (hydrated) {
+    return;
+  }
+  hydration ??= (async () => {
+    try {
+      const counter = await openReplyCacheCounterStore().lookup(IMESSAGE_REPLY_CACHE_COUNTER_KEY);
+      hydrateCounter(counter);
+      const entries = await openReplyCacheStore().entries();
+      // A legacy host callback can finish synchronous hydration while this read waits.
+      if (!hydrated) {
+        hydrateRows(entries.map(({ value }) => value));
+      }
+    } catch (err) {
+      reportPersistenceFailure("read", err);
+    } finally {
+      hydrated = true;
+    }
+  })();
+  await hydration;
+}
+
+function hydrateFromStoreOnceSync(): void {
+  if (hydrated) {
+    return;
+  }
+  hydrated = true;
+  try {
+    const state = getIMessageRuntime().state;
+    const counter = state
+      .openSyncKeyedStore<IMessageReplyCacheCounter>({
+        namespace: IMESSAGE_REPLY_CACHE_COUNTER_NAMESPACE,
+        maxEntries: IMESSAGE_REPLY_CACHE_COUNTER_MAX_ENTRIES,
+      })
+      .lookup(IMESSAGE_REPLY_CACHE_COUNTER_KEY);
+    hydrateCounter(counter);
+    const entries = state
+      .openSyncKeyedStore<IMessageReplyCacheEntry>({
+        namespace: IMESSAGE_REPLY_CACHE_NAMESPACE,
+        maxEntries: IMESSAGE_REPLY_CACHE_MAX_ENTRIES,
+      })
+      .entries();
+    hydrateRows(entries.map(({ value }) => value));
+  } catch (err) {
+    reportPersistenceFailure("read", err);
+  }
+}
+
+async function persistReplyCacheEntry(entry: IMessageReplyCacheEntry): Promise<void> {
   const ttlMs = remainingTtlMs(entry.timestamp);
   if (!ttlMs) {
     return;
   }
   try {
-    openReplyCacheStore().register(resolveIMessageReplyCacheEntryKey(entry.messageId), entry, {
-      ttlMs,
-    });
+    await openReplyCacheStore().register(
+      resolveIMessageReplyCacheEntryKey(entry.messageId),
+      entry,
+      {
+        ttlMs,
+      },
+    );
   } catch (err) {
     reportPersistenceFailure("write", err);
   }
 }
 
-function deleteReplyCacheEntry(messageId: string): void {
+async function deleteReplyCacheEntry(messageId: string): Promise<void> {
   try {
-    openReplyCacheStore().delete(resolveIMessageReplyCacheEntryKey(messageId));
+    await openReplyCacheStore().delete(resolveIMessageReplyCacheEntryKey(messageId));
   } catch (err) {
     reportPersistenceFailure("delete", err);
   }
 }
 
-function persistReplyCacheCounter(): void {
+async function persistReplyCacheCounter(counter: number): Promise<void> {
   try {
-    openReplyCacheCounterStore().register(IMESSAGE_REPLY_CACHE_COUNTER_KEY, {
-      counter: imessageShortIdCounter,
-    });
+    await openReplyCacheCounterStore().register(IMESSAGE_REPLY_CACHE_COUNTER_KEY, { counter });
   } catch (err) {
     reportPersistenceFailure("counter", err);
   }
@@ -172,20 +207,20 @@ function buildReplyCacheEntry(
 
 function generateShortId(): string {
   imessageShortIdCounter += 1;
-  persistReplyCacheCounter();
   return String(imessageShortIdCounter);
 }
 
-export function rememberIMessageReplyCache(
+export async function rememberIMessageReplyCache(
   entry: Omit<IMessageReplyCacheEntry, "shortId">,
-): IMessageReplyCacheEntry {
-  hydrateFromStoreOnce();
+): Promise<IMessageReplyCacheEntry> {
+  await hydrateFromStoreOnce();
   const messageId = entry.messageId.trim();
   if (!messageId) {
     return { ...entry, shortId: "" };
   }
 
   let shortId = imessageUuidToShortId.get(messageId);
+  const isNewMessage = !shortId;
   if (!shortId) {
     shortId = generateShortId();
     imessageShortIdToUuid.set(shortId, messageId);
@@ -196,8 +231,7 @@ export function rememberIMessageReplyCache(
   imessageReplyCacheByMessageId.delete(messageId);
   imessageReplyCacheByMessageId.set(messageId, fullEntry);
 
-  const cutoff = Date.now() - REPLY_CACHE_TTL_MS;
-  let evicted = false;
+  const cutoff = Date.now() - IMESSAGE_REPLY_CACHE_TTL_MS;
   const deletedMessageIds: string[] = [];
   for (const [key, value] of imessageReplyCacheByMessageId) {
     if (value.timestamp >= cutoff) {
@@ -209,7 +243,6 @@ export function rememberIMessageReplyCache(
       imessageShortIdToUuid.delete(value.shortId);
       imessageUuidToShortId.delete(key);
     }
-    evicted = true;
   }
   while (imessageReplyCacheByMessageId.size > IMESSAGE_REPLY_CACHE_MAX_ENTRIES) {
     const oldest = imessageReplyCacheByMessageId.keys().next().value;
@@ -223,15 +256,20 @@ export function rememberIMessageReplyCache(
       imessageShortIdToUuid.delete(oldEntry.shortId);
       imessageUuidToShortId.delete(oldest);
     }
-    evicted = true;
   }
 
-  if (evicted) {
-    for (const messageIdToDelete of deletedMessageIds) {
-      deleteReplyCacheEntry(messageIdToDelete);
+  const counter = imessageShortIdCounter;
+  // Publish memory without yielding, then persist each admitted mutation in order.
+  persistence = persistence.then(async () => {
+    if (isNewMessage) {
+      await persistReplyCacheCounter(counter);
     }
-  }
-  persistReplyCacheEntry(fullEntry);
+    for (const messageIdToDelete of deletedMessageIds) {
+      await deleteReplyCacheEntry(messageIdToDelete);
+    }
+    await persistReplyCacheEntry(fullEntry);
+  });
+  await persistence;
 
   return fullEntry;
 }
@@ -247,69 +285,8 @@ function hasChatScope(ctx?: IMessageChatContext): boolean {
   );
 }
 
-/**
- * Strip the `iMessage;-;` / `SMS;-;` / `any;-;` service prefix that Messages
- * uses for direct chats. Different layers report direct DMs in different
- * forms — imsg's watch emits the bare handle plus an `any;-;…` chat_guid,
- * the action surface synthesizes `iMessage;-;…` from a phone-number target —
- * so comparing the raw strings would falsely flag the same chat as a
- * cross-chat target. Normalize both sides to the bare suffix.
- */
-function normalizeDirectChatIdentifier(raw: string): string {
-  const trimmed = raw.trim();
-  const lowered = trimmed.toLowerCase();
-  for (const prefix of ["imessage;-;", "sms;-;", "any;-;"]) {
-    if (lowered.startsWith(prefix)) {
-      return trimmed.slice(prefix.length);
-    }
-  }
-  return trimmed;
-}
-
 function isCrossChatMismatch(cached: IMessageReplyCacheEntry, ctx: IMessageChatContext): boolean {
-  const cachedChatGuid = normalizeOptionalString(cached.chatGuid);
-  const ctxChatGuid = normalizeOptionalString(ctx.chatGuid);
-  if (cachedChatGuid && ctxChatGuid) {
-    if (
-      normalizeDirectChatIdentifier(cachedChatGuid) === normalizeDirectChatIdentifier(ctxChatGuid)
-    ) {
-      return false;
-    }
-    return cachedChatGuid !== ctxChatGuid;
-  }
-  const cachedChatIdentifier = normalizeOptionalString(cached.chatIdentifier);
-  const ctxChatIdentifier = normalizeOptionalString(ctx.chatIdentifier);
-  if (cachedChatIdentifier && ctxChatIdentifier) {
-    if (
-      normalizeDirectChatIdentifier(cachedChatIdentifier) ===
-      normalizeDirectChatIdentifier(ctxChatIdentifier)
-    ) {
-      return false;
-    }
-    return cachedChatIdentifier !== ctxChatIdentifier;
-  }
-  const cachedChatId = typeof cached.chatId === "number" ? cached.chatId : undefined;
-  const ctxChatId = typeof ctx.chatId === "number" ? ctx.chatId : undefined;
-  if (cachedChatId !== undefined && ctxChatId !== undefined) {
-    return cachedChatId !== ctxChatId;
-  }
-  // Cross-format pairing: caller supplied chatIdentifier=iMessage;-;<phone>
-  // and the cache stored chatGuid=any;-;<phone> (or vice versa). Compare via
-  // the direct-DM normalization so we recognize them as the same chat.
-  const cachedFingerprint = cachedChatGuid
-    ? normalizeDirectChatIdentifier(cachedChatGuid)
-    : cachedChatIdentifier
-      ? normalizeDirectChatIdentifier(cachedChatIdentifier)
-      : undefined;
-  const ctxFingerprint = ctxChatGuid
-    ? normalizeDirectChatIdentifier(ctxChatGuid)
-    : ctxChatIdentifier
-      ? normalizeDirectChatIdentifier(ctxChatIdentifier)
-      : undefined;
-  if (cachedFingerprint && ctxFingerprint) {
-    return cachedFingerprint !== ctxFingerprint;
-  }
-  return false;
+  return resolveIMessageChatMatch(cached, ctx) === "mismatch";
 }
 
 function describeChatForError(values: IMessageChatContext): string {
@@ -341,7 +318,7 @@ function buildCrossChatError(
 ): Error {
   const remediation =
     inputKind === "short"
-      ? "Retry with MessageSidFull to avoid cross-chat reactions/replies landing in the wrong conversation."
+      ? "Use a message ID from the current chat target; MessageSidFull from another chat is rejected."
       : "Retry with the correct chat target.";
   return new Error(
     `iMessage message id ${describeMessageIdForError(inputId, inputKind)} belongs to a different chat ` +
@@ -349,7 +326,7 @@ function buildCrossChatError(
   );
 }
 
-export function resolveIMessageMessageId(
+export async function resolveIMessageMessageId(
   shortOrUuid: string,
   opts?: {
     requireKnownShortId?: boolean;
@@ -368,7 +345,7 @@ export function resolveIMessageMessageId(
      */
     requireFromMe?: boolean;
   },
-): string {
+): Promise<string> {
   const trimmed = shortOrUuid.trim();
   if (!trimmed) {
     return trimmed;
@@ -378,7 +355,7 @@ export function resolveIMessageMessageId(
   // `imessageShortIdToUuid` and fall through to "no longer available".
   // `rememberIMessageReplyCache` already hydrates on its own, so this only
   // matters for the resolve-first-after-restart sequence.
-  hydrateFromStoreOnce();
+  await hydrateFromStoreOnce();
 
   if (/^\d+$/.test(trimmed)) {
     // Cache hit: the cached entry carries the chat info this short id was
@@ -426,20 +403,20 @@ export function resolveIMessageMessageId(
   return trimmed;
 }
 
-export function isKnownFromMeIMessageMessageId(
+export async function isKnownFromMeIMessageMessageId(
   messageId: string | undefined,
   ctx: IMessageChatContext & { accountId?: string },
-): boolean {
+): Promise<boolean> {
   const trimmed = normalizeOptionalString(messageId);
   if (!trimmed || !ctx.accountId || !hasChatScope(ctx)) {
     return false;
   }
-  hydrateFromStoreOnce();
+  await hydrateFromStoreOnce();
   const cached = imessageReplyCacheByMessageId.get(trimmed);
   if (!cached || cached.isFromMe !== true || cached.accountId !== ctx.accountId) {
     return false;
   }
-  return isPositiveChatMatch(cached, ctx);
+  return isPositiveIMessageChatMatch(cached, ctx);
 }
 
 function buildFromMeError(inputId: string, inputKind: "short" | "uuid"): Error {
@@ -486,7 +463,7 @@ export function findLatestIMessageEntryForChat(
     if (entry.timestamp < cutoff) {
       continue;
     }
-    if (!isPositiveChatMatch(entry, ctx)) {
+    if (!isPositiveIMessageChatMatch(entry, ctx)) {
       continue;
     }
     if (!best || entry.timestamp > best.timestamp) {
@@ -496,61 +473,72 @@ export function findLatestIMessageEntryForChat(
   return best;
 }
 
-/**
- * Return true when the cached entry positively matches the caller's chat
- * context on at least one identifier kind. Unlike `isCrossChatMismatch`,
- * which returns false for "no overlap," this requires concrete agreement.
- */
-function isPositiveChatMatch(entry: IMessageReplyCacheEntry, ctx: IMessageChatContext): boolean {
-  const cachedChatGuid = normalizeOptionalString(entry.chatGuid);
-  const ctxChatGuid = normalizeOptionalString(ctx.chatGuid);
-  if (cachedChatGuid && ctxChatGuid && cachedChatGuid === ctxChatGuid) {
-    return true;
-  }
-  const cachedChatIdentifier = normalizeOptionalString(entry.chatIdentifier);
-  const ctxChatIdentifier = normalizeOptionalString(ctx.chatIdentifier);
-  if (cachedChatIdentifier && ctxChatIdentifier && cachedChatIdentifier === ctxChatIdentifier) {
-    return true;
-  }
-  if (
-    typeof entry.chatId === "number" &&
-    typeof ctx.chatId === "number" &&
-    entry.chatId === ctx.chatId
-  ) {
-    return true;
-  }
-  // Cross-format: cached chatGuid vs ctx chatIdentifier, etc. Compare via
-  // the direct-DM normalization that strips iMessage;-;/SMS;-;/any;-; .
-  const cachedFingerprint = cachedChatGuid
-    ? normalizeDirectChatIdentifier(cachedChatGuid)
-    : cachedChatIdentifier
-      ? normalizeDirectChatIdentifier(cachedChatIdentifier)
-      : undefined;
-  const ctxFingerprint = ctxChatGuid
-    ? normalizeDirectChatIdentifier(ctxChatGuid)
-    : ctxChatIdentifier
-      ? normalizeDirectChatIdentifier(ctxChatIdentifier)
-      : undefined;
-  if (cachedFingerprint && ctxFingerprint && cachedFingerprint === ctxFingerprint) {
-    return true;
-  }
-  return false;
+export async function resolveIMessageCachedResourceBinding(
+  messageId: string,
+  ctx: IMessageChatContext & { accountId: string },
+): Promise<"match" | "mismatch" | "unknown"> {
+  await hydrateFromStoreOnce();
+  return resolveCachedResourceBinding(messageId, ctx);
 }
 
-export function resetIMessageShortIdState(options: { clearPersistent?: boolean } = {}): void {
-  imessageReplyCacheByMessageId.clear();
-  imessageShortIdToUuid.clear();
-  imessageUuidToShortId.clear();
-  imessageShortIdCounter = 0;
-  hydrated = false;
-  persistenceFailureLogged = false;
-  if (options.clearPersistent === false) {
-    return;
+function resolveCachedResourceBinding(
+  messageId: string,
+  ctx: IMessageChatContext & { accountId: string },
+): "match" | "mismatch" | "unknown" {
+  const entry = imessageReplyCacheByMessageId.get(messageId.trim());
+  if (!entry) {
+    return "unknown";
   }
-  try {
-    openReplyCacheStore().clear();
-    openReplyCacheCounterStore().clear();
-  } catch {
-    // best-effort
+  if (Date.now() - entry.timestamp > IMESSAGE_REPLY_CACHE_TTL_MS) {
+    return "unknown";
   }
+  if (entry.accountId !== ctx.accountId) {
+    return "mismatch";
+  }
+  const chatMatch = resolveIMessageChatMatch(entry, ctx);
+  if (chatMatch !== "match") {
+    return chatMatch;
+  }
+  return "match";
+}
+
+type CurrentMessageChatParams = {
+  accountId: string;
+  currentMessageId: string | number;
+  chatContext: IMessageChatContext;
+};
+
+/** @deprecated Used only by hosts without asynchronous conversation matching. */
+export function isIMessageCurrentMessageInChat(params: CurrentMessageChatParams): boolean {
+  hydrateFromStoreOnceSync();
+  return isCurrentMessageInChat(params);
+}
+
+export async function isIMessageCurrentMessageInChatAsync(
+  params: CurrentMessageChatParams,
+): Promise<boolean> {
+  await hydrateFromStoreOnce();
+  return isCurrentMessageInChat(params);
+}
+
+function isCurrentMessageInChat(params: CurrentMessageChatParams): boolean {
+  if (!params.accountId || !hasChatScope(params.chatContext)) {
+    return false;
+  }
+  const currentMessageId = normalizeOptionalString(String(params.currentMessageId));
+  if (!currentMessageId) {
+    return false;
+  }
+  const fullMessageId = /^\d+$/.test(currentMessageId)
+    ? imessageShortIdToUuid.get(currentMessageId)
+    : currentMessageId;
+  if (!fullMessageId) {
+    return false;
+  }
+  return (
+    resolveCachedResourceBinding(fullMessageId, {
+      ...params.chatContext,
+      accountId: params.accountId,
+    }) === "match"
+  );
 }

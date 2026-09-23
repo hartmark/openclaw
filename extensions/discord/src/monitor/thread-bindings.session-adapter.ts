@@ -1,21 +1,26 @@
 import {
+  registerSessionBindingAdapter,
+  unregisterSessionBindingAdapter,
   resolveThreadBindingConversationIdFromBindingId,
   type BindingTargetKind,
   type SessionBindingAdapter,
   type SessionBindingRecord,
 } from "openclaw/plugin-sdk/conversation-runtime";
+import { normalizeAccountId } from "openclaw/plugin-sdk/routing";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveDiscordChannelId } from "../target-parsing.js";
 import { resolveChannelIdForBinding } from "./thread-bindings.discord-api.js";
-import { resolveBindingRecordKey } from "./thread-bindings.state.js";
 import {
-  resolveThreadBindingIdleTimeoutMs,
-  resolveThreadBindingInactivityExpiresAt,
-  resolveThreadBindingMaxAgeExpiresAt,
-  resolveThreadBindingMaxAgeMs,
+  resolveBindingRecordKey,
+  resolvePreparedThreadBindingLifecycle,
 } from "./thread-bindings.state.js";
-import type { ThreadBindingManager, ThreadBindingRecord } from "./thread-bindings.types.js";
+import {
+  DEFAULT_THREAD_BINDING_IDLE_TIMEOUT_MS,
+  DEFAULT_THREAD_BINDING_MAX_AGE_MS,
+  type ThreadBindingManager,
+  type ThreadBindingRecord,
+} from "./thread-bindings.types.js";
 
 type ThreadBindingDefaults = {
   idleTimeoutMs: number;
@@ -42,25 +47,6 @@ function toThreadBindingTargetKind(raw: BindingTargetKind): "subagent" | "acp" {
   return raw === "subagent" ? "subagent" : "acp";
 }
 
-function resolveEffectiveBindingExpiresAt(params: {
-  record: ThreadBindingRecord;
-  defaultIdleTimeoutMs: number;
-  defaultMaxAgeMs: number;
-}): number | undefined {
-  const inactivityExpiresAt = resolveThreadBindingInactivityExpiresAt({
-    record: params.record,
-    defaultIdleTimeoutMs: params.defaultIdleTimeoutMs,
-  });
-  const maxAgeExpiresAt = resolveThreadBindingMaxAgeExpiresAt({
-    record: params.record,
-    defaultMaxAgeMs: params.defaultMaxAgeMs,
-  });
-  if (inactivityExpiresAt != null && maxAgeExpiresAt != null) {
-    return Math.min(inactivityExpiresAt, maxAgeExpiresAt);
-  }
-  return inactivityExpiresAt ?? maxAgeExpiresAt;
-}
-
 function toSessionBindingRecord(
   record: ThreadBindingRecord,
   defaults: ThreadBindingDefaults,
@@ -70,6 +56,7 @@ function toSessionBindingRecord(
       accountId: record.accountId,
       threadId: record.threadId,
     }) ?? `${record.accountId}:${record.threadId}`;
+  const lifecycle = resolvePreparedThreadBindingLifecycle({ record, ...defaults });
   return {
     bindingId,
     targetSessionKey: record.targetSessionKey,
@@ -82,11 +69,7 @@ function toSessionBindingRecord(
     },
     status: "active",
     boundAt: record.boundAt,
-    expiresAt: resolveEffectiveBindingExpiresAt({
-      record,
-      defaultIdleTimeoutMs: defaults.idleTimeoutMs,
-      defaultMaxAgeMs: defaults.maxAgeMs,
-    }),
+    expiresAt: lifecycle.expiresAt,
     metadata: {
       agentId: record.agentId,
       label: record.label,
@@ -94,14 +77,8 @@ function toSessionBindingRecord(
       webhookToken: record.webhookToken,
       boundBy: record.boundBy,
       lastActivityAt: record.lastActivityAt,
-      idleTimeoutMs: resolveThreadBindingIdleTimeoutMs({
-        record,
-        defaultIdleTimeoutMs: defaults.idleTimeoutMs,
-      }),
-      maxAgeMs: resolveThreadBindingMaxAgeMs({
-        record,
-        defaultMaxAgeMs: defaults.maxAgeMs,
-      }),
+      idleTimeoutMs: lifecycle.idleTimeoutMs,
+      maxAgeMs: lifecycle.maxAgeMs,
       ...record.metadata,
     },
   };
@@ -114,7 +91,8 @@ export function createThreadBindingSessionAdapter(params: {
   resolveCurrentCfg: () => OpenClawConfig;
   resolveCurrentToken: () => string | undefined;
 }): SessionBindingAdapter {
-  const toRecord = (entry: ThreadBindingRecord) => toSessionBindingRecord(entry, params.defaults);
+  const serializeBinding = (entry: ThreadBindingRecord) =>
+    toSessionBindingRecord(entry, params.defaults);
 
   return {
     channel: "discord",
@@ -123,6 +101,7 @@ export function createThreadBindingSessionAdapter(params: {
       placements: ["current", "child"],
     },
     bind: async (input) => {
+      const assertCurrent = input.assertCurrent;
       if (input.conversation.channel !== "discord") {
         return null;
       }
@@ -182,17 +161,18 @@ export function createThreadBindingSessionAdapter(params: {
         boundBy,
         introText,
         metadata,
+        ...(assertCurrent ? { assertCurrent } : {}),
       });
-      return bound ? toRecord(bound) : null;
+      return bound ? serializeBinding(bound) : null;
     },
     listBySession: (targetSessionKey) =>
-      params.manager.listBySessionKey(targetSessionKey).map(toRecord),
+      params.manager.listBySessionKey(targetSessionKey).map(serializeBinding),
     resolveByConversation: (ref) => {
       if (ref.channel !== "discord") {
         return null;
       }
       const binding = params.manager.getByThreadId(ref.conversationId);
-      return binding ? toRecord(binding) : null;
+      return binding ? serializeBinding(binding) : null;
     },
     touch: (bindingId, at) => {
       const threadId = resolveThreadBindingConversationIdFromBindingId({
@@ -210,7 +190,7 @@ export function createThreadBindingSessionAdapter(params: {
           targetSessionKey: input.targetSessionKey,
           reason: input.reason,
         });
-        return removed.map(toRecord);
+        return removed.map(serializeBinding);
       }
       const threadId = resolveThreadBindingConversationIdFromBindingId({
         accountId: params.accountId,
@@ -223,7 +203,34 @@ export function createThreadBindingSessionAdapter(params: {
         threadId,
         reason: input.reason,
       });
-      return removed ? [toRecord(removed)] : [];
+      return removed ? [serializeBinding(removed)] : [];
     },
+  };
+}
+
+/** Disabled bindings have a live empty owner; retirement still makes that owner unavailable. */
+export function createNoopThreadBindingManager(accountIdRaw?: string): ThreadBindingManager {
+  const accountId = normalizeAccountId(accountIdRaw);
+  const adapter: SessionBindingAdapter = {
+    channel: "discord",
+    accountId,
+    capabilities: { bindSupported: false, unbindSupported: false, placements: [] },
+    listBySession: () => [],
+    resolveByConversation: () => null,
+  };
+  registerSessionBindingAdapter(adapter);
+  return {
+    accountId,
+    getIdleTimeoutMs: () => DEFAULT_THREAD_BINDING_IDLE_TIMEOUT_MS,
+    getMaxAgeMs: () => DEFAULT_THREAD_BINDING_MAX_AGE_MS,
+    getByThreadId: () => undefined,
+    getBySessionKey: () => undefined,
+    listBySessionKey: () => [],
+    listBindings: () => [],
+    touchThread: () => null,
+    bindTarget: async () => null,
+    unbindThread: () => null,
+    unbindBySessionKey: () => [],
+    stop: () => unregisterSessionBindingAdapter({ channel: "discord", accountId, adapter }),
   };
 }

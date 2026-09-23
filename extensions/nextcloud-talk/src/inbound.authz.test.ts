@@ -1,5 +1,6 @@
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import { describe, expect, it, vi } from "vitest";
-import type { PluginRuntime, RuntimeEnv } from "../runtime-api.js";
+import { createRuntimeSpies } from "../../test-support/runtime-spies.js";
 import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
 import { handleNextcloudTalkInbound } from "./inbound.js";
 import { setNextcloudTalkRuntime } from "./runtime.js";
@@ -9,30 +10,25 @@ function installInboundAuthzRuntime(params: {
   readAllowFromStore: () => Promise<string[]>;
   buildMentionRegexes: () => RegExp[];
 }) {
-  setNextcloudTalkRuntime({
-    channel: {
-      pairing: {
-        readAllowFromStore: params.readAllowFromStore,
+  setNextcloudTalkRuntime(
+    createPluginRuntimeMock({
+      channel: {
+        pairing: {
+          readAllowFromStore: params.readAllowFromStore,
+        },
+        commands: {
+          shouldHandleTextCommands: () => false,
+        },
+        text: {
+          hasControlCommand: () => false,
+        },
+        mentions: {
+          buildMentionRegexes: params.buildMentionRegexes,
+          matchesMentionPatterns: () => false,
+        },
       },
-      commands: {
-        shouldHandleTextCommands: () => false,
-      },
-      text: {
-        hasControlCommand: () => false,
-      },
-      mentions: {
-        buildMentionRegexes: params.buildMentionRegexes,
-        matchesMentionPatterns: () => false,
-      },
-    },
-  } as unknown as PluginRuntime);
-}
-
-function createTestRuntimeEnv(): RuntimeEnv {
-  return {
-    log: vi.fn(),
-    error: vi.fn(),
-  } as unknown as RuntimeEnv;
+    }),
+  );
 }
 
 describe("nextcloud-talk inbound authz", () => {
@@ -83,7 +79,7 @@ describe("nextcloud-talk inbound authz", () => {
       message,
       account,
       config,
-      runtime: createTestRuntimeEnv(),
+      runtime: createRuntimeSpies(),
     });
 
     expect(readAllowFromStore).not.toHaveBeenCalled();
@@ -138,7 +134,7 @@ describe("nextcloud-talk inbound authz", () => {
           },
         },
       },
-      runtime: createTestRuntimeEnv(),
+      runtime: createRuntimeSpies(),
     });
 
     expect(buildMentionRegexes).not.toHaveBeenCalled();

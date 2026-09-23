@@ -17,7 +17,7 @@ function applyGroupAllowFromFromStore(params: {
 
   let changed = false;
   const maybeApply = (prefix: string, holder: Record<string, unknown>) => {
-    if (holder.groupPolicy !== "allowlist") {
+    if (holder.groupPolicy !== "open") {
       return;
     }
     const allowFrom = Array.isArray(holder.allowFrom) ? holder.allowFrom : [];

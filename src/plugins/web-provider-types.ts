@@ -1,3 +1,4 @@
+// Defines web provider plugin schema and runtime types.
 import type { TSchema } from "typebox";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { RuntimeEnv } from "../runtime.js";
@@ -8,8 +9,8 @@ import type {
 import type { WizardPrompter } from "../wizard/prompts.js";
 import type { SecretInputMode } from "./provider-auth-types.js";
 
-export type WebSearchProviderId = string;
-export type WebFetchProviderId = string;
+type WebSearchProviderId = string;
+type WebFetchProviderId = string;
 
 export type WebSearchProviderToolDefinition = {
   description: string;
@@ -23,10 +24,13 @@ export type WebSearchProviderToolDefinition = {
 export type WebFetchProviderToolDefinition = {
   description: string;
   parameters: TSchema;
-  execute: (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  execute: (
+    args: Record<string, unknown>,
+    context?: { signal?: AbortSignal },
+  ) => Promise<Record<string, unknown>>;
 };
 
-export type WebSearchProviderContext = {
+type WebSearchProviderContext = {
   config?: OpenClawConfig;
   searchConfig?: Record<string, unknown>;
   runtimeMetadata?: RuntimeWebSearchMetadata;
@@ -35,9 +39,11 @@ export type WebSearchProviderContext = {
 
 export type WebSearchProviderToolExecutionContext = {
   signal?: AbortSignal;
+  /** Synchronous caller fence; non-HTTP transports must invoke it before each side effect. */
+  assertCurrent?: () => void;
 };
 
-export type WebFetchProviderContext = {
+type WebFetchProviderContext = {
   config?: OpenClawConfig;
   fetchConfig?: Record<string, unknown>;
   runtimeMetadata?: RuntimeWebFetchMetadata;
@@ -45,17 +51,17 @@ export type WebFetchProviderContext = {
 
 export type WebSearchCredentialResolutionSource = "config" | "secretRef" | "env" | "missing";
 
-export type WebSearchProviderConfiguredCredentialFallback = {
+type WebSearchProviderConfiguredCredentialFallback = {
   path: string;
   value: unknown;
 };
 
-export type WebFetchProviderConfiguredCredentialFallback = {
+type WebFetchProviderConfiguredCredentialFallback = {
   path: string;
   value: unknown;
 };
 
-export type WebSearchRuntimeMetadataContext = {
+type WebSearchRuntimeMetadataContext = {
   config?: OpenClawConfig;
   searchConfig?: Record<string, unknown>;
   runtimeMetadata?: RuntimeWebSearchMetadata;
@@ -76,7 +82,7 @@ export type WebSearchProviderSetupContext = {
 
 export type WebFetchCredentialResolutionSource = "config" | "secretRef" | "env" | "missing";
 
-export type WebFetchRuntimeMetadataContext = {
+type WebFetchRuntimeMetadataContext = {
   config?: OpenClawConfig;
   fetchConfig?: Record<string, unknown>;
   runtimeMetadata?: RuntimeWebFetchMetadata;
@@ -91,6 +97,8 @@ export type WebSearchProviderPlugin = {
   id: WebSearchProviderId;
   label: string;
   hint: string;
+  /** Settings subtree relative to this plugin's config; null hides inline settings. Defaults to ["webSearch"]. */
+  configPath?: readonly string[] | null;
   onboardingScopes?: readonly "text-inference"[];
   requiresCredential?: boolean;
   credentialLabel?: string;

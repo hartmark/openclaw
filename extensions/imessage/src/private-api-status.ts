@@ -10,7 +10,12 @@ export type IMessagePrivateApiStatus = {
   // and callers should treat them as unsupported.
   cliCapabilities?: {
     sendRichSupportsAttachment?: boolean;
+    pollSendSupportsNoComment?: boolean;
   };
+  // imsg's own `status --json` `message` field. When advanced features are off
+  // it explains why (SIP enabled, library validation, macOS 26 AMFI gate), so
+  // callers can surface a real reason instead of a generic "run imsg launch".
+  statusMessage?: string;
   error?: string;
 };
 
@@ -69,6 +74,18 @@ export function getCachedIMessagePrivateApiStatus(
   return entry.status;
 }
 
+// Drop a cached verdict so the next action re-probes.
+//
+// A successful probe is cached without expiry (see cacheProbeResult), which is
+// right for the hot path but leaves no way back once the bridge dies: the
+// helper dylib can stop answering while Messages.app stays alive and the
+// injection stays mapped, and nothing about that is observable from the cache.
+// The RPC client calls this when the bridge stops answering, so the stale
+// "available" verdict cannot outlive the bridge it describes.
+export function invalidateCachedIMessagePrivateApiStatus(cliPath?: string | null): void {
+  bridgeStatusCache.delete(normalizeCliPath(cliPath));
+}
+
 export function setCachedIMessagePrivateApiStatus(
   cliPath: string,
   status: IMessagePrivateApiStatus,
@@ -78,12 +95,4 @@ export function setCachedIMessagePrivateApiStatus(
     return;
   }
   bridgeStatusCache.set(normalizeCliPath(cliPath), { status, expiresAt });
-}
-
-export function clearCachedIMessagePrivateApiStatus(cliPath?: string): void {
-  if (cliPath) {
-    bridgeStatusCache.delete(normalizeCliPath(cliPath));
-  } else {
-    bridgeStatusCache.clear();
-  }
 }

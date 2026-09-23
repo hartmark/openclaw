@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import { readProviderTextResponse } from "openclaw/plugin-sdk/provider-http";
 import { z } from "zod";
+import { resolveQaConvexCredentialEnv } from "../../qa-credentials-bootstrap.runtime.js";
 import {
   isQaCredentialTruthyOptIn,
   joinQaCredentialEndpoint,
@@ -10,13 +13,19 @@ import {
   parseQaCredentialPositiveIntegerEnv,
   QA_CREDENTIALS_DEFAULT_ENDPOINT_PREFIX,
 } from "../../qa-credentials-common.runtime.js";
+import { captureQaLeaseClock, createQaLeaseHealth } from "./credential-lease-health.js";
 
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 90_000;
-const DEFAULT_ENDPOINT_PREFIX = QA_CREDENTIALS_DEFAULT_ENDPOINT_PREFIX;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
 const DEFAULT_LEASE_TTL_MS = 20 * 60 * 1_000;
+const DEFAULT_CHUNKED_PAYLOAD_MAX_BYTES = 64 * 1024 * 1024;
+const DEFAULT_CHUNKED_PAYLOAD_MAX_CHUNKS = 4096;
+const CONVEX_BROKER_RESPONSE_MAX_BYTES = 1 * 1024 * 1024;
+const CHUNKED_PAYLOAD_MAX_BYTES_ENV = "OPENCLAW_QA_CREDENTIAL_PAYLOAD_MAX_BYTES";
+const CHUNKED_PAYLOAD_MAX_CHUNKS_ENV = "OPENCLAW_QA_CREDENTIAL_PAYLOAD_MAX_CHUNKS";
 const RETRY_BACKOFF_MS = [500, 1_000, 2_000, 4_000, 5_000] as const;
+const HEARTBEAT_RETRY_DELAYS_MS = [1_000, 3_000, 5_000] as const;
 const RETRYABLE_ACQUIRE_CODES = new Set(["POOL_EXHAUSTED", "NO_CREDENTIAL_AVAILABLE"]);
 const CHUNKED_PAYLOAD_MARKER = "__openclawQaCredentialPayloadChunksV1";
 
@@ -54,6 +63,8 @@ type ConvexCredentialBrokerConfig = {
   httpTimeoutMs: number;
   leaseTtlMs: number;
   ownerId: string;
+  payloadMaxBytes: number;
+  payloadMaxChunks: number;
   payloadChunkUrl: string;
   releaseUrl: string;
   role: QaCredentialRole;
@@ -63,14 +74,16 @@ type QaCredentialLeaseHeartbeat = {
   getFailure(): Error | null;
   stop(): Promise<void>;
   throwIfFailed(): void;
+  whenFailed: Promise<Error>;
 };
 
-export type QaCredentialRole = "ci" | "maintainer";
+type QaCredentialRole = "ci" | "maintainer";
 
 type QaCredentialLeaseSource = "convex" | "env";
 
 type QaCredentialLease<TPayload> = {
   credentialId?: string;
+  assertHealthy(): void;
   heartbeat(): Promise<void>;
   heartbeatIntervalMs: number;
   kind: string;
@@ -85,6 +98,8 @@ type QaCredentialLease<TPayload> = {
 
 type AcquireQaCredentialLeaseOptions<TPayload> = {
   env?: NodeJS.ProcessEnv;
+  cwd?: string;
+  signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   kind: string;
   ownerId?: string;
@@ -101,8 +116,8 @@ class QaCredentialBrokerError extends Error {
   code: string;
   retryAfterMs?: number;
 
-  constructor(params: { code: string; message: string; retryAfterMs?: number }) {
-    super(params.message);
+  constructor(params: { code: string; message: string; retryAfterMs?: number; cause?: unknown }) {
+    super(params.message, { cause: params.cause });
     this.name = "QaCredentialBrokerError";
     this.code = params.code;
     this.retryAfterMs = params.retryAfterMs;
@@ -133,27 +148,11 @@ function normalizeQaCredentialRole(
   throw new Error(`Credential role must be one of maintainer or ci, got "${value}".`);
 }
 
-function normalizeConvexSiteUrl(raw: string, env: NodeJS.ProcessEnv): string {
-  return normalizeQaCredentialConvexSiteUrl({ raw, env });
-}
-
-function normalizeEndpointPrefix(value: string | undefined): string {
-  return normalizeQaCredentialEndpointPrefix({
-    value,
-    fallback: DEFAULT_ENDPOINT_PREFIX,
-    invalidAbsoluteMessage:
-      "OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX must be an absolute path like /qa-credentials/v1.",
-    invalidSegmentsMessage:
-      "OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX must not contain backslashes or .. path segments.",
-  });
-}
-
 function resolveConvexAuthToken(env: NodeJS.ProcessEnv, role: QaCredentialRole): string {
-  const roleToken =
+  const token =
     role === "ci"
       ? env.OPENCLAW_QA_CONVEX_SECRET_CI?.trim()
       : env.OPENCLAW_QA_CONVEX_SECRET_MAINTAINER?.trim();
-  const token = roleToken;
   if (token) {
     return token;
   }
@@ -172,8 +171,15 @@ function resolveConvexCredentialBrokerConfig(params: {
   if (!siteUrl) {
     throw new Error("Missing OPENCLAW_QA_CONVEX_SITE_URL for --credential-source convex.");
   }
-  const baseUrl = normalizeConvexSiteUrl(siteUrl, params.env);
-  const endpointPrefix = normalizeEndpointPrefix(params.env.OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX);
+  const baseUrl = normalizeQaCredentialConvexSiteUrl({ raw: siteUrl, env: params.env });
+  const endpointPrefix = normalizeQaCredentialEndpointPrefix({
+    value: params.env.OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX,
+    fallback: QA_CREDENTIALS_DEFAULT_ENDPOINT_PREFIX,
+    invalidAbsoluteMessage:
+      "OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX must be an absolute path like /qa-credentials/v1.",
+    invalidSegmentsMessage:
+      "OPENCLAW_QA_CONVEX_ENDPOINT_PREFIX must not contain backslashes or .. path segments.",
+  });
   const ownerId =
     params.ownerId?.trim() ||
     params.env.OPENCLAW_QA_CREDENTIAL_OWNER_ID?.trim() ||
@@ -202,6 +208,16 @@ function resolveConvexCredentialBrokerConfig(params: {
       "OPENCLAW_QA_CREDENTIAL_HTTP_TIMEOUT_MS",
       DEFAULT_HTTP_TIMEOUT_MS,
     ),
+    payloadMaxBytes: parsePositiveIntegerEnv(
+      params.env,
+      CHUNKED_PAYLOAD_MAX_BYTES_ENV,
+      DEFAULT_CHUNKED_PAYLOAD_MAX_BYTES,
+    ),
+    payloadMaxChunks: parsePositiveIntegerEnv(
+      params.env,
+      CHUNKED_PAYLOAD_MAX_CHUNKS_ENV,
+      DEFAULT_CHUNKED_PAYLOAD_MAX_CHUNKS,
+    ),
     acquireUrl: joinQaCredentialEndpoint(baseUrl, endpointPrefix, "acquire"),
     heartbeatUrl: joinQaCredentialEndpoint(baseUrl, endpointPrefix, "heartbeat"),
     payloadChunkUrl: joinQaCredentialEndpoint(baseUrl, endpointPrefix, "payload-chunk"),
@@ -209,7 +225,10 @@ function resolveConvexCredentialBrokerConfig(params: {
   };
 }
 
-function parseChunkedPayloadMarker(payload: unknown) {
+function parseChunkedPayloadMarker(
+  payload: unknown,
+  limits: { maxBytes: number; maxChunks: number },
+) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return null;
   }
@@ -224,12 +243,18 @@ function parseChunkedPayloadMarker(payload: unknown) {
   ) {
     throw new Error("Chunked credential payload marker has an invalid chunkCount.");
   }
+  if (record.chunkCount > limits.maxChunks) {
+    throw new Error(`Chunked credential payload marker exceeds ${limits.maxChunks} chunks.`);
+  }
   if (
     typeof record.byteLength !== "number" ||
     !Number.isInteger(record.byteLength) ||
     record.byteLength < 0
   ) {
     throw new Error("Chunked credential payload marker has an invalid byteLength.");
+  }
+  if (record.byteLength > limits.maxBytes) {
+    throw new Error(`Chunked credential payload marker exceeds ${limits.maxBytes} bytes.`);
   }
   return {
     chunkCount: record.chunkCount,
@@ -256,6 +281,7 @@ async function postConvexBroker(params: {
   authToken: string;
   body: Record<string, unknown>;
   fetchImpl: typeof fetch;
+  maxBytes: number;
   timeoutMs: number;
   url: string;
 }): Promise<unknown> {
@@ -270,7 +296,11 @@ async function postConvexBroker(params: {
     signal: AbortSignal.timeout(timeoutMs),
   });
 
-  const text = await response.text();
+  // Keep ordinary broker responses small, while allowing chunk payloads to use
+  // the larger declared payload ceiling.
+  const text = await readProviderTextResponse(response, "Convex credential broker", {
+    maxBytes: params.maxBytes,
+  });
   const payload: unknown = (() => {
     if (!text.trim()) {
       return undefined;
@@ -302,15 +332,23 @@ async function resolveConvexCredentialPayload(params: {
   config: ConvexCredentialBrokerConfig;
   fetchImpl: typeof fetch;
   kind: string;
+  signal?: AbortSignal;
 }) {
-  const marker = parseChunkedPayloadMarker(params.acquired.payload);
+  params.signal?.throwIfAborted();
+  const marker = parseChunkedPayloadMarker(params.acquired.payload, {
+    maxBytes: params.config.payloadMaxBytes,
+    maxChunks: params.config.payloadMaxChunks,
+  });
   if (!marker) {
     return params.acquired.payload;
   }
   const chunks: string[] = [];
+  let serializedBytes = 0;
   for (let index = 0; index < marker.chunkCount; index += 1) {
+    params.signal?.throwIfAborted();
     const payload = await postConvexBroker({
       fetchImpl: params.fetchImpl,
+      maxBytes: params.config.payloadMaxBytes,
       timeoutMs: params.config.httpTimeoutMs,
       authToken: params.config.authToken,
       url: params.config.payloadChunkUrl,
@@ -323,11 +361,16 @@ async function resolveConvexCredentialPayload(params: {
         index,
       },
     });
+    params.signal?.throwIfAborted();
     const parsed = convexPayloadChunkSuccessSchema.parse(payload);
+    serializedBytes += Buffer.byteLength(parsed.data, "utf8");
+    if (serializedBytes > marker.byteLength) {
+      throw new Error("Chunked credential payload exceeded declared byteLength.");
+    }
     chunks.push(parsed.data);
   }
   const serialized = chunks.join("");
-  if (serialized.length !== marker.byteLength) {
+  if (serializedBytes !== marker.byteLength) {
     throw new Error("Chunked credential payload length mismatch.");
   }
   return JSON.parse(serialized) as unknown;
@@ -341,7 +384,8 @@ function computeAcquireBackoffMs(params: {
   if (params.retryAfterMs && params.retryAfterMs > 0) {
     return params.retryAfterMs;
   }
-  const base = RETRY_BACKOFF_MS[Math.min(RETRY_BACKOFF_MS.length - 1, params.attempt - 1)];
+  const backoffIndex = Math.max(0, Math.min(RETRY_BACKOFF_MS.length - 1, params.attempt - 1));
+  const base = expectDefined(RETRY_BACKOFF_MS[backoffIndex], "QA credential retry backoff");
   const jitter = 0.75 + params.randomImpl() * 0.5;
   return Math.max(100, Math.round(base * jitter));
 }
@@ -363,10 +407,23 @@ function assertConvexOk(payload: unknown, actionLabel: string) {
   throw new Error(`Convex credential ${actionLabel} failed with an invalid response payload.`);
 }
 
+function isTransientBrokerTransportError(error: unknown) {
+  if (error instanceof QaCredentialBrokerError) {
+    return false;
+  }
+  const message = formatErrorMessage(error);
+  return (
+    /fetch failed|connect timeout error|UND_ERR_[A-Z_]+|EAI_AGAIN|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT/iu.test(
+      message,
+    ) || /failed with HTTP 5\d\d\b/iu.test(message)
+  );
+}
+
 export async function acquireQaCredentialLease<TPayload>(
   opts: AcquireQaCredentialLeaseOptions<TPayload>,
 ): Promise<QaCredentialLease<TPayload>> {
-  const env = opts.env ?? process.env;
+  let env = opts.env ?? process.env;
+  opts.signal?.throwIfAborted();
   const source = normalizeQaCredentialSource(opts.source ?? env.OPENCLAW_QA_CREDENTIAL_SOURCE);
   if (source === "env") {
     return {
@@ -374,6 +431,7 @@ export async function acquireQaCredentialLease<TPayload>(
       kind: opts.kind,
       payload: opts.resolveEnvPayload(),
       heartbeatIntervalMs: 0,
+      assertHealthy() {},
       leaseTtlMs: 0,
       async heartbeat() {},
       async release() {},
@@ -381,6 +439,9 @@ export async function acquireQaCredentialLease<TPayload>(
   }
 
   const role = normalizeQaCredentialRole(opts.role ?? env.OPENCLAW_QA_CREDENTIAL_ROLE, env);
+  if (role === "ci") {
+    env = await resolveQaConvexCredentialEnv(env, opts);
+  }
   const config = resolveConvexCredentialBrokerConfig({
     env,
     role,
@@ -399,10 +460,13 @@ export async function acquireQaCredentialLease<TPayload>(
   let attempt = 0;
 
   while (true) {
+    opts.signal?.throwIfAborted();
     attempt += 1;
     try {
+      const acquiredAt = captureQaLeaseClock();
       const payload = await postConvexBroker({
         fetchImpl,
+        maxBytes: CONVEX_BROKER_RESPONSE_MAX_BYTES,
         timeoutMs: config.httpTimeoutMs,
         authToken: config.authToken,
         url: config.acquireUrl,
@@ -418,6 +482,7 @@ export async function acquireQaCredentialLease<TPayload>(
       const releaseLease = async () => {
         const releasePayload = await postConvexBroker({
           fetchImpl,
+          maxBytes: CONVEX_BROKER_RESPONSE_MAX_BYTES,
           timeoutMs: config.httpTimeoutMs,
           authToken: config.authToken,
           url: config.releaseUrl,
@@ -434,12 +499,14 @@ export async function acquireQaCredentialLease<TPayload>(
       let parsedPayload: TPayload;
       try {
         const resolvedPayload = await resolveConvexCredentialPayload({
+          signal: opts.signal,
           acquired,
           config,
           fetchImpl,
           kind: opts.kind,
         });
         parsedPayload = opts.parsePayload(resolvedPayload);
+        opts.signal?.throwIfAborted();
       } catch (error) {
         try {
           await releaseLease();
@@ -456,8 +523,11 @@ export async function acquireQaCredentialLease<TPayload>(
       }
       const leaseTtlMs = acquired.leaseTtlMs ?? config.leaseTtlMs;
       const heartbeatIntervalMs = acquired.heartbeatIntervalMs ?? config.heartbeatIntervalMs;
-      return {
+      const health = createQaLeaseHealth(leaseTtlMs, acquiredAt);
+      let releasePromise: Promise<void> | undefined;
+      const lease: QaCredentialLease<TPayload> = {
         source: "convex",
+        assertHealthy: health.assertHealthy,
         kind: opts.kind,
         role,
         ownerId: config.ownerId,
@@ -467,8 +537,11 @@ export async function acquireQaCredentialLease<TPayload>(
         heartbeatIntervalMs,
         payload: parsedPayload,
         async heartbeat() {
+          health.assertHealthy();
+          const requestStartedAt = captureQaLeaseClock();
           const heartbeatPayload = await postConvexBroker({
             fetchImpl,
+            maxBytes: CONVEX_BROKER_RESPONSE_MAX_BYTES,
             timeoutMs: config.httpTimeoutMs,
             authToken: config.authToken,
             url: config.heartbeatUrl,
@@ -482,24 +555,50 @@ export async function acquireQaCredentialLease<TPayload>(
             },
           });
           assertConvexOk(heartbeatPayload, "heartbeat");
+          health.confirm(requestStartedAt);
         },
-        async release() {
-          await releaseLease();
+        release() {
+          health.close();
+          releasePromise ??= releaseLease();
+          return releasePromise;
         },
       };
+      try {
+        lease.assertHealthy();
+        opts.signal?.throwIfAborted();
+        return lease;
+      } catch (error) {
+        try {
+          await lease.release();
+        } catch (releaseError) {
+          throw new AggregateError(
+            [error, releaseError],
+            "QA credential readiness and release failed.",
+            { cause: releaseError },
+          );
+        }
+        throw new QaCredentialBrokerError({
+          code: "LEASE_NOT_READY",
+          message: "QA credential lease could not be confirmed before use.",
+          cause: error,
+        });
+      }
     } catch (error) {
-      if (error instanceof QaCredentialBrokerError && RETRYABLE_ACQUIRE_CODES.has(error.code)) {
+      const retryablePoolError =
+        error instanceof QaCredentialBrokerError && RETRYABLE_ACQUIRE_CODES.has(error.code);
+      const transientTransportError = isTransientBrokerTransportError(error);
+      if (retryablePoolError || transientTransportError) {
         const elapsed = timeImpl() - startedAt;
         if (elapsed >= config.acquireTimeoutMs) {
-          throw new Error(
-            `Convex credential pool exhausted for kind "${opts.kind}" after ${config.acquireTimeoutMs}ms.`,
-            { cause: error },
-          );
+          const message = retryablePoolError
+            ? `Convex credential pool exhausted for kind "${opts.kind}" after ${config.acquireTimeoutMs}ms.`
+            : `Convex credential broker remained unreachable for kind "${opts.kind}" after ${config.acquireTimeoutMs}ms.`;
+          throw new Error(message, { cause: error });
         }
         const delayMs = Math.min(
           computeAcquireBackoffMs({
             attempt,
-            retryAfterMs: error.retryAfterMs,
+            retryAfterMs: retryablePoolError ? error.retryAfterMs : undefined,
             randomImpl,
           }),
           Math.max(0, config.acquireTimeoutMs - elapsed),
@@ -524,9 +623,11 @@ export async function acquireQaCredentialLease<TPayload>(
 }
 
 export function startQaCredentialLeaseHeartbeat(
-  lease: Pick<QaCredentialLease<unknown>, "heartbeat" | "heartbeatIntervalMs" | "kind" | "source">,
+  lease: Pick<QaCredentialLease<unknown>, "heartbeat" | "heartbeatIntervalMs" | "kind" | "source"> &
+    Partial<Pick<QaCredentialLease<unknown>, "assertHealthy">>,
   opts?: {
     intervalMs?: number;
+    retryDelaysMs?: readonly number[];
     setTimeoutImpl?: typeof setTimeout;
     clearTimeoutImpl?: typeof clearTimeout;
   },
@@ -536,6 +637,7 @@ export function startQaCredentialLeaseHeartbeat(
       getFailure: () => null,
       async stop() {},
       throwIfFailed() {},
+      whenFailed: new Promise<Error>(() => {}),
     };
   }
   const intervalMs = opts?.intervalMs ?? lease.heartbeatIntervalMs;
@@ -544,17 +646,36 @@ export function startQaCredentialLeaseHeartbeat(
       getFailure: () => null,
       async stop() {},
       throwIfFailed() {},
+      whenFailed: new Promise<Error>(() => {}),
     };
   }
 
   const setTimeoutImpl = opts?.setTimeoutImpl ?? setTimeout;
   const clearTimeoutImpl = opts?.clearTimeoutImpl ?? clearTimeout;
+  const retryDelaysMs = opts?.retryDelaysMs ?? HEARTBEAT_RETRY_DELAYS_MS;
   let failure: Error | null = null;
+  let retryAttempt = 0;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let inFlight: Promise<void> | null = null;
+  let resolveFailure: (error: Error) => void = () => undefined;
+  const whenFailed = new Promise<Error>((resolve) => {
+    resolveFailure = resolve;
+  });
+  const getFailure = () => {
+    if (!failure) {
+      try {
+        lease.assertHealthy?.();
+      } catch (error) {
+        failure =
+          error instanceof Error ? error : new Error("QA credential lease is no longer usable.");
+        resolveFailure(failure);
+      }
+    }
+    return failure;
+  };
 
-  const schedule = () => {
+  const schedule = (delayMs = intervalMs) => {
     if (stopped || failure) {
       return;
     }
@@ -566,28 +687,39 @@ export function startQaCredentialLeaseHeartbeat(
       inFlight = (async () => {
         try {
           await lease.heartbeat();
+          retryAttempt = 0;
         } catch (error) {
+          if (isTransientBrokerTransportError(error) && retryAttempt < retryDelaysMs.length) {
+            const retryDelayMs = expectDefined(
+              retryDelaysMs[retryAttempt],
+              "QA credential heartbeat retry delay",
+            );
+            retryAttempt += 1;
+            schedule(resolveTimerTimeoutMs(retryDelayMs, 1_000, 0));
+            return;
+          }
           failure = new Error(
             `Credential lease heartbeat failed for kind "${lease.kind}": ${formatErrorMessage(error)}`,
           );
+          resolveFailure(failure);
           return;
         } finally {
           inFlight = null;
         }
         schedule();
       })();
-    }, intervalMs);
+    }, delayMs);
   };
 
   schedule();
 
   return {
-    getFailure() {
-      return failure;
-    },
+    whenFailed,
+    getFailure,
     throwIfFailed() {
-      if (failure) {
-        throw failure;
+      const currentFailure = getFailure();
+      if (currentFailure) {
+        throw currentFailure;
       }
     },
     async stop() {

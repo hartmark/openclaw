@@ -1,4 +1,6 @@
+// Browser tests cover pw tools core.interactions.evaluate.abort plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { BrowserObservedDialogBlockedError } from "./pw-session-contracts.js";
 
 let page: { evaluate: ReturnType<typeof vi.fn>; url: ReturnType<typeof vi.fn> } | null = null;
 let locator: { evaluate: ReturnType<typeof vi.fn> } | null = null;
@@ -34,6 +36,16 @@ vi.mock("./pw-session.js", () => {
     markObservedDialogsHandledRemotelyForPage,
     refLocator,
     restoreRoleRefsForTarget,
+    wasBrowserNavigationSourcePreservedAfterPolicyDenial: vi.fn(() => false),
+    withPageNavigationRequestGuard: vi.fn(
+      async ({
+        action,
+        page: guardedPage,
+      }: {
+        action: (url: string) => Promise<unknown>;
+        page: { url: () => string };
+      }) => await action(guardedPage.url()),
+    ),
   };
 });
 
@@ -90,6 +102,7 @@ describe("evaluateViaPlaywright (abort)", () => {
       cdpUrl: "http://127.0.0.1:9222",
       fn,
       ref,
+      ssrfPolicy: { dangerouslyAllowPrivateNetwork: false },
       signal: ctrl.signal,
     });
 
@@ -97,7 +110,12 @@ describe("evaluateViaPlaywright (abort)", () => {
     ctrl.abort(new Error("aborted by test"));
 
     await expect(p).rejects.toThrow("aborted by test");
-    expect(forceDisconnectPlaywrightForTarget).toHaveBeenCalled();
+    expect(forceDisconnectPlaywrightForTarget).toHaveBeenCalledWith({
+      cdpUrl: "http://127.0.0.1:9222",
+      page,
+      targetId: undefined,
+      ssrfPolicy: { dangerouslyAllowPrivateNetwork: false },
+    });
   });
 
   it("does not disconnect when evaluate is blocked by an observed dialog", async () => {
@@ -122,14 +140,22 @@ describe("evaluateViaPlaywright (abort)", () => {
     });
 
     await pending.evalCalledPromise;
-    const err = new Error("blocked by dialog");
-    err.name = "BrowserObservedDialogBlockedError";
+    const err = new BrowserObservedDialogBlockedError({
+      dialogs: {
+        pending: [{ id: "d1", type: "alert", message: "x", openedAt: "2026-09-08T00:00:00Z" }],
+        recent: [],
+      },
+    });
     ctrl.abort(err);
 
-    await expect(p).rejects.toThrow("blocked by dialog");
+    await expect(p).rejects.toBe(err);
     expect(forceDisconnectPlaywrightForTarget).not.toHaveBeenCalled();
     resolveEval(true);
-    await Promise.resolve();
-    expect(markObservedDialogsHandledRemotelyForPage).toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(markObservedDialogsHandledRemotelyForPage).toHaveBeenCalledWith(
+        page,
+        err.browserState.dialogs.pending,
+      );
+    });
   });
 });

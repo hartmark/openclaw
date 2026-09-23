@@ -1,3 +1,4 @@
+// Provider setup flow configures provider credentials, models, and defaults.
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizePluginsConfig, resolveEffectiveEnableState } from "../plugins/config-state.js";
 import * as providerAuthChoices from "../plugins/provider-auth-choices.js";
@@ -5,9 +6,17 @@ import * as providerInstallCatalog from "../plugins/provider-install-catalog.js"
 import type { FlowContribution, FlowOption } from "./types.js";
 import { sortFlowContributionsByLabel } from "./types.js";
 
+// Provider setup contributions from manifests and install catalogs.
 type ProviderFlowScope = "text-inference" | "image-generation" | "music-generation";
 
 const DEFAULT_PROVIDER_FLOW_SCOPE: ProviderFlowScope = "text-inference";
+
+type ProviderSetupFlowParams = {
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+  env?: NodeJS.ProcessEnv;
+  scope?: ProviderFlowScope | "all";
+};
 
 type ProviderSetupFlowOption = FlowOption & {
   onboardingScopes?: ProviderFlowScope[];
@@ -26,17 +35,17 @@ type ProviderSetupFlowContribution = FlowContribution & {
 
 function includesProviderFlowScope(
   scopes: readonly ProviderFlowScope[] | undefined,
-  scope: ProviderFlowScope,
+  scope: ProviderFlowScope | "all",
 ): boolean {
-  return scopes ? scopes.includes(scope) : scope === DEFAULT_PROVIDER_FLOW_SCOPE;
+  // Missing scope means the historic text-inference onboarding surface only.
+  return (
+    scope === "all" || (scopes ? scopes.includes(scope) : scope === DEFAULT_PROVIDER_FLOW_SCOPE)
+  );
 }
 
-function resolveInstallCatalogProviderSetupFlowContributions(params?: {
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  scope?: ProviderFlowScope;
-}): ProviderSetupFlowContribution[] {
+function resolveInstallCatalogProviderSetupFlowContributions(
+  params?: ProviderSetupFlowParams,
+): ProviderSetupFlowContribution[] {
   const scope = params?.scope ?? DEFAULT_PROVIDER_FLOW_SCOPE;
   const normalizedPluginsConfig = normalizePluginsConfig(params?.config?.plugins);
   return providerInstallCatalog
@@ -67,6 +76,7 @@ function resolveInstallCatalogProviderSetupFlowContributions(params?: {
           pluginId: entry.pluginId,
           option: {
             value: entry.choiceId,
+            ...(entry.modelTarget ? { modelTarget: entry.modelTarget } : {}),
             label: entry.choiceLabel,
             ...(entry.choiceHint ? { hint: entry.choiceHint } : {}),
             ...(entry.assistantPriority !== undefined
@@ -88,12 +98,9 @@ function resolveInstallCatalogProviderSetupFlowContributions(params?: {
     });
 }
 
-function resolveManifestProviderSetupFlowContributions(params?: {
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  scope?: ProviderFlowScope;
-}): ProviderSetupFlowContribution[] {
+function resolveManifestProviderSetupFlowContributions(
+  params?: ProviderSetupFlowParams,
+): ProviderSetupFlowContribution[] {
   const scope = params?.scope ?? DEFAULT_PROVIDER_FLOW_SCOPE;
   return providerAuthChoices
     .resolveManifestProviderAuthChoices({
@@ -113,6 +120,7 @@ function resolveManifestProviderSetupFlowContributions(params?: {
           pluginId: choice.pluginId,
           option: {
             value: choice.choiceId,
+            ...(choice.modelTarget ? { modelTarget: choice.modelTarget } : {}),
             label: choice.choiceLabel,
             ...(choice.choiceHint ? { hint: choice.choiceHint } : {}),
             ...(choice.assistantPriority !== undefined
@@ -135,12 +143,9 @@ function resolveManifestProviderSetupFlowContributions(params?: {
     });
 }
 
-export function resolveProviderSetupFlowContributions(params?: {
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  scope?: ProviderFlowScope;
-}): ProviderSetupFlowContribution[] {
+export function resolveProviderSetupFlowContributions(
+  params?: ProviderSetupFlowParams,
+): ProviderSetupFlowContribution[] {
   const scope = params?.scope ?? DEFAULT_PROVIDER_FLOW_SCOPE;
   const manifestContributions = resolveManifestProviderSetupFlowContributions({
     ...params,

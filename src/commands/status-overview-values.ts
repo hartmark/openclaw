@@ -1,3 +1,24 @@
+// Small value formatters for status overview rows.
+// These helpers keep terse row text consistent between compact and full status reports.
+
+import type { HostDesktopStatus } from "../gateway/desktop/host-source.js";
+
+export function formatHostDesktopStatus(status?: HostDesktopStatus): string {
+  if (!status || status.state === "disabled") {
+    return "disabled";
+  }
+  if (status.state === "managed") {
+    return status.managedState === "running"
+      ? `managed · running · display :${status.display} · 127.0.0.1:${status.port} · security VncAuth`
+      : status.managedState === "failed"
+        ? `managed · failed: ${status.error}`
+        : status.managedState === "unknown"
+          ? "managed · runtime state unavailable"
+          : `managed · ${status.managedState === "not-started" ? "not started" : "starting"}`;
+  }
+  return `${status.state} · 127.0.0.1:${status.port}${status.security ? ` · security ${status.security}` : ""}`;
+}
+
 type AgentStatusLike = {
   bootstrapPendingCount: number;
   totalSessions: number;
@@ -26,11 +47,13 @@ function countActiveStatusAgents(params: {
   activeThresholdMs?: number;
 }) {
   const activeThresholdMs = params.activeThresholdMs ?? 10 * 60_000;
+  // "Active" means a recent session update, not merely a configured agent.
   return params.agentStatus.agents.filter(
     (agent) => agent.lastActiveAgeMs != null && agent.lastActiveAgeMs <= activeThresholdMs,
   ).length;
 }
 
+/** Formats the status-all agents overview cell. */
 export function buildStatusAllAgentsValue(params: {
   agentStatus: AgentStatusLike;
   activeThresholdMs?: number;
@@ -39,16 +62,19 @@ export function buildStatusAllAgentsValue(params: {
   return `${params.agentStatus.agents.length} total · ${params.agentStatus.bootstrapPendingCount} bootstrapping · ${activeAgents} active · ${params.agentStatus.totalSessions} sessions`;
 }
 
+/** Formats the secrets diagnostics count for overview output. */
 export function buildStatusSecretsValue(count: number) {
   return count > 0 ? `${count} diagnostic${count === 1 ? "" : "s"}` : "none";
 }
 
+/** Formats queued system-event count for overview output. */
 export function buildStatusEventsValue(params: { queuedSystemEvents: string[] }) {
   return params.queuedSystemEvents.length > 0
     ? `${params.queuedSystemEvents.length} queued`
     : "none";
 }
 
+/** Formats whether deep probe data was collected. */
 export function buildStatusProbesValue(params: {
   health?: unknown;
   ok: (value: string) => string;
@@ -57,6 +83,7 @@ export function buildStatusProbesValue(params: {
   return params.health ? params.ok("enabled") : params.muted("skipped (use --deep)");
 }
 
+/** Formats plugin compatibility notices as a compact count by notice and plugin. */
 export function buildStatusPluginCompatibilityValue(params: {
   notices: PluginCompatibilityNoticeLike[];
   ok: (value: string) => string;
@@ -73,6 +100,7 @@ export function buildStatusPluginCompatibilityValue(params: {
   );
 }
 
+/** Formats stored session count, default model/context, and backing store summary. */
 export function buildStatusSessionsOverviewValue(params: {
   sessions: SummarySessionsLike;
   formatKTokens: (value: number) => string;
@@ -84,5 +112,5 @@ export function buildStatusSessionsOverviewValue(params: {
     params.sessions.paths.length > 1
       ? `${params.sessions.paths.length} stores`
       : (params.sessions.paths[0] ?? "unknown");
-  return `${params.sessions.count} active · default ${params.sessions.defaults.model ?? "unknown"}${defaultCtx} · ${storeLabel}`;
+  return `${params.sessions.count} stored · default ${params.sessions.defaults.model ?? "unknown"}${defaultCtx} · ${storeLabel}`;
 }

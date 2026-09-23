@@ -1,26 +1,32 @@
-import {
-  findNormalizedProviderValue,
-  normalizeProviderId,
-} from "@openclaw/model-catalog-core/provider-id";
+/**
+ * Effective tool inventory resolver.
+ *
+ * Builds model-visible tool lists after profile, provider, plugin, policy, and compatibility filters.
+ */
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/config.js";
+import {
+  findConfiguredProviderModel,
+  resolveMergedModelProviderConfig,
+} from "../config/model-provider-config.js";
 import { extractModelCompat } from "../plugins/provider-model-compat.js";
 import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
 import { normalizeProviderTransportWithPlugin } from "../plugins/provider-runtime.js";
+import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
 import { resolveAgentDir, resolveAgentWorkspaceDir, resolveSessionAgentId } from "./agent-scope.js";
 import { createOpenClawCodingTools } from "./agent-tools.js";
 import { resolveEffectiveToolPolicy } from "./agent-tools.policy.js";
-import { resolveModel } from "./embedded-agent-runner/model.js";
+import { resolveModelAsync } from "./embedded-agent-runner/model.js";
 import { resolveBundledStaticCatalogModel } from "./embedded-agent-runner/model.static-catalog.js";
 import { normalizeStaticProviderModelId } from "./model-ref-shared.js";
-import { normalizeToolName } from "./tool-policy.js";
-import {
-  buildEffectiveToolInventoryGroups,
-  buildRuntimeCompatibleToolInventory,
-} from "./tools-effective-inventory-build.js";
+import { acquireReadOnlyPreparedModelRuntime } from "./prepared-model-runtime.js";
+import { normalizeToolPolicyName } from "./tool-policy.js";
+import { buildRuntimeCompatibleToolInventory } from "./tools-effective-inventory-build.js";
+import { buildEffectiveToolInventoryGroups } from "./tools-effective-inventory-groups.js";
 import type {
   EffectiveToolInventoryNotice,
   EffectiveToolInventoryEntry,
@@ -28,18 +34,12 @@ import type {
   ResolveEffectiveToolInventoryParams,
 } from "./tools-effective-inventory.types.js";
 
-export {
-  buildEffectiveToolInventoryEntries,
-  buildEffectiveToolInventoryGroups,
-  buildRuntimeCompatibleToolInventory,
-} from "./tools-effective-inventory-build.js";
-
 function listIncludesTool(list: string[] | undefined, toolName: string): boolean {
   if (!Array.isArray(list)) {
     return false;
   }
-  const normalizedToolName = normalizeToolName(toolName);
-  return list.some((entry) => normalizeToolName(entry) === normalizedToolName);
+  const normalizedToolName = normalizeToolPolicyName(toolName);
+  return list.some((entry) => normalizeToolPolicyName(entry) === normalizedToolName);
 }
 
 function policyDeniesTool(policy: { deny?: string[] } | undefined, toolName: string): boolean {
@@ -60,11 +60,14 @@ function buildToolInventoryNotices(params: {
   entries: EffectiveToolInventoryEntry[];
   effectivePolicy: ReturnType<typeof resolveEffectiveToolPolicy>;
 }): EffectiveToolInventoryNotice[] | undefined {
-  const hasBrowserTool = params.entries.some((entry) => normalizeToolName(entry.id) === "browser");
+  const hasBrowserTool = params.entries.some(
+    (entry) => normalizeToolPolicyName(entry.id) === "browser",
+  );
   if (hasBrowserTool || !hasExplicitBrowserIntent(params.cfg)) {
     return undefined;
   }
 
+  // Browser can be configured yet absent after policy/profile/plugin filtering; surface why.
   const browserDenied = [
     params.effectivePolicy.globalPolicy,
     params.effectivePolicy.globalProviderPolicy,
@@ -88,7 +91,7 @@ function buildToolInventoryNotices(params: {
         id: "browser-filtered-by-profile",
         severity: "info",
         message:
-          'Browser is configured, but the current tool profile does not include the browser tool. Add tools.alsoAllow: ["browser"] or agents.list[].tools.alsoAllow: ["browser"]; tools.subagents.tools.allow alone cannot add it back after profile filtering.',
+          'Browser is configured, but the current tool profile does not include the browser tool. Add tools.alsoAllow: ["browser"] or agents.entries.*.tools.alsoAllow: ["browser"]; tools.subagents.tools.allow alone cannot add it back after profile filtering.',
       },
     ];
   }
@@ -118,12 +121,14 @@ function applyProviderTransportNormalization(params: {
 }): ProviderRuntimeModel {
   const normalized = normalizeProviderTransportWithPlugin({
     provider: params.provider,
+    modelId: params.runtimeModel.id,
     config: params.cfg,
     workspaceDir: params.workspaceDir,
     context: {
       config: params.cfg,
       workspaceDir: params.workspaceDir,
       provider: params.provider,
+      modelId: params.runtimeModel.id,
       api: params.runtimeModel.api,
       baseUrl: params.runtimeModel.baseUrl,
     },
@@ -150,26 +155,8 @@ function resolveConfiguredFallbackApi(
     : "openai-responses";
 }
 
-function resolveDynamicRuntimeModelContext(params: {
-  cfg: OpenClawConfig;
-  agentDir?: string;
-  workspaceDir?: string;
-  provider: string;
-  modelId: string;
-}): { modelApi?: string; runtimeModel?: ProviderRuntimeModel } {
-  const runtimeModel = resolveModel(params.provider, params.modelId, params.agentDir, params.cfg, {
-    workspaceDir: params.workspaceDir,
-  }).model as ProviderRuntimeModel | undefined;
-  if (!runtimeModel) {
-    return {};
-  }
-  return {
-    modelApi: runtimeModel.api,
-    runtimeModel,
-  };
-}
-
-export function resolveEffectiveToolInventoryRuntimeModelContext(params: {
+/** Resolves configured or bundled metadata without starting provider discovery. */
+function resolveStaticToolInventoryRuntimeModelContext(params: {
   cfg: OpenClawConfig;
   agentId?: string;
   agentDir?: string;
@@ -184,18 +171,10 @@ export function resolveEffectiveToolInventoryRuntimeModelContext(params: {
   }
   const agentId = params.agentId?.trim() || resolveSessionAgentId({ config: params.cfg });
   const workspaceDir = params.workspaceDir ?? resolveAgentWorkspaceDir(params.cfg, agentId);
-  const providerConfig = findNormalizedProviderValue(params.cfg.models?.providers, provider);
-  const configuredModels = Array.isArray(providerConfig?.models) ? providerConfig.models : [];
-  const normalizedModelId = normalizeStaticProviderModelId(provider, modelId);
-  const normalizedModelKey = normalizeLowercaseStringOrEmpty(normalizedModelId);
-  const providerPrefixedModelKey = normalizeLowercaseStringOrEmpty(
-    `${provider}/${normalizedModelId}`,
+  const providerConfig = resolveMergedModelProviderConfig(params.cfg, provider);
+  const configuredModel = findConfiguredProviderModel(providerConfig, provider, modelId, (id) =>
+    normalizeLowercaseStringOrEmpty(normalizeStaticProviderModelId(provider, id)),
   );
-  const configuredModel = configuredModels.find((model) => {
-    const id = normalizeStaticProviderModelId(provider, model.id);
-    const key = normalizeLowercaseStringOrEmpty(id);
-    return key === normalizedModelKey || key === providerPrefixedModelKey;
-  });
   const bundledStaticModel = resolveBundledStaticCatalogModel({
     provider,
     modelId,
@@ -203,6 +182,7 @@ export function resolveEffectiveToolInventoryRuntimeModelContext(params: {
     workspaceDir,
   });
   if (configuredModel) {
+    // Configured model entries override the bundled catalog but inherit missing transport details.
     const configuredApi =
       normalizeOptionalString(configuredModel.api) ??
       normalizeOptionalString(providerConfig?.api) ??
@@ -215,7 +195,7 @@ export function resolveEffectiveToolInventoryRuntimeModelContext(params: {
       runtimeModel: {
         ...bundledStaticModel,
         ...configuredModel,
-        id: configuredModel.id,
+        id: modelId,
         name: configuredModel.name ?? bundledStaticModel?.name ?? configuredModel.id,
         provider,
         api: configuredApi,
@@ -231,13 +211,7 @@ export function resolveEffectiveToolInventoryRuntimeModelContext(params: {
     };
   }
   if (!bundledStaticModel) {
-    return resolveDynamicRuntimeModelContext({
-      cfg: params.cfg,
-      agentDir: params.agentDir,
-      workspaceDir,
-      provider,
-      modelId,
-    });
+    return {};
   }
   const runtimeModel = applyProviderTransportNormalization({
     cfg: params.cfg,
@@ -255,7 +229,81 @@ export function resolveEffectiveToolInventoryRuntimeModelContext(params: {
   };
 }
 
-function resolveEffectiveModelCompat(params: {
+type ToolInventoryRuntimeModelContext = ReturnType<
+  typeof resolveStaticToolInventoryRuntimeModelContext
+>;
+
+/** Keeps dynamic model hooks owned and scoped until inventory projection finishes. */
+export async function acquireEffectiveToolInventoryRuntimeModelContext(
+  params: Parameters<typeof resolveStaticToolInventoryRuntimeModelContext>[0],
+): Promise<
+  { run: <T>(project: (context: ToolInventoryRuntimeModelContext) => T) => T } & AsyncDisposable
+> {
+  const staticContext = resolveStaticToolInventoryRuntimeModelContext(params);
+  if (staticContext.runtimeModel) {
+    return { run: (project) => project(staticContext), [Symbol.asyncDispose]: async () => {} };
+  }
+
+  const provider = normalizeProviderId(params.modelProvider ?? "");
+  const modelId = params.modelId?.trim() ?? "";
+  if (!provider || !modelId) {
+    return { run: (project) => project({}), [Symbol.asyncDispose]: async () => {} };
+  }
+  const agentId = params.agentId?.trim() || resolveSessionAgentId({ config: params.cfg });
+  const agentDir = params.agentDir ?? resolveAgentDir(params.cfg, agentId);
+  const workspaceDir = params.workspaceDir ?? resolveAgentWorkspaceDir(params.cfg, agentId);
+  const lease = await acquireReadOnlyPreparedModelRuntime(
+    {
+      agentId,
+      agentDir,
+      config: params.cfg,
+      workspaceDir,
+      // The selected provider owner must join the generation before dynamic hooks resolve.
+      loadRuntimePlugins: true,
+      runtimePluginSelections: [{ provider, modelId, agentId }],
+    },
+    { catalogMode: "static" },
+  );
+  let transferred = false;
+  try {
+    const stores = lease.snapshot.createStores();
+    const resolved = await resolveModelAsync(provider, modelId, agentDir, params.cfg, {
+      agentId,
+      workspaceDir,
+      authStorage: stores.authStorage,
+      modelRegistry: stores.modelRegistry,
+      preparedModelRuntime: lease.snapshot,
+    });
+    const runtimeModel = resolved.model as ProviderRuntimeModel | undefined;
+    if (!runtimeModel) {
+      return { run: (project) => project({}), [Symbol.asyncDispose]: async () => {} };
+    }
+    const context = { modelApi: runtimeModel.api, runtimeModel };
+    let released = false;
+    let disposal: Promise<void> | undefined;
+    const acquired = {
+      run: <T>(project: (context: ToolInventoryRuntimeModelContext) => T): T => {
+        if (released) {
+          throw new Error("Tool inventory model context has been released");
+        }
+        return withPluginRuntimeGenerationScope(lease.snapshot, () => project(context));
+      },
+      [Symbol.asyncDispose]() {
+        released = true;
+        return (disposal ??= lease[Symbol.asyncDispose]());
+      },
+    };
+    transferred = true;
+    return acquired;
+  } finally {
+    if (!transferred) {
+      await lease[Symbol.asyncDispose]();
+    }
+  }
+}
+
+/** Resolves compatibility metadata explicitly configured for a provider/model pair. */
+export function resolveConfiguredModelCompat(params: {
   cfg: OpenClawConfig;
   modelProvider?: string;
   modelId?: string;
@@ -265,24 +313,14 @@ function resolveEffectiveModelCompat(params: {
   if (!provider || !modelId) {
     return undefined;
   }
-  const providerConfig = findNormalizedProviderValue(params.cfg.models?.providers, provider);
-  const models = Array.isArray(providerConfig?.models) ? providerConfig.models : [];
-  if (models.length === 0) {
-    return undefined;
-  }
-  const normalizedModelId = normalizeStaticProviderModelId(provider, modelId);
-  const normalizedModelKey = normalizeLowercaseStringOrEmpty(normalizedModelId);
-  const providerPrefixedModelKey = normalizeLowercaseStringOrEmpty(
-    `${provider}/${normalizedModelId}`,
+  const providerConfig = resolveMergedModelProviderConfig(params.cfg, provider);
+  const match = findConfiguredProviderModel(providerConfig, provider, modelId, (id) =>
+    normalizeLowercaseStringOrEmpty(normalizeStaticProviderModelId(provider, id)),
   );
-  const match = models.find((model) => {
-    const id = normalizeStaticProviderModelId(provider, model.id);
-    const key = normalizeLowercaseStringOrEmpty(id);
-    return key === normalizedModelKey || key === providerPrefixedModelKey;
-  });
   return extractModelCompat(match);
 }
 
+/** Resolves the grouped effective tool inventory and user-visible filtering notices. */
 export function resolveEffectiveToolInventory(
   params: ResolveEffectiveToolInventoryParams,
 ): EffectiveToolInventoryResult {
@@ -292,12 +330,12 @@ export function resolveEffectiveToolInventory(
   const workspaceDir = params.workspaceDir ?? resolveAgentWorkspaceDir(params.cfg, agentId);
   const agentDir = params.agentDir ?? resolveAgentDir(params.cfg, agentId);
   const runtimeModelContext =
-    params.modelApi || params.runtimeModel
+    Object.hasOwn(params, "modelApi") || Object.hasOwn(params, "runtimeModel")
       ? {
           modelApi: params.modelApi ?? params.runtimeModel?.api,
           runtimeModel: params.runtimeModel,
         }
-      : resolveEffectiveToolInventoryRuntimeModelContext({
+      : resolveStaticToolInventoryRuntimeModelContext({
           cfg: params.cfg,
           agentId,
           agentDir,
@@ -305,7 +343,7 @@ export function resolveEffectiveToolInventory(
           modelProvider: params.modelProvider,
           modelId: params.modelId,
         });
-  const modelCompat = resolveEffectiveModelCompat({
+  const modelCompat = resolveConfiguredModelCompat({
     cfg: params.cfg,
     modelProvider: params.modelProvider,
     modelId: params.modelId,
@@ -314,12 +352,14 @@ export function resolveEffectiveToolInventory(
   const effectiveTools = createOpenClawCodingTools({
     agentId,
     sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
     workspaceDir,
     agentDir,
     config: params.cfg,
     modelProvider: params.modelProvider,
     modelId: params.modelId,
     modelApi: runtimeModelContext.modelApi,
+    modelBaseUrl: runtimeModelContext.runtimeModel?.baseUrl,
     modelCompat,
     messageProvider: params.messageProvider,
     senderId: params.senderId,

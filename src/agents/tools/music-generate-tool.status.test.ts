@@ -1,10 +1,10 @@
+// Music generation status tests cover duplicate guards and explicit status
+// actions for background music tasks.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as musicGenerationRuntime from "../../music-generation/runtime.js";
-import {
-  recordRecentMediaGenerationTaskStartForSession,
-  resetRecentMediaGenerationDuplicateGuardsForTests,
-} from "../media-generation-task-status-shared.js";
-import { MUSIC_GENERATION_TASK_KIND } from "../music-generation-task-status.js";
+import { recordRecentMediaGenerationTaskStartForSession } from "../media-generation-task-status-shared.js";
+import { resetRecentMediaGenerationDuplicateGuardsForTests } from "../media-generation-task-status-shared.test-support.js";
+import { MUSIC_GENERATION_TASK_KIND } from "../media-generation-task-status.js";
 import {
   createMusicGenerateDuplicateGuardResult,
   createMusicGenerateStatusActionResult,
@@ -14,7 +14,6 @@ const taskRuntimeInternalMocks = vi.hoisted(() => {
   const mocks = {
     listTasksForOwnerKey: vi.fn(),
     listFreshTasksForOwnerKey: vi.fn(),
-    reloadTaskRegistryFromStore: vi.fn(),
   };
   mocks.listFreshTasksForOwnerKey.mockImplementation((ownerKey) =>
     mocks.listTasksForOwnerKey(ownerKey),
@@ -33,7 +32,6 @@ function resetMusicStatusMocks() {
   taskRuntimeInternalMocks.listFreshTasksForOwnerKey.mockImplementation((ownerKey) =>
     taskRuntimeInternalMocks.listTasksForOwnerKey(ownerKey),
   );
-  taskRuntimeInternalMocks.reloadTaskRegistryFromStore.mockReset();
   resetRecentMediaGenerationDuplicateGuardsForTests();
 }
 
@@ -44,7 +42,9 @@ describe("createMusicGenerateTool status actions", () => {
     vi.unstubAllEnvs();
   });
 
-  it("returns active task status instead of starting a duplicate generation", () => {
+  it("returns active task status instead of starting a duplicate generation", async () => {
+    // Duplicate guard responses prevent agents from launching parallel provider
+    // jobs while a matching request is still running.
     taskRuntimeInternalMocks.listTasksForOwnerKey.mockReturnValue([
       {
         taskId: "task-active",
@@ -64,7 +64,7 @@ describe("createMusicGenerateTool status actions", () => {
       },
     ]);
 
-    const result = createMusicGenerateDuplicateGuardResult("agent:main:discord:direct:123", {
+    const result = await createMusicGenerateDuplicateGuardResult("agent:main:discord:direct:123", {
       prompt: "night-drive synthwave",
     });
 
@@ -103,7 +103,7 @@ describe("createMusicGenerateTool status actions", () => {
     expect(details?.progressSummary).toBe("Generating music");
   });
 
-  it("reports active task status when action=status is requested", () => {
+  it("reports active task status when action=status is requested", async () => {
     taskRuntimeInternalMocks.listTasksForOwnerKey.mockReturnValue([
       {
         taskId: "task-active",
@@ -123,7 +123,7 @@ describe("createMusicGenerateTool status actions", () => {
       },
     ]);
 
-    const result = createMusicGenerateStatusActionResult("agent:main:discord:direct:123");
+    const result = await createMusicGenerateStatusActionResult("agent:main:discord:direct:123");
     const text = (result.content?.[0] as { text: string } | undefined)?.text ?? "";
 
     expect(text).toContain("Music generation task task-active is already queued with minimax.");
@@ -147,7 +147,7 @@ describe("createMusicGenerateTool status actions", () => {
     expect(details.progressSummary).toBe("Queued music generation");
   });
 
-  it("returns recent succeeded music status instead of starting a duplicate generation", () => {
+  it("returns recent succeeded music status instead of starting a duplicate generation", async () => {
     const now = Date.now();
     recordRecentMediaGenerationTaskStartForSession({
       sessionKey: "agent:main:discord:direct:123",
@@ -181,7 +181,7 @@ describe("createMusicGenerateTool status actions", () => {
       },
     ]);
 
-    const result = createMusicGenerateDuplicateGuardResult("agent:main:discord:direct:123", {
+    const result = await createMusicGenerateDuplicateGuardResult("agent:main:discord:direct:123", {
       requestKey: "music-request:night-drive",
     });
     const text = (result?.content?.[0] as { text: string } | undefined)?.text ?? "";

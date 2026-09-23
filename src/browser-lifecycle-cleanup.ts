@@ -1,3 +1,4 @@
+// Coordinates browser process cleanup for CLI-managed runtime sessions.
 import type { OpenClawConfig } from "./config/types.openclaw.js";
 import { runBestEffortCleanup } from "./infra/non-fatal-cleanup.js";
 import { closeTrackedBrowserTabsForSessions } from "./plugin-sdk/browser-maintenance.js";
@@ -20,6 +21,7 @@ function isBrowserCleanupDisabled(cfg: OpenClawConfig | undefined): boolean {
 export async function cleanupBrowserSessionsForLifecycleEnd(params: {
   cfg?: OpenClawConfig;
   sessionKeys: string[];
+  isCurrent?: () => boolean;
   onWarn?: (message: string) => void;
   onError?: (error: unknown) => void;
 }): Promise<void> {
@@ -34,6 +36,7 @@ export async function cleanupBrowserSessionsForLifecycleEnd(params: {
     cleanup: async () => {
       await closeTrackedBrowserTabsForSessions({
         sessionKeys,
+        isCurrent: params.isCurrent,
         onWarn: params.onWarn,
       });
     },

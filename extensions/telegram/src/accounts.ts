@@ -21,6 +21,10 @@ import {
 import type { TelegramTransport } from "./fetch.js";
 import { resolveTelegramToken } from "./token.js";
 
+type CredentialUnavailableDiagnostic = NonNullable<
+  ReturnType<typeof resolveTelegramToken>["credentialDiagnostics"]
+>[number];
+
 export { mergeTelegramAccountConfig, resolveTelegramAccountConfig } from "./account-config.js";
 
 let log: ReturnType<typeof createSubsystemLogger> | null = null;
@@ -55,6 +59,8 @@ export type ResolvedTelegramAccount = {
   name?: string;
   token: string;
   tokenSource: "env" | "tokenFile" | "config" | "none";
+  tokenStatus: "available" | "configured_unavailable" | "missing";
+  credentialDiagnostics?: CredentialUnavailableDiagnostic[];
   config: TelegramAccountConfig;
 };
 
@@ -73,11 +79,6 @@ export function listTelegramAccountIds(cfg: OpenClawConfig): string[] {
 }
 
 let emittedMissingDefaultWarn = false;
-
-/** @internal Reset the once-per-process warning flag. Exported for tests only. */
-export function resetMissingDefaultWarnFlag(): void {
-  emittedMissingDefaultWarn = false;
-}
 
 export function resolveDefaultTelegramAccountId(cfg: OpenClawConfig): string {
   const selection = resolveDefaultTelegramAccountSelection(cfg);
@@ -163,15 +164,21 @@ export function resolveTelegramAccount(params: {
       name: normalizeOptionalString(merged.name),
       token: tokenResolution.token,
       tokenSource: tokenResolution.source,
+      tokenStatus: tokenResolution.credentialDiagnostics?.length
+        ? "configured_unavailable"
+        : tokenResolution.token
+          ? "available"
+          : "missing",
+      ...(tokenResolution.credentialDiagnostics
+        ? { credentialDiagnostics: tokenResolution.credentialDiagnostics }
+        : {}),
       config: merged,
     } satisfies ResolvedTelegramAccount;
   };
 
-  // If accountId is omitted, prefer a configured account token over failing on
-  // the implicit "default" account. This keeps env-based setups working while
-  // making config-only tokens work for things like heartbeats.
+  const resolvedAccountId = params.accountId ?? resolveDefaultTelegramAccountId(params.cfg);
   return resolveAccountWithDefaultFallback({
-    accountId: params.accountId,
+    accountId: resolvedAccountId,
     normalizeAccountId,
     resolvePrimary: resolve,
     hasCredential: (account) => account.tokenSource !== "none",

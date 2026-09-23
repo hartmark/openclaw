@@ -3,36 +3,147 @@
  * lifecycle helpers and `openclaw/plugin-sdk/channel-inbound` for inbound
  * reply dispatch helpers.
  */
-
-import type { CreateChannelReplyPipelineParams } from "./channel-outbound.js";
-import { createChannelMessageReplyPipeline } from "./channel-outbound.js";
-import { deliverInboundReplyWithMessageSendContext } from "./channel-outbound.js";
-
-export * from "./channel-outbound.js";
+// Pin the compatibility surface; new outbound helpers belong on channel-outbound.
+export {
+  bindIngressLifecycleToReplyOptions,
+  buildChannelProgressDraftLine,
+  buildChannelProgressDraftLineForEntry,
+  buildOutboundSessionContext,
+  CHANNEL_INGRESS_RETENTION_DEFAULTS,
+  compactChannelProgressDraftLine,
+  createAccountStatusSink,
+  createChannelIngressDrain,
+  createChannelIngressError,
+  createChannelIngressMonitor,
+  createChannelMessageAdapterFromOutbound,
+  createChannelMessageReplyPipeline,
+  createChannelProgressDraftCompositor,
+  createChannelProgressDraftGate,
+  createChannelProgressWorkCounter,
+  createChannelRunQueue,
+  createDraftStreamLoop,
+  createDurableInboundReceiveJournalFromQueue,
+  createFinalizableDraftLifecycle,
+  createFinalizableDraftStreamControlsForState,
+  createMessageReceiptFromOutboundResults,
+  createMessageReceiveContext,
+  createOutboundPayloadPlan,
+  createPreviewMessageReceipt,
+  createReplyPrefixContext,
+  createReplyPrefixOptions,
+  createReplyToFanout,
+  createRuntimeOutboundDelegates,
+  createTypingCallbacks,
+  createTypingKeepaliveLoop,
+  DEFAULT_INGRESS_ADOPTION_STALL_MS,
+  DEFAULT_INGRESS_RETRY_DEAD_LETTER_MIN_AGE_MS,
+  DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS,
+  defineChannelMessageAdapter,
+  defineFinalizableLivePreviewAdapter,
+  deliverInboundReplyWithMessageSendContext,
+  deliverWithFinalizableLivePreviewAdapter,
+  deriveDurableFinalDeliveryRequirements,
+  formatChannelProgressDraftDiffStat,
+  formatChannelProgressDraftLine,
+  formatChannelProgressDraftLineForEntry,
+  formatChannelProgressDraftText,
+  formatPlanChecklistLines,
+  getChannelStreamingConfigObject,
+  INGRESS_CLAIM_PROCESS_ID,
+  isChannelProgressAttentionLine,
+  isChannelProgressDraftWorkToolName,
+  isPotentialTruncatedFinal,
+  isRecentOutboundMessageIdentity,
+  keepHttpServerTaskAlive,
+  listMessageReceiptPlatformIds,
+  logTypingFailure,
+  mergeChannelProgressDraftLine,
+  normalizeAgentPlanSteps,
+  normalizeChannelProgressDraftLineIdentity,
+  processPidFromOwnerId,
+  projectOutboundPayloadPlanForDelivery,
+  recordOutboundMessageIdentity,
+  resolveAgentOutboundIdentity,
+  resolveChannelDraftStreamingChunking,
+  resolveChannelMessageSourceReplyDeliveryMode,
+  resolveChannelPreviewStreamMode,
+  resolveChannelProgressDraftConfig,
+  resolveChannelProgressDraftMaxLineChars,
+  resolveChannelProgressDraftMaxLines,
+  resolveChannelProgressDraftRender,
+  resolveChannelStreamingBlockCoalesce,
+  resolveChannelStreamingBlockEnabled,
+  resolveChannelStreamingChunkMode,
+  resolveChannelStreamingNativeTransport,
+  resolveChannelStreamingPreviewCommandText,
+  resolveChannelStreamingPreviewToolProgress,
+  resolveChannelStreamingProgressCommentary,
+  resolveChannelStreamingProgressNarration,
+  resolveChannelStreamingSuppressDefaultToolProgressMessages,
+  resolveMessageReceiptPrimaryId,
+  resolveOutboundSendDep,
+  resolveTranscriptBackedChannelFinalText,
+  runPassiveAccountLifecycle,
+  sanitizeForPlainText,
+  selectLongerFinalText,
+  selectPlanChecklistSteps,
+  sendDurableMessageBatch,
+  takeMessageIdAfterStop,
+  verifyChannelMessageAdapterCapabilityProofs,
+  verifyChannelMessageLiveCapabilityAdapterProofs,
+  verifyChannelMessageLiveFinalizerProofs,
+  verifyChannelMessageReceiveAckPolicyAdapterProofs,
+  verifyDurableFinalCapabilityProofs,
+  waitUntilAbort,
+  withDurableMessageSendContext,
+} from "./channel-outbound.js";
+export type {
+  AgentPlanStep,
+  AgentPlanStepStatus,
+  ChannelDeliveryStreamingConfig,
+  ChannelDraftStreamingChunking,
+  ChannelIngressDrain,
+  ChannelIngressMonitorDeliveryResult,
+  ChannelIngressMonitorLifecycle,
+  ChannelIngressQueue,
+  ChannelIngressQueueClaim,
+  ChannelIngressQueueClaimRef,
+  ChannelIngressQueueCorruptClaim,
+  ChannelIngressQueueRecord,
+  ChannelMessageAdapterShape,
+  ChannelMessageDurableFinalAdapter,
+  ChannelMessageSendMediaContext,
+  ChannelMessageSendPayloadContext,
+  ChannelMessageSendResult,
+  ChannelMessageSendTextContext,
+  ChannelMessageUnknownSendContext,
+  ChannelMessageUnknownSendReconciliationResult,
+  ChannelPreviewStreamingConfig,
+  ChannelProgressDraftCompositorLine,
+  ChannelProgressDraftCompositorSnapshot,
+  ChannelProgressDraftLine,
+  ChannelProgressDraftRenderMode,
+  ChannelStreamingBlockConfig,
+  ChannelStreamingProgressConfig,
+  DurableMessageBatchSendResult,
+  MessageAckPolicy,
+  MessageReceipt,
+  MessageReceiptPart,
+  MessageReceiptPartKind,
+  MessageReceiptSourceResult,
+  MessageReceiveContext,
+  OutboundDeliveryFormattingOptions,
+  OutboundIdentity,
+  OutboundMessageIdentity,
+  OutboundSendDeps,
+  OutboundSessionContext,
+  ReplyToResolution,
+  StreamingMode,
+  TextChunkMode,
+} from "./channel-outbound.js";
 /** @deprecated Use `hasFinalInboundReplyDispatch(...)` from `openclaw/plugin-sdk/channel-inbound`. */
 export { hasFinalChannelTurnDispatch } from "../channels/turn/dispatch-result.js";
 /** @deprecated Use `hasVisibleInboundReplyDispatch(...)` from `openclaw/plugin-sdk/channel-inbound`. */
 export { hasVisibleChannelTurnDispatch } from "../channels/turn/dispatch-result.js";
 /** @deprecated Use `resolveInboundReplyDispatchCounts(...)` from `openclaw/plugin-sdk/channel-inbound`. */
 export { resolveChannelTurnDispatchCounts } from "../channels/turn/dispatch-result.js";
-
-/** @deprecated Use `createChannelMessageReplyPipeline(...)` from `openclaw/plugin-sdk/channel-outbound`. */
-export function createChannelTurnReplyPipeline(params: CreateChannelReplyPipelineParams) {
-  return createChannelMessageReplyPipeline(params);
-}
-
-/** @deprecated Use `buildInboundReplyDispatchBase(...)` from `openclaw/plugin-sdk/channel-inbound`. */
-export { buildChannelMessageReplyDispatchBase } from "./inbound-reply-dispatch.js";
-/** @deprecated Use `dispatchChannelInboundReply(...)` or `runPreparedInboundReply(...)` from `openclaw/plugin-sdk/channel-inbound`. */
-export { dispatchChannelMessageReplyWithBase } from "./inbound-reply-dispatch.js";
-/** @deprecated Use `recordChannelMessageReplyDispatch(...)` only from legacy compatibility paths. */
-export { recordChannelMessageReplyDispatch } from "./inbound-reply-dispatch.js";
-/** @deprecated Use `hasFinalInboundReplyDispatch(...)` from `openclaw/plugin-sdk/channel-inbound`. */
-export { hasFinalChannelMessageReplyDispatch } from "./inbound-reply-dispatch.js";
-/** @deprecated Use `hasVisibleInboundReplyDispatch(...)` from `openclaw/plugin-sdk/channel-inbound`. */
-export { hasVisibleChannelMessageReplyDispatch } from "./inbound-reply-dispatch.js";
-/** @deprecated Use `resolveInboundReplyDispatchCounts(...)` from `openclaw/plugin-sdk/channel-inbound`. */
-export { resolveChannelMessageReplyDispatchCounts } from "./inbound-reply-dispatch.js";
-
-/** @deprecated Use `deliverInboundReplyWithMessageSendContext(...)` from `openclaw/plugin-sdk/channel-outbound`. */
-export const deliverDurableInboundReplyPayload = deliverInboundReplyWithMessageSendContext;

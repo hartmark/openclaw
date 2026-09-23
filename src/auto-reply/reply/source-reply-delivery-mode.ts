@@ -1,14 +1,27 @@
+/** Source-reply visibility and suppression policy for auto-reply delivery. */
+import {
+  isSyntheticSourceReplyTurn,
+  type ReplyExpectation,
+} from "../../agents/reply-completion.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import type { InboundEventKind } from "../../channels/inbound-event/kind.js";
+import { resolveSilentReplySettings } from "../../config/silent-reply.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  isProgressCardRefreshInputProvenance,
+  type InputProvenance,
+} from "../../sessions/input-provenance.js";
 import type { SessionSendPolicyDecision } from "../../sessions/send-policy.js";
+import { classifySilentReplyConversationType } from "../../shared/silent-reply-policy.js";
 import { INTERNAL_MESSAGE_CHANNEL, normalizeMessageChannel } from "../../utils/message-channel.js";
 import { resolveCommandTurnContext, type CommandTurnContext } from "../command-turn-context.js";
 import { isExplicitCommandTurnContext } from "../command-turn-detection.js";
 import type { SourceReplyDeliveryMode } from "../get-reply-options.types.js";
 
+/** Minimal inbound context needed for source-reply delivery decisions. */
 export type SourceReplyDeliveryModeContext = {
   ChatType?: string;
+  SessionKey?: string;
   InboundEventKind?: InboundEventKind;
   Provider?: string;
   Surface?: string;
@@ -18,8 +31,22 @@ export type SourceReplyDeliveryModeContext = {
   CommandSource?: "text" | "native";
   CommandTurn?: CommandTurnContext;
   BotUsername?: string;
+  WasMentioned?: boolean;
+  InputProvenance?: InputProvenance;
 };
 
+function toSessionStableDeliveryModeContext(
+  ctx: SourceReplyDeliveryModeContext,
+): SourceReplyDeliveryModeContext {
+  return {
+    ChatType: ctx.ChatType,
+    Provider: ctx.Provider,
+    Surface: ctx.Surface,
+    ExplicitDeliverRoute: ctx.ExplicitDeliverRoute,
+  };
+}
+
+/** Returns true when the turn explicitly invoked a source-visible command. */
 export function isExplicitSourceReplyCommand(
   ctx: SourceReplyDeliveryModeContext,
   cfg: OpenClawConfig,
@@ -27,6 +54,7 @@ export function isExplicitSourceReplyCommand(
   return isExplicitCommandTurnContext(ctx, cfg);
 }
 
+/** Returns true for text slash commands that lack authorization metadata. */
 export function isUnauthorizedTextSlashCommand(ctx: SourceReplyDeliveryModeContext): boolean {
   const commandTurn = resolveCommandTurnContext(ctx);
   return (
@@ -40,6 +68,7 @@ function isInternalRoomEvent(ctx: SourceReplyDeliveryModeContext): boolean {
   return ctx.InboundEventKind === "room_event" && isInternalSourceReplyChannel(ctx);
 }
 
+/** Returns true for internal message-channel turns that should remain local. */
 export function isInternalSourceReplyChannel(ctx: SourceReplyDeliveryModeContext): boolean {
   const providerChannel = normalizeMessageChannel(ctx.Provider);
   const surfaceChannel = normalizeMessageChannel(ctx.Surface);
@@ -51,6 +80,7 @@ export function isInternalSourceReplyChannel(ctx: SourceReplyDeliveryModeContext
   );
 }
 
+/** Resolves whether normal final text should auto-deliver or require the message tool. */
 export function resolveSourceReplyDeliveryMode(params: {
   cfg: OpenClawConfig;
   ctx: SourceReplyDeliveryModeContext;
@@ -98,8 +128,50 @@ export function resolveSourceReplyDeliveryMode(params: {
   return mode;
 }
 
-export type SourceReplyVisibilityPolicy = {
+/** Selects reply requiredness at admission, preserving configured ambient group silence. */
+export function resolveSourceReplyExpectation(params: {
+  ctx: SourceReplyDeliveryModeContext;
+  cfg: OpenClawConfig;
+  isHeartbeat?: boolean;
+}): ReplyExpectation {
+  if (
+    isSyntheticSourceReplyTurn({
+      inputProvenance: params.ctx.InputProvenance,
+      isHeartbeat: params.isHeartbeat,
+    })
+  ) {
+    return "optional";
+  }
+  if (isExplicitSourceReplyCommand(params.ctx, params.cfg)) {
+    return "required";
+  }
+  if (params.ctx.InboundEventKind === "room_event") {
+    return "optional";
+  }
+  const chatType = normalizeChatType(params.ctx.ChatType);
+  const conversationType = classifySilentReplyConversationType({
+    conversationType: chatType === "group" || chatType === "channel" ? "group" : chatType,
+    sessionKey: params.ctx.SessionKey,
+    surface: params.ctx.Surface ?? params.ctx.Provider,
+  });
+  if (
+    conversationType === "group" &&
+    params.ctx.WasMentioned !== true &&
+    resolveSilentReplySettings({
+      cfg: params.cfg,
+      surface: params.ctx.Surface ?? params.ctx.Provider,
+      conversationType: "group",
+    }).policy === "allow"
+  ) {
+    return "optional";
+  }
+  return "required";
+}
+
+/** Full source-reply suppression decision consumed by run and hook code. */
+type SourceReplyVisibilityPolicy = {
   sourceReplyDeliveryMode: SourceReplyDeliveryMode;
+  sessionStableSourceReplyDeliveryMode: SourceReplyDeliveryMode;
   sendPolicyDenied: boolean;
   suppressAutomaticSourceDelivery: boolean;
   suppressDelivery: boolean;
@@ -109,6 +181,7 @@ export type SourceReplyVisibilityPolicy = {
   deliverySuppressionReason: string;
 };
 
+/** Resolves source delivery, hooks, lifecycle, and typing suppression flags. */
 export function resolveSourceReplyVisibilityPolicy(params: {
   cfg: OpenClawConfig;
   ctx: SourceReplyDeliveryModeContext;
@@ -119,7 +192,15 @@ export function resolveSourceReplyVisibilityPolicy(params: {
   explicitSuppressTyping?: boolean;
   shouldSuppressTyping?: boolean;
   messageToolAvailable?: boolean;
+  /**
+   * Sender-independent availability for the session-stable mode. The stable
+   * mode feeds CLI binding facts shared by every turn kind, so a sender-scoped
+   * message-tool denial must not downgrade it while sender-less synthetic
+   * turns resolve tool-only — that hash split resets the CLI session (#121485).
+   */
+  sessionStableMessageToolAvailable?: boolean;
   defaultVisibleReplies?: "automatic" | "message_tool";
+  isHeartbeat?: boolean;
 }): SourceReplyVisibilityPolicy {
   const sourceReplyDeliveryMode = resolveSourceReplyDeliveryMode({
     cfg: params.cfg,
@@ -129,27 +210,49 @@ export function resolveSourceReplyVisibilityPolicy(params: {
     messageToolAvailable: params.messageToolAvailable,
     defaultVisibleReplies: params.defaultVisibleReplies,
   });
+  const hasStableTurnOverride =
+    !isSyntheticSourceReplyTurn({
+      inputProvenance: params.ctx.InputProvenance,
+      isHeartbeat: params.isHeartbeat,
+    }) &&
+    (params.requested !== undefined || isExplicitSourceReplyCommand(params.ctx, params.cfg));
+  const sessionStableSourceReplyDeliveryMode = hasStableTurnOverride
+    ? sourceReplyDeliveryMode
+    : resolveSourceReplyDeliveryMode({
+        cfg: params.cfg,
+        ctx: toSessionStableDeliveryModeContext(params.ctx),
+        messageToolAvailable:
+          params.sessionStableMessageToolAvailable ?? params.messageToolAvailable,
+        defaultVisibleReplies: params.defaultVisibleReplies,
+      });
   const sendPolicyDenied = params.sendPolicy === "deny";
-  const suppressAutomaticSourceDelivery = sourceReplyDeliveryMode === "message_tool_only";
+  const progressRefresh = isProgressCardRefreshInputProvenance(params.ctx.InputProvenance);
+  const suppressAutomaticSourceDelivery =
+    progressRefresh || sourceReplyDeliveryMode === "message_tool_only";
   const suppressDelivery = sendPolicyDenied || suppressAutomaticSourceDelivery;
   const deliverySuppressionReason = sendPolicyDenied
     ? "sendPolicy: deny"
-    : suppressAutomaticSourceDelivery
-      ? "sourceReplyDeliveryMode: message_tool_only"
-      : "";
+    : progressRefresh
+      ? "progress card refresh"
+      : suppressAutomaticSourceDelivery
+        ? "sourceReplyDeliveryMode: message_tool_only"
+        : "";
 
   return {
     sourceReplyDeliveryMode,
+    sessionStableSourceReplyDeliveryMode,
     sendPolicyDenied,
     suppressAutomaticSourceDelivery,
     suppressDelivery,
     suppressHookUserDelivery: params.suppressAcpChildUserDelivery === true || suppressDelivery,
     suppressHookReplyLifecycle:
+      progressRefresh ||
       sendPolicyDenied ||
       params.suppressAcpChildUserDelivery === true ||
       params.explicitSuppressTyping === true ||
       params.shouldSuppressTyping === true,
     suppressTyping:
+      progressRefresh ||
       sendPolicyDenied ||
       params.explicitSuppressTyping === true ||
       params.shouldSuppressTyping === true,

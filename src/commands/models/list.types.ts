@@ -1,10 +1,5 @@
-export type ConfiguredEntry = {
-  key: string;
-  ref: { provider: string; model: string };
-  tags: Set<string>;
-  aliases: string[];
-};
-
+// Shared data shapes for model-list and model-status output.
+/** Render-ready model-list row. */
 export type ModelRow = {
   key: string;
   name: string;
@@ -14,13 +9,13 @@ export type ModelRow = {
   local: boolean | null;
   available: boolean | null;
   tags: string[];
-  missing: boolean;
 };
 
+/** Provider auth summary shown by `models status`. */
 export type ProviderAuthOverview = {
   provider: string;
   effective: {
-    kind: "profiles" | "env" | "models.json" | "synthetic" | "missing";
+    kind: "profiles" | "env" | "models.json" | "synthetic" | "runtime" | "missing";
     detail: string;
   };
   profiles: {

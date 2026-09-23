@@ -1,6 +1,12 @@
 import { Routes } from "discord-api-types/v10";
+import { normalizeDiscordMessageId } from "./api.messages.js";
 import type { RequestQuery } from "./rest-scheduler.js";
 import type { RequestClient, RequestData } from "./rest.js";
+
+function normalizeDiscordWebhookMessageId(messageId: string): string {
+  const normalized = messageId.trim();
+  return normalized === "@original" ? normalized : normalizeDiscordMessageId(normalized);
+}
 
 export async function createInteractionCallback(
   rest: RequestClient,
@@ -19,9 +25,12 @@ export async function editWebhookMessage(
   data: RequestData,
   query?: RequestQuery,
 ): Promise<unknown> {
-  return query
-    ? await rest.patch(Routes.webhookMessage(applicationId, token, messageId), data, query)
-    : await rest.patch(Routes.webhookMessage(applicationId, token, messageId), data);
+  const route = Routes.webhookMessage(
+    applicationId,
+    token,
+    normalizeDiscordWebhookMessageId(messageId),
+  );
+  return query ? await rest.patch(route, data, query) : await rest.patch(route, data);
 }
 
 export async function deleteWebhookMessage(
@@ -30,7 +39,9 @@ export async function deleteWebhookMessage(
   token: string,
   messageId: string,
 ): Promise<unknown> {
-  return await rest.delete(Routes.webhookMessage(applicationId, token, messageId));
+  return await rest.delete(
+    Routes.webhookMessage(applicationId, token, normalizeDiscordWebhookMessageId(messageId)),
+  );
 }
 
 export async function getWebhookMessage(
@@ -39,7 +50,9 @@ export async function getWebhookMessage(
   token: string,
   messageId: string,
 ): Promise<unknown> {
-  return await rest.get(Routes.webhookMessage(applicationId, token, messageId));
+  return await rest.get(
+    Routes.webhookMessage(applicationId, token, normalizeDiscordWebhookMessageId(messageId)),
+  );
 }
 
 export async function createWebhookMessage(

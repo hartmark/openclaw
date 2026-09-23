@@ -1,8 +1,12 @@
+// Browser tests cover agent.shared plugin behavior.
 import { describe, expect, it, vi } from "vitest";
+import { BrowserProfileUnavailableError, toBrowserErrorResponse } from "../errors.js";
+import * as navigationGuard from "../navigation-guard.js";
 import type { BrowserRouteContext, ProfileContext } from "../server-context.js";
 import "../../test-support/browser-security.mock.js";
 import {
   readBody,
+  handleRouteError,
   resolveSafeRouteTabUrl,
   resolveTargetIdFromBody,
   resolveTargetIdFromQuery,
@@ -40,24 +44,28 @@ function profileContext(tabs: Array<{ targetId: string; url: string }>) {
   };
 }
 
-function routeContextForTab(url: string): BrowserRouteContext {
+function routeContextForTab(
+  url: string,
+  ensureTabAvailable = vi.fn(async () => ({
+    targetId: "tab-1",
+    title: "Tab",
+    url,
+    type: "page",
+  })),
+): BrowserRouteContext {
   const profileCtx = {
     profile: {
       cdpUrl: "http://127.0.0.1:9222",
       name: "default",
     },
-    ensureTabAvailable: vi.fn(async () => ({
-      targetId: "tab-1",
-      title: "Tab",
-      url,
-      type: "page",
-    })),
+    ensureTabAvailable,
   } as unknown as ProfileContext;
 
   return {
     forProfile: () => profileCtx,
     state: () => ({
       resolved: {
+        actionTimeoutMs: 60_000,
         ssrfPolicy: {},
       },
     }),
@@ -66,6 +74,77 @@ function routeContextForTab(url: string): BrowserRouteContext {
 }
 
 describe("browser route shared helpers", () => {
+  it("does not interact after dashboard ownership changes during target resolution", async () => {
+    let ownerCurrent = true;
+    const ctx = routeContextForTab(
+      "https://example.com",
+      vi.fn(async () => {
+        ownerCurrent = false;
+        return { targetId: "tab-1", title: "Tab", url: "https://example.com", type: "page" };
+      }),
+    );
+    const response = createBrowserRouteResponse();
+    const run = vi.fn(async () => "mutated");
+    await withRouteTabContext({
+      req: {
+        params: {},
+        query: {},
+        assertCurrent: async () => {
+          if (!ownerCurrent) {
+            throw new Error("dashboard was removed");
+          }
+        },
+      },
+      res: response.res,
+      ctx,
+      targetId: "tab-1",
+      run,
+    });
+    expect(response.statusCode).toBe(500);
+    expect(response.body).toMatchObject({
+      error: expect.stringContaining("dashboard was removed"),
+    });
+    expect(run).not.toHaveBeenCalled();
+  });
+  it("preserves structured browser errors on agent routes", () => {
+    const response = createBrowserRouteResponse();
+    const error = new BrowserProfileUnavailableError("display required", {
+      metadata: {
+        reason: "no_display_for_headed_profile",
+        details: {
+          profile: "openclaw",
+          requestedHeadless: false,
+          headlessSource: "env",
+          displayPresent: false,
+        },
+      },
+    });
+
+    handleRouteError({ mapTabError: toBrowserErrorResponse } as never, response.res, error);
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toMatchObject({
+      error: "display required",
+      reason: "no_display_for_headed_profile",
+      details: { headlessSource: "env" },
+    });
+  });
+
+  it("redacts credentials from unmapped route errors", () => {
+    const response = createBrowserRouteResponse();
+    const error = new Error(
+      "connect failed for wss://browser-user:browser-password@browserless.example/cdp?token=browser-token",
+    );
+
+    handleRouteError({ mapTabError: () => null } as never, response.res, error);
+
+    expect(response.statusCode).toBe(500);
+    expect(response.body).toMatchObject({ error: expect.stringContaining("browserless.example") });
+    expect(JSON.stringify(response.body)).not.toContain("browser-user");
+    expect(JSON.stringify(response.body)).not.toContain("browser-password");
+    expect(JSON.stringify(response.body)).not.toContain("browser-token");
+  });
+
   describe("readBody", () => {
     it("returns object bodies", () => {
       expect(readBody(requestWithBody({ one: 1 }))).toEqual({ one: 1 });
@@ -128,9 +207,58 @@ describe("browser route shared helpers", () => {
         }),
       ).resolves.toBeUndefined();
     });
+
+    it("propagates cancelled URL verification instead of returning a redacted URL", async () => {
+      const controller = new AbortController();
+      const reason = new Error("browser navigation verification deadline expired");
+      const guard = vi
+        .spyOn(navigationGuard, "assertBrowserNavigationResultAllowed")
+        .mockImplementationOnce(async () => {
+          controller.abort(reason);
+          throw reason;
+        });
+      try {
+        await expect(
+          resolveSafeRouteTabUrl({
+            ctx: routeContext() as never,
+            profileCtx: profileContext([
+              { targetId: "tab-1", url: "https://example.com/current" },
+            ]) as never,
+            targetId: "tab-1",
+            signal: controller.signal,
+          }),
+        ).rejects.toBe(reason);
+        expect(guard).toHaveBeenCalledWith(expect.objectContaining({ signal: controller.signal }));
+      } finally {
+        guard.mockRestore();
+      }
+    });
   });
 
   describe("withRouteTabContext", () => {
+    it("opts agent routes into Playwright target-id fallback", async () => {
+      const response = createBrowserRouteResponse();
+      const ensureTabAvailable = vi.fn(async () => ({
+        targetId: "tab-1",
+        title: "Tab",
+        url: "https://example.com",
+        type: "page",
+      }));
+
+      await withRouteTabContext({
+        req: requestWithBody({}),
+        res: response.res,
+        ctx: routeContextForTab("https://example.com", ensureTabAvailable),
+        run: async () => {},
+      });
+
+      expect(ensureTabAvailable).toHaveBeenCalledWith(undefined, {
+        allowPlaywrightFallback: true,
+        signal: expect.any(AbortSignal),
+        timeoutMs: 60_000,
+      });
+    });
+
     it("does not enforce current-tab URL policy unless requested", async () => {
       const response = createBrowserRouteResponse();
       const run = vi.fn(async () => {

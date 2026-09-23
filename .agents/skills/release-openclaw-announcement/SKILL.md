@@ -1,25 +1,32 @@
 ---
 name: release-openclaw-announcement
-description: "Draft or post OpenClaw beta/stable Discord release announcements from changelog, GitHub release, registry, and validation evidence. Use when announcing a beta, stable release, release candidate, or asking what users should test after an OpenClaw release."
+description: "Draft or post OpenClaw beta, stable, or extended-stable Discord release announcements from changelog, tag, registry, and validation evidence. Use when announcing a release, release candidate, or asking what users should test after an OpenClaw release."
 ---
 
 # OpenClaw Release Announcement
 
-Use with `release-openclaw-maintainer` after a beta or stable release is live.
-Use with `openclaw-discord` when actually posting to Discord.
+Use with `release-openclaw-maintainer` after a release is live.
+Use with `$discord-user-post` when actually posting to Discord as the logged-in
+user.
 
 ## Evidence First
 
 Before drafting focus areas, read real release evidence:
 
-1. Current GitHub release body for the tag.
-2. `CHANGELOG.md` section for the released base version.
+1. GitHub release body and immutable tag; for extended-stable, also confirm the
+   npm/container-only scope and non-Latest classification.
+2. The released base version's `CHANGELOG/<version>.md` and contribution
+   record, resolved with `node scripts/release-changelog.mjs read --version <version> [--ref <sha-or-tag>]`
+   (add `--record` for accounting). The shared
+   resolver reads historical monolithic tags; current `CHANGELOG.md` is an
+   index. After approved docs publication, read the complete docs mirror and
+   frozen record rather than treating the compact GitHub body as full notes.
 3. Commits since the previous shipped version or the operator-specified base.
 4. Registry/package metadata for the exact version and current dist-tag.
 5. Validation status that is relevant to user confidence.
 
 Do not claim a full changelog audit unless you did it. If you only read the
-generated release notes or top changelog section, say that and either audit
+generated release notes or selected changelog section, say that and either audit
 properly or draft with that limitation.
 
 For beta focus areas, prioritize user-observable changes over internal test or
@@ -68,6 +75,19 @@ openclaw --version
 
 Fresh installs still point to `https://openclaw.ai`.
 
+For extended-stable, name the exact version and trailing month. Mention only
+observable backports, and use:
+
+```sh
+openclaw update --channel extended-stable
+openclaw --version
+```
+
+Do not add `--yes`: users moving from newer regular stable must see the downgrade
+warning because older versions may not understand newer configuration. Link the
+GitHub Release, but do not inherit regular stable macOS, Windows, ClawHub,
+`latest`, or website claims.
+
 ## Style
 
 - Discord Markdown, no tables.
@@ -80,6 +100,7 @@ Fresh installs still point to `https://openclaw.ai`.
 
 ## Posting
 
-When asked to post, use the configured Discord workflow from
-`openclaw-discord` or the approved OpenClaw relay. Never print tokens.
-For public channels, inspect the final body before sending.
+When asked to post, use `$discord-user-post` to operate the logged-in Discord
+desktop app as the user. Resolve and visibly verify the exact server/channel,
+inspect the final body, and request action-time confirmation before entering or
+sending it. Never use OpenClaw channel sends, bots, webhooks, relays, or tokens.

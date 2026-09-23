@@ -1,223 +1,120 @@
+// Defines model selection and provider configuration types.
+
+import type { z } from "zod";
 import type {
-  AnthropicMessagesCompat,
-  OpenAICompletionsCompat,
-  OpenAIResponsesCompat,
-  ThinkingLevelMap,
-} from "../llm/types.js";
+  ModelDataImageInputConfig,
+  ModelDataMediaInputConfig,
+} from "../../packages/llm-core/src/model-data.js";
+import type { OpenAICompletionsCompat, RawModelCostConfig } from "../llm/types.js";
 import type { AgentRuntimePolicyConfig } from "./types.agents-shared.js";
 import type { ConfiguredModelProviderRequest } from "./types.provider-request.js";
 import type { SecretInput } from "./types.secrets.js";
+import type { ModelsConfigSchema } from "./zod-schema.core.js";
 
-export const MODEL_APIS = [
-  "openai-completions",
-  "openai-responses",
-  "openai-chatgpt-responses",
-  "anthropic-messages",
-  "google-generative-ai",
-  "google-vertex",
-  "github-copilot",
-  "bedrock-converse-stream",
-  "ollama",
-  "azure-openai-responses",
-] as const;
+export {
+  MODEL_APIS,
+  MODEL_THINKING_FORMATS,
+  isModelThinkingFormat,
+  type ModelApi,
+  type SupportedThinkingFormat,
+} from "./model-config-vocabulary.js";
 
-export type ModelApi = (typeof MODEL_APIS)[number];
+type ModelsSchemaInput = NonNullable<z.input<typeof ModelsConfigSchema>>;
 
-type SupportedOpenAICompatFields = Pick<
-  OpenAICompletionsCompat,
-  | "supportsStore"
-  | "supportsDeveloperRole"
-  | "supportsReasoningEffort"
-  | "supportsUsageInStreaming"
-  | "supportsStrictMode"
-  | "maxTokensField"
-  | "requiresToolResultName"
-  | "requiresAssistantAfterToolResult"
-  | "requiresThinkingAsText"
-  | "openRouterRouting"
-  | "vercelGatewayRouting"
-  | "zaiToolStream"
-  | "cacheControlFormat"
-  | "sendSessionAffinityHeaders"
-  | "supportsLongCacheRetention"
->;
+type ModelProviderSchemaInput = NonNullable<ModelsSchemaInput["providers"]>[string];
 
-type SupportedOpenAIResponsesCompatFields = Pick<
-  OpenAIResponsesCompat,
-  "sendSessionIdHeader" | "supportsLongCacheRetention"
->;
+type ModelDefinitionSchemaInput = NonNullable<ModelProviderSchemaInput["models"]>[number];
 
-type SupportedAnthropicMessagesCompatFields = Pick<
-  AnthropicMessagesCompat,
-  "supportsEagerToolInputStreaming" | "supportsLongCacheRetention"
->;
+/** Provider/model compatibility switches consumed by request builders and tool schema adapters. */
+export type ModelCompatConfig = Omit<
+  NonNullable<ModelDefinitionSchemaInput["compat"]>,
+  "openRouterRouting" | "vercelGatewayRouting"
+> &
+  Pick<OpenAICompletionsCompat, "openRouterRouting" | "vercelGatewayRouting">;
 
-export type SupportedThinkingFormat =
-  | NonNullable<OpenAICompletionsCompat["thinkingFormat"]>
-  | "deepseek"
-  | "openrouter"
-  | "together";
+export type ModelImageInputConfig = ModelDataImageInputConfig;
 
-export const MODEL_THINKING_FORMATS = [
-  "openai",
-  "openrouter",
-  "deepseek",
-  "together",
-  "qwen",
-  "qwen-chat-template",
-  "zai",
-] as const satisfies readonly SupportedThinkingFormat[];
+export type ModelMediaInputConfig = ModelDataMediaInputConfig;
 
-export function isModelThinkingFormat(value: string): value is SupportedThinkingFormat {
-  return (MODEL_THINKING_FORMATS as readonly string[]).includes(value);
-}
+/** Authentication mode expected by a configured model provider. */
+export type ModelProviderAuthMode = NonNullable<ModelProviderSchemaInput["auth"]>;
 
-export type ModelCompatConfig = SupportedOpenAICompatFields &
-  SupportedOpenAIResponsesCompatFields &
-  SupportedAnthropicMessagesCompatFields & {
-    thinkingFormat?: SupportedThinkingFormat;
-    supportedReasoningEfforts?: string[];
-    reasoningEffortMap?: Record<string, string>;
-    visibleReasoningDetailTypes?: string[];
-    supportsTools?: boolean;
-    supportsPromptCacheKey?: boolean;
-    requiresStringContent?: boolean;
-    strictMessageKeys?: boolean;
-    toolSchemaProfile?: string;
-    unsupportedToolSchemaKeywords?: string[];
-    nativeWebSearchTool?: boolean;
-    toolCallArgumentsEncoding?: string;
-    requiresMistralToolIds?: boolean;
-    requiresOpenAiAnthropicToolPayload?: boolean;
-  };
+export type ModelProviderLocalServiceConfig = NonNullable<ModelProviderSchemaInput["localService"]>;
 
-export type ModelImageInputConfig = {
-  /** Provider-documented maximum encoded image payload size. */
-  maxBytes?: number;
-  /** Provider-documented maximum accepted input pixels. */
-  maxPixels?: number;
-  /** Provider-documented maximum accepted width/height in pixels. */
-  maxSidePx?: number;
-  /** Preferred resize side for the default balanced compression policy. */
-  preferredSidePx?: number;
-  /** Token accounting style, used as documentation for provider-owned policy. */
-  tokenMode?: "tile" | "detail" | "provider";
-};
-
-export type ModelMediaInputConfig = {
-  image?: ModelImageInputConfig;
-};
-
-export type ModelProviderAuthMode = "api-key" | "aws-sdk" | "oauth" | "token";
-
-export type ModelProviderLocalServiceConfig = {
-  command: string;
-  args?: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-  healthUrl?: string;
-  readyTimeoutMs?: number;
-  idleStopMs?: number;
-};
-
-export type ModelDefinitionConfig = {
-  id: string;
-  name: string;
-  api?: ModelApi;
-  baseUrl?: string;
+export type ModelDefinitionConfig = Omit<
+  ModelDefinitionSchemaInput,
+  "reasoning" | "input" | "cost" | "maxTokens" | "agentRuntime" | "mediaInput" | "compat"
+> & {
+  /** Whether the model supports reasoning/thinking controls. */
   reasoning: boolean;
-  input: Array<"text" | "image" | "video" | "audio">;
-  cost: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-    /** Optional tiered pricing.  When present, cost calculation uses
-     *  per-tier rates instead of the flat rates above.  Prices are
-     *  USD / million tokens; ranges are half-open `[start, end)` on the
-     *  input-token axis. */
-    tieredPricing?: Array<{
-      input: number;
-      output: number;
-      cacheRead: number;
-      cacheWrite: number;
-      /** Bounded tier: `[start, end)`. Open-ended top tier: `[start]` (normalized to `[start, Infinity]` at load time). */
-      range: [number, number] | [number];
-    }>;
-  };
-  contextWindow: number;
-  /**
-   * Optional effective runtime cap used for compaction/session budgeting.
-   * Keeps provider/native contextWindow metadata intact while letting configs
-   * prefer a smaller practical window.
-   */
-  contextTokens?: number;
+  /** Supported input modalities for routing and media-tool selection. */
+  input: NonNullable<ModelDefinitionSchemaInput["input"]>;
+  /** Token pricing in USD per million tokens. */
+  cost: RawModelCostConfig;
+  /** Maximum completion/output token budget. */
   maxTokens: number;
-  /** Maps OpenClaw thinking levels to provider/model-specific values. */
-  thinkingLevelMap?: ThinkingLevelMap;
-  /** Provider-specific request/runtime parameters passed through to provider plugins. */
-  params?: Record<string, unknown>;
   /** Optional agent execution runtime override for this provider/model pair. */
   agentRuntime?: AgentRuntimePolicyConfig;
-  headers?: Record<string, string>;
+  /** Provider compatibility flags for payload shaping and feature gating. */
   compat?: ModelCompatConfig;
+  /** Media input limits used by routing and preflight compression. */
   mediaInput?: ModelMediaInputConfig;
-  metadataSource?: "models-add";
 };
 
-export type ModelProviderConfig = {
+export type ModelProviderConfig = Omit<
+  ModelProviderSchemaInput,
+  "baseUrl" | "models" | "apiKey" | "headers" | "request" | "agentRuntime"
+> & {
+  /** Provider API base URL. */
   baseUrl: string;
+  /** API key or secret reference for this provider. */
   apiKey?: SecretInput;
-  auth?: ModelProviderAuthMode;
-  api?: ModelApi;
-  contextWindow?: number;
-  contextTokens?: number;
-  maxTokens?: number;
-  timeoutSeconds?: number;
-  /** Optional provider deployment/API region used by provider plugins that expose regional endpoints. */
-  region?: string;
-  injectNumCtxForOpenAICompat?: boolean;
-  /** Provider-specific runtime parameters interpreted by provider plugins. */
-  params?: Record<string, unknown>;
+  /** Secret-bearing headers merged into provider requests. */
+  headers?: Record<string, SecretInput>;
+  /** Provider request transport/retry overrides. */
+  request?: ConfiguredModelProviderRequest;
   /** Optional default agent execution runtime for models under this provider. */
   agentRuntime?: AgentRuntimePolicyConfig;
-  /** Optional local service to start before calling this provider. */
-  localService?: ModelProviderLocalServiceConfig;
-  headers?: Record<string, SecretInput>;
-  authHeader?: boolean;
-  request?: ConfiguredModelProviderRequest;
+  /** Model catalog entries exposed by this provider. */
   models: ModelDefinitionConfig[];
 };
 
+/** Fully materialized provider declaration emitted by provider catalog plugins. */
 export type ModelProviderDeclarationConfig = ModelProviderConfig;
 
+/** User config input shape before provider defaults/models are materialized. */
 export type ModelProviderConfigInput = Omit<Partial<ModelProviderConfig>, "models"> & {
   models?: ModelDefinitionConfig[];
 };
 
 export type BedrockDiscoveryConfig = {
+  /** Enable AWS Bedrock model discovery. */
   enabled?: boolean;
+  /** AWS region to query for models. */
   region?: string;
+  /** Optional provider id filters for discovery. */
   providerFilter?: string[];
+  /** Discovery cache refresh interval in seconds. */
   refreshInterval?: number;
+  /** Context window applied when discovery cannot infer one. */
   defaultContextWindow?: number;
+  /** Max output tokens applied when discovery cannot infer one. */
   defaultMaxTokens?: number;
 };
 
 export type DiscoveryToggleConfig = {
+  /** Enables the named discovery source. */
   enabled?: boolean;
 };
 
-export type ModelPricingConfig = {
-  enabled?: boolean;
-};
+export type ModelCatalogRefreshConfig = NonNullable<ModelsSchemaInput["catalogRefresh"]>;
 
-export type ModelsConfig = {
-  mode?: "merge" | "replace";
+export type ModelsConfig = Omit<ModelsSchemaInput, "providers"> & {
+  /** Configured provider catalog keyed by provider id. */
   providers?: Record<string, ModelProviderConfig>;
-  pricing?: ModelPricingConfig;
 };
 
+/** Top-level models config input before provider entries are normalized. */
 export type ModelsConfigInput = Omit<ModelsConfig, "providers"> & {
   providers?: Record<string, ModelProviderConfigInput>;
 };

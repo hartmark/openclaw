@@ -1,4 +1,5 @@
 import type { SQLInputValue } from "node:sqlite";
+import { vectorToBlob } from "./vector-blob.js";
 
 type VectorWriteDb = {
   prepare: (sql: string) => {
@@ -6,20 +7,18 @@ type VectorWriteDb = {
   };
 };
 
-const vectorToBlob = (embedding: number[]): Buffer =>
-  Buffer.from(new Float32Array(embedding).buffer);
+export function createMemoryVectorWriter(db: VectorWriteDb, tableName = "memory_index_chunks_vec") {
+  let deleteStatement: ReturnType<VectorWriteDb["prepare"]> | undefined;
+  let insertStatement: ReturnType<VectorWriteDb["prepare"]> | undefined;
 
-export function replaceMemoryVectorRow(params: {
-  db: VectorWriteDb;
-  id: string;
-  embedding: number[];
-  tableName?: string;
-}): void {
-  const tableName = params.tableName ?? "chunks_vec";
-  try {
-    params.db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(params.id);
-  } catch {}
-  params.db
-    .prepare(`INSERT INTO ${tableName} (id, embedding) VALUES (?, ?)`)
-    .run(params.id, vectorToBlob(params.embedding));
+  // One replacement owns the statements. A failed DELETE must not prevent INSERT.
+  return (id: string, embedding: number[]): void => {
+    try {
+      (deleteStatement ??= db.prepare(`DELETE FROM ${tableName} WHERE id = ?`)).run(id);
+    } catch {}
+    (insertStatement ??= db.prepare(`INSERT INTO ${tableName} (id, embedding) VALUES (?, ?)`)).run(
+      id,
+      vectorToBlob(embedding),
+    );
+  };
 }

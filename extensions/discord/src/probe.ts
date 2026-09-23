@@ -1,11 +1,16 @@
 import type { BaseProbeResult } from "openclaw/plugin-sdk/channel-contract";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { resolveFetch } from "openclaw/plugin-sdk/fetch-runtime";
-import { fetchWithTimeout } from "openclaw/plugin-sdk/text-utility-runtime";
+import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
+import { fetchWithTimeout, runChannelProbe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { DiscordApiError, fetchDiscord } from "./api.js";
+import { getDiscordEndpointRuntime, type DiscordEndpointRuntime } from "./endpoint-runtime.js";
 import { normalizeDiscordToken } from "./token.js";
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
+const DISCORD_PROBE_GET_ME_LABEL = "discord.probe.getMe";
+const DISCORD_PROBE_JSON_MAX_BYTES = 16 * 1024 * 1024;
+const DISCORD_PROBE_COMPLETION_RESERVE_MAX_MS = 25;
 
 export type DiscordProbe = BaseProbeResult & {
   status?: number | null;
@@ -28,6 +33,11 @@ export type DiscordApplicationSummary = {
   intents?: DiscordPrivilegedIntentsSummary;
 };
 
+export type DiscordApplicationIdProbeResult =
+  | { kind: "resolved"; applicationId: string }
+  | { kind: "rejected"; status: 401 | 403; error: unknown }
+  | { kind: "unavailable"; status: number | null; error: unknown };
+
 const DISCORD_APP_FLAG_GATEWAY_PRESENCE = 1 << 12;
 const DISCORD_APP_FLAG_GATEWAY_PRESENCE_LIMITED = 1 << 13;
 const DISCORD_APP_FLAG_GATEWAY_GUILD_MEMBERS = 1 << 14;
@@ -39,6 +49,7 @@ async function fetchDiscordApplicationMe(
   token: string,
   timeoutMs: number,
   fetcher: typeof fetch,
+  endpointRuntime: DiscordEndpointRuntime | null,
 ): Promise<{ id?: string; flags?: number } | undefined> {
   try {
     const normalized = normalizeDiscordToken(token, "channels.discord.token");
@@ -48,23 +59,12 @@ async function fetchDiscordApplicationMe(
     return await fetchDiscord<{ id?: string; flags?: number }>(
       "/oauth2/applications/@me",
       normalized,
-      createDiscordTimeoutFetch(fetcher, timeoutMs),
-      { retry: { attempts: 1 } },
+      fetcher,
+      { endpointRuntime, retry: { attempts: 1 }, timeoutMs },
     );
   } catch {
     return undefined;
   }
-}
-
-function createDiscordTimeoutFetch(fetcher: typeof fetch, timeoutMs: number): typeof fetch {
-  const fetchImpl = getResolvedFetch(fetcher);
-  return ((input: RequestInfo | URL, init?: RequestInit) =>
-    fetchWithTimeout(
-      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
-      init ?? {},
-      timeoutMs,
-      fetchImpl,
-    )) as typeof fetch;
 }
 
 export function resolveDiscordPrivilegedIntentsFromFlags(
@@ -96,8 +96,11 @@ export async function fetchDiscordApplicationSummary(
   token: string,
   timeoutMs: number,
   fetcher: typeof fetch = fetch,
+  endpointRuntime?: DiscordEndpointRuntime | null,
 ): Promise<DiscordApplicationSummary | undefined> {
-  const json = await fetchDiscordApplicationMe(token, timeoutMs, fetcher);
+  const retainedEndpoint =
+    endpointRuntime === undefined ? getDiscordEndpointRuntime() : endpointRuntime;
+  const json = await fetchDiscordApplicationMe(token, timeoutMs, fetcher, retainedEndpoint ?? null);
   if (!json) {
     return undefined;
   }
@@ -119,59 +122,102 @@ function getResolvedFetch(fetcher: typeof fetch): typeof fetch {
   return fetchImpl;
 }
 
+async function readDiscordProbeGetMeJson(
+  response: Response,
+  timeoutMs: number,
+  deadlineMs: number,
+): Promise<{ id?: string; username?: string }> {
+  const bytes = await readResponseWithLimit(response, DISCORD_PROBE_JSON_MAX_BYTES, {
+    chunkTimeoutMs: timeoutMs,
+    onIdleTimeout: ({ chunkTimeoutMs }) =>
+      new Error(`${DISCORD_PROBE_GET_ME_LABEL}: JSON response stalled after ${chunkTimeoutMs}ms`),
+    timeoutMs: Math.max(1, deadlineMs - Date.now()),
+    onTimeout: () =>
+      new Error(`${DISCORD_PROBE_GET_ME_LABEL}: JSON response timed out after ${timeoutMs}ms`),
+    onOverflow: ({ maxBytes }) =>
+      new Error(`${DISCORD_PROBE_GET_ME_LABEL}: JSON response exceeds ${maxBytes} bytes`),
+  });
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as {
+      id?: string;
+      username?: string;
+    };
+  } catch (cause) {
+    throw new Error(`${DISCORD_PROBE_GET_ME_LABEL}: malformed JSON response`, { cause });
+  }
+}
+
 export async function probeDiscord(
   token: string,
   timeoutMs: number,
   opts?: { fetcher?: typeof fetch; includeApplication?: boolean },
 ): Promise<DiscordProbe> {
-  const started = Date.now();
-  const fetcher = opts?.fetcher ?? fetch;
-  const includeApplication = opts?.includeApplication === true;
-  const normalized = normalizeDiscordToken(token, "channels.discord.token");
-  const result: DiscordProbe = {
-    ok: false,
-    status: null,
-    error: null,
-    elapsedMs: 0,
-  };
-  if (!normalized) {
-    return {
-      ...result,
-      error: "missing token",
-      elapsedMs: Date.now() - started,
-    };
-  }
-  try {
-    const res = await fetchWithTimeout(
-      `${DISCORD_API_BASE}/users/@me`,
-      { headers: { Authorization: `Bot ${normalized}` } },
-      timeoutMs,
-      getResolvedFetch(fetcher),
-    );
-    if (!res.ok) {
-      result.status = res.status;
-      result.error = `getMe failed (${res.status})`;
-      return { ...result, elapsedMs: Date.now() - started };
-    }
-    const json = (await res.json()) as { id?: string; username?: string };
-    result.ok = true;
-    result.bot = {
-      id: json.id ?? null,
-      username: json.username ?? null,
-    };
-    if (includeApplication) {
-      result.application =
-        (await fetchDiscordApplicationSummary(normalized, timeoutMs, fetcher)) ?? undefined;
-    }
-    return { ...result, elapsedMs: Date.now() - started };
-  } catch (err) {
-    return {
-      ...result,
-      status: err instanceof Response ? err.status : result.status,
-      error: formatErrorMessage(err),
-      elapsedMs: Date.now() - started,
-    };
-  }
+  return await runChannelProbe(
+    undefined,
+    async ({ startedAt }) => {
+      const endpoint = getDiscordEndpointRuntime();
+      const fetcher = endpoint?.fetch ?? opts?.fetcher ?? fetch;
+      const includeApplication = opts?.includeApplication === true;
+      const normalized = normalizeDiscordToken(token, "channels.discord.token");
+      const result: Omit<DiscordProbe, "elapsedMs"> = {
+        ok: false,
+        status: null,
+        error: null,
+      };
+      if (!normalized) {
+        return { ...result, error: "missing token" };
+      }
+      let res: Response | undefined;
+      try {
+        const getMeUrl = `${endpoint?.descriptor.restApiBaseUrl ?? DISCORD_API_BASE}/users/@me`;
+        const getMeDeadlineMs = Date.now() + timeoutMs;
+        res = await fetchWithTimeout(
+          getMeUrl,
+          { headers: { Authorization: `Bot ${normalized}` } },
+          timeoutMs,
+          getResolvedFetch(fetcher),
+        );
+        if (!res.ok) {
+          return { ...result, status: res.status, error: `getMe failed (${res.status})` };
+        }
+        const json = await readDiscordProbeGetMeJson(res, timeoutMs, getMeDeadlineMs);
+        result.ok = true;
+        result.bot = {
+          id: json.id ?? null,
+          username: json.username ?? null,
+        };
+        if (includeApplication) {
+          // Application metadata is optional. Keep its deadline inside the outer status budget so a
+          // stalled secondary response cannot discard the already-resolved bot identity.
+          const elapsedMs = Math.max(0, Date.now() - startedAt);
+          const completionReserveMs = Math.min(
+            DISCORD_PROBE_COMPLETION_RESERVE_MAX_MS,
+            Math.max(1, Math.floor(timeoutMs / 10)),
+          );
+          const applicationTimeoutMs = Math.floor(timeoutMs - elapsedMs - completionReserveMs);
+          if (applicationTimeoutMs > 0) {
+            result.application =
+              (await fetchDiscordApplicationSummary(
+                normalized,
+                applicationTimeoutMs,
+                fetcher,
+                endpoint ?? null,
+              )) ?? undefined;
+          }
+        }
+        return result;
+      } finally {
+        if (res?.bodyUsed !== true) {
+          await res?.body?.cancel().catch(() => undefined);
+        }
+      }
+    },
+    (error) => ({
+      ok: false,
+      status: error instanceof Response ? error.status : null,
+      error: formatErrorMessage(error),
+    }),
+  );
 }
 
 /**
@@ -202,36 +248,58 @@ export function parseApplicationIdFromToken(token: string): string | undefined {
   }
 }
 
+export async function probeDiscordApplicationId(
+  token: string,
+  timeoutMs: number,
+  fetcher: typeof fetch = fetch,
+): Promise<DiscordApplicationIdProbeResult> {
+  const normalized = normalizeDiscordToken(token, "channels.discord.token");
+  if (!normalized) {
+    return { kind: "unavailable", status: null, error: new Error("missing token") };
+  }
+  const parsedApplicationId = parseApplicationIdFromToken(token);
+  if (parsedApplicationId) {
+    return { kind: "resolved", applicationId: parsedApplicationId };
+  }
+  try {
+    const endpoint = getDiscordEndpointRuntime();
+    const json = await fetchDiscord<{ id?: string }>(
+      "/oauth2/applications/@me",
+      normalized,
+      endpoint?.fetch ?? fetcher,
+      { timeoutMs },
+    );
+    if (json?.id) {
+      return { kind: "resolved", applicationId: json.id };
+    }
+    return {
+      kind: "unavailable",
+      status: null,
+      error: new Error("Discord application response did not include an id"),
+    };
+  } catch (error) {
+    if (error instanceof DiscordApiError && (error.status === 401 || error.status === 403)) {
+      return { kind: "rejected", status: error.status, error };
+    }
+    return {
+      kind: "unavailable",
+      status: error instanceof DiscordApiError ? error.status : null,
+      error,
+    };
+  }
+}
+
 export async function fetchDiscordApplicationId(
   token: string,
   timeoutMs: number,
   fetcher: typeof fetch = fetch,
 ): Promise<string | undefined> {
-  const normalized = normalizeDiscordToken(token, "channels.discord.token");
-  if (!normalized) {
-    return undefined;
+  const result = await probeDiscordApplicationId(token, timeoutMs, fetcher);
+  if (result.kind === "resolved") {
+    return result.applicationId;
   }
-  const parsedApplicationId = parseApplicationIdFromToken(token);
-  if (parsedApplicationId) {
-    return parsedApplicationId;
+  if (result.kind === "unavailable" && result.status === 429) {
+    throw result.error;
   }
-  try {
-    const json = await fetchDiscord<{ id?: string }>(
-      "/oauth2/applications/@me",
-      normalized,
-      createDiscordTimeoutFetch(fetcher, timeoutMs),
-    );
-    if (json?.id) {
-      return json.id;
-    }
-    return undefined;
-  } catch (error) {
-    if (error instanceof DiscordApiError) {
-      if (error.status === 429) {
-        throw error;
-      }
-      return undefined;
-    }
-    return undefined;
-  }
+  return undefined;
 }

@@ -7,27 +7,12 @@ private func runCLI() async -> Int32 {
     do {
         let descriptors = CLIRegistry.descriptors
         let program = Program(descriptors: descriptors)
-        let invocation = try program.resolve(argv: CommandLine.arguments)
-        try await dispatch(invocation: invocation)
+        let invocation = try program.resolve(argv: ["swabble"] + CommandLine.arguments.dropFirst())
+        try await dispatchSwabble(parsed: invocation.parsedValues, path: invocation.path)
         return 0
     } catch {
         fputs("error: \(error)\n", stderr)
         return 1
-    }
-}
-
-@available(macOS 26.0, *)
-@MainActor
-private func dispatch(invocation: CommandInvocation) async throws {
-    let parsed = invocation.parsedValues
-    let path = invocation.path
-    guard let first = path.first else { throw CommanderProgramError.missingCommand }
-
-    switch first {
-    case "swabble":
-        try await dispatchSwabble(parsed: parsed, path: path)
-    default:
-        throw CommanderProgramError.unknownCommand(first)
     }
 }
 
@@ -74,11 +59,11 @@ private func swabbleHandlers(parsed: ParsedValues) -> [String: () async throws -
             try await cmd.run()
         },
         "health": {
-            var cmd = HealthCommand(parsed: parsed)
+            var cmd = HealthCommand()
             try await cmd.run()
         },
         "tail-log": {
-            var cmd = TailLogCommand(parsed: parsed)
+            var cmd = TailLogCommand()
             try await cmd.run()
         },
         "start": {
@@ -94,9 +79,9 @@ private func swabbleHandlers(parsed: ParsedValues) -> [String: () async throws -
             try await cmd.run()
         },
         "status": {
-            var cmd = StatusCommand()
+            var cmd = StatusCommand(parsed: parsed)
             try await cmd.run()
-        }
+        },
     ]
 }
 
@@ -106,7 +91,7 @@ private func dispatchMic(parsed: ParsedValues, path: [String]) async throws {
     let micSub = try subcommand(path, index: 2, command: "mic")
     switch micSub {
     case "list":
-        var cmd = MicList(parsed: parsed)
+        var cmd = MicList()
         try await cmd.run()
     case "set":
         var cmd = MicSet(parsed: parsed)

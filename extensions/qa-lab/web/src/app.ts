@@ -1,13 +1,18 @@
+import { formatErrorMessage as formatSharedErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import type { QaBusStateSnapshot } from "openclaw/plugin-sdk/qa-channel-protocol";
+// Qa Lab plugin module implements app behavior.
 import { defaultQaModelForMode, isQaFastModeEnabled } from "../../model-selection.js";
 import { normalizeCaptureSavedView, normalizeCaptureSavedViews } from "./capture-saved-view.js";
-import { formatErrorMessage } from "./errors.js";
+import { getJson, getJsonNoStore, postJson, QaLabHttpError } from "./http.js";
+import { conversationSelectionKey, findConversationBySelectionKey } from "./ui-conversation-key.js";
+import { redactSensitiveText } from "./ui-render-capture-redaction.js";
 import {
   type Bootstrap,
+  type EvidenceEnvelope,
   type OutcomesEnvelope,
   type ReportEnvelope,
+  type RunnerResolvedPlan,
   type RunnerSelection,
-  type Snapshot,
-  type TabId,
   type CaptureEventsEnvelope,
   type CaptureCoverageEnvelope,
   type CaptureQueryEnvelope,
@@ -17,33 +22,11 @@ import {
   type UiState,
   renderQaLabUi,
 } from "./ui-render.js";
-async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(path);
-  if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
-  }
-  return (await response.json()) as T;
-}
+import { stateFingerprint } from "./ui-state-fingerprint.js";
+import { bindTabNavigation } from "./ui-tab-navigation.js";
 
-async function getJsonNoStore<T>(path: string): Promise<T> {
-  const response = await fetch(path, { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
-  }
-  return (await response.json()) as T;
-}
-
-async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(payload.error || `${response.status} ${response.statusText}`);
-  }
-  return (await response.json()) as T;
+function formatErrorMessage(error: unknown): string {
+  return redactSensitiveText(formatSharedErrorMessage(error));
 }
 
 function countCaptureDimension(
@@ -108,6 +91,14 @@ function defaultModelsForProviderMode(
   };
 }
 
+function cloneRunnerSelection(selection: RunnerSelection): RunnerSelection {
+  return {
+    ...selection,
+    runtimePair: selection.runtimePair ? [...selection.runtimePair] : null,
+    scenarioIds: selection.scenarioIds ? [...selection.scenarioIds] : null,
+  };
+}
+
 function detectTheme(): "light" | "dark" {
   const stored = localStorage.getItem("qa-lab-theme");
   if (stored === "light" || stored === "dark") {
@@ -159,6 +150,11 @@ function isEditableElement(target: EventTarget | null): boolean {
 }
 
 export async function createQaLabApp(root: HTMLDivElement) {
+  const initialUrl = new URL(window.location.href);
+  const initialEvidencePath =
+    initialUrl.searchParams.get("evidencePath")?.trim() ||
+    initialUrl.searchParams.get("path")?.trim() ||
+    "";
   const state: UiState = {
     theme: detectTheme(),
     bootstrap: null,
@@ -202,6 +198,13 @@ export async function createQaLabApp(root: HTMLDivElement) {
     captureErrorsOnly: false,
     captureCoverage: null,
     captureStartupStatus: null,
+    evidence: null,
+    evidenceArtifactFilter: "all",
+    evidenceError: null,
+    evidenceLoading: false,
+    evidencePathDraft: initialEvidencePath,
+    evidenceSearchText: "",
+    evidenceStatusFilter: "all",
     captureControlsExpanded: false,
     captureSummaryExpanded: false,
     captureSavedViews: loadCaptureSavedViews(),
@@ -212,12 +215,14 @@ export async function createQaLabApp(root: HTMLDivElement) {
     capturePinnedLaneIds: [],
     selectedCaptureSessionIds: [],
     selectedCaptureEventKey: null,
-    selectedConversationId: null,
+    selectedEvidenceEntryKey: null,
+    selectedConversationKey: null,
     selectedThreadId: null,
     selectedScenarioId: null,
-    activeTab: "chat",
+    activeTab: initialUrl.pathname === "/evidence" || initialEvidencePath ? "evidence" : "chat",
     runnerDraft: null,
     runnerDraftDirty: false,
+    runnerPlanOverride: null,
     composer: {
       conversationKind: "direct",
       conversationId: "alice",
@@ -247,77 +252,6 @@ export async function createQaLabApp(root: HTMLDivElement) {
   let sparklineSweepCurrentEndPct: number | null = null;
   let captureGlobalListenersBound = false;
 
-  function stateFingerprint(): string {
-    const msgs = state.snapshot?.messages;
-    const ev = state.snapshot?.events;
-    return JSON.stringify({
-      mc: msgs?.length ?? 0,
-      lm: msgs && msgs.length > 0 ? msgs[msgs.length - 1].id : null,
-      cc: state.snapshot?.conversations.length ?? 0,
-      tc: state.snapshot?.threads.length ?? 0,
-      ec: ev?.length ?? 0,
-      lc: ev && ev.length > 0 ? ev[ev.length - 1].cursor : -1,
-      rs: state.bootstrap?.runner.status,
-      ra: state.bootstrap?.runner.startedAt,
-      rf: state.bootstrap?.runner.finishedAt,
-      re: state.bootstrap?.runner.error,
-      ss: state.scenarioRun?.status,
-      sc: state.scenarioRun?.counts,
-      so: state.scenarioRun?.scenarios.map((o) => o.status).join(","),
-      rp: state.latestReport?.generatedAt,
-      cs: state.bootstrap?.runnerCatalog.status,
-      cl: state.bootstrap?.runnerCatalog.real.length ?? 0,
-      cps: state.captureSessions.length,
-      cse: state.captureSessions[0]?.eventCount ?? 0,
-      cei: state.selectedCaptureSessionIds.join(","),
-      cec: state.captureEvents.length,
-      ceh: state.captureEvents[0]?.host ?? null,
-      ccp: state.captureQueryPreset,
-      ccq: state.captureQueryRows.length,
-      ccv: state.captureCoverage?.totalEvents ?? 0,
-      ccpv: state.captureCoverage?.providers[0]?.value ?? null,
-      ccss: state.captureStartupStatus?.proxy.ok ?? null,
-      ccsg: state.captureStartupStatus?.gateway.ok ?? null,
-      ccce: state.captureControlsExpanded,
-      ccse: state.captureSummaryExpanded,
-      ccsx: state.captureSelectedSessionsExpanded,
-      ccsv: state.captureSavedViews.map((view) => `${view.id}:${view.name}`).join("|"),
-      scc: state.sidebarCollapsed,
-      scp: state.sidebarPanel,
-      cck: state.captureKindFilter.join(","),
-      ccpf: state.captureProviderFilter.join(","),
-      cchf: state.captureHostFilter.join(","),
-      cchm: state.captureHeaderMode,
-      ccgm: state.captureGroupMode,
-      cctl: state.captureTimelineLaneMode,
-      ccts: state.captureTimelineLaneSort,
-      cctps: state.captureTimelinePreviousLaneSort,
-      cctq: state.captureTimelineLaneSearch,
-      cctz: state.captureTimelineZoom,
-      cctsm: state.captureTimelineSparklineMode,
-      cctws: state.captureTimelineWindowStartPct,
-      cctwe: state.captureTimelineWindowEndPct,
-      cctba: state.captureTimelineBrushAnchorPct,
-      cctbc: state.captureTimelineBrushCurrentPct,
-      cctff: state.captureTimelineFocusSelectedFlow,
-      cctfm: state.captureTimelineFocusedLaneMode,
-      cctft: state.captureTimelineFocusedLaneThreshold,
-      ccdp: state.captureDetailPlacement,
-      ccds: state.captureDetailSplitPct,
-      ccdsd: state.captureDetailSplitDragging,
-      ccdv: state.captureDetailView,
-      ccpdv: state.capturePreferredDetailView,
-      ccdfl: state.captureFlowDetailLayout,
-      ccdpl: state.capturePayloadDetailLayout,
-      ccdpe: state.capturePayloadExtent,
-      ccpes: state.capturePayloadEventSort,
-      ccpef: state.capturePayloadEventFilter,
-      ccli: state.captureCollapsedLaneIds.join(","),
-      ccpi: state.capturePinnedLaneIds.join(","),
-      er: state.error,
-    });
-  }
-
   function isSelectOpen(): boolean {
     const active = document.activeElement;
     return active !== null && root.contains(active) && active.tagName === "SELECT";
@@ -329,7 +263,7 @@ export async function createQaLabApp(root: HTMLDivElement) {
     try {
       const [bootstrap, snapshot, report, outcomes] = await Promise.all([
         getJson<Bootstrap>("/api/bootstrap"),
-        getJson<Snapshot>("/api/state"),
+        getJson<QaBusStateSnapshot>("/api/state"),
         getJson<ReportEnvelope>("/api/report"),
         getJson<OutcomesEnvelope>("/api/outcomes"),
       ]);
@@ -337,15 +271,18 @@ export async function createQaLabApp(root: HTMLDivElement) {
       state.snapshot = snapshot;
       state.latestReport = report.report ?? bootstrap.latestReport;
       state.scenarioRun = outcomes.run;
+      if (!state.evidencePathDraft.trim() && bootstrap.runner.artifacts?.evidencePath) {
+        state.evidencePathDraft = bootstrap.runner.artifacts.evidencePath;
+      }
       if (!state.runnerDraft || !state.runnerDraftDirty) {
-        state.runnerDraft = {
-          ...bootstrap.runner.selection,
-          scenarioIds: [...bootstrap.runner.selection.scenarioIds],
-        };
+        state.runnerDraft = cloneRunnerSelection(bootstrap.runner.selection);
         state.runnerDraftDirty = false;
       }
-      if (!state.selectedConversationId) {
-        state.selectedConversationId = snapshot.conversations[0]?.id ?? null;
+      if (!state.selectedConversationKey) {
+        const firstConversation = snapshot.conversations[0];
+        state.selectedConversationKey = firstConversation
+          ? conversationSelectionKey(firstConversation)
+          : null;
       }
       if (!state.selectedScenarioId) {
         state.selectedScenarioId = bootstrap.scenarios[0]?.id ?? null;
@@ -457,7 +394,7 @@ export async function createQaLabApp(root: HTMLDivElement) {
     previousRunnerStatus = currentRunnerStatus;
 
     /* Only re-render when data actually changed; defer if a <select> is open */
-    const fp = stateFingerprint();
+    const fp = stateFingerprint(state);
     if (fp !== lastFingerprint) {
       lastFingerprint = fp;
       renderDeferred = true;
@@ -491,13 +428,14 @@ export async function createQaLabApp(root: HTMLDivElement) {
   function updateRunnerDraft(mutator: (draft: RunnerSelection) => RunnerSelection) {
     const fallback = state.bootstrap?.runner.selection;
     if (!state.runnerDraft && fallback) {
-      state.runnerDraft = { ...fallback, scenarioIds: [...fallback.scenarioIds] };
+      state.runnerDraft = cloneRunnerSelection(fallback);
     }
     if (!state.runnerDraft) {
       return;
     }
     state.runnerDraft = mutator(state.runnerDraft);
     state.runnerDraftDirty = true;
+    state.runnerPlanOverride = null;
     render();
   }
 
@@ -557,18 +495,34 @@ export async function createQaLabApp(root: HTMLDivElement) {
     state.error = null;
     render();
     try {
+      const selectedConversation = findConversationBySelectionKey(
+        state.snapshot?.conversations ?? [],
+        state.selectedConversationKey,
+      );
+      const accountId = selectedConversation?.accountId ?? "default";
+      const selectedThreadId =
+        selectedConversation?.id === conversationId &&
+        selectedConversation.kind === state.composer.conversationKind
+          ? state.selectedThreadId
+          : null;
       await postJson("/api/inbound/message", {
+        accountId,
         conversation: {
           id: conversationId,
           kind: state.composer.conversationKind,
-          ...(state.composer.conversationKind === "channel" ? { title: conversationId } : {}),
+          ...(state.composer.conversationKind !== "direct" ? { title: conversationId } : {}),
         },
         senderId: state.composer.senderId.trim() || "alice",
         senderName: state.composer.senderName.trim() || undefined,
         text,
-        ...(state.selectedThreadId ? { threadId: state.selectedThreadId } : {}),
+        ...(selectedThreadId ? { threadId: selectedThreadId } : {}),
       });
-      state.selectedConversationId = conversationId;
+      state.selectedConversationKey = conversationSelectionKey({
+        accountId,
+        id: conversationId,
+        kind: state.composer.conversationKind,
+      });
+      state.selectedThreadId = selectedThreadId;
       state.composer.text = "";
       chatScrollLocked = true;
       await refresh();
@@ -594,24 +548,67 @@ export async function createQaLabApp(root: HTMLDivElement) {
       const result = await postJson<{ runner: { selection: RunnerSelection } }>(
         "/api/scenario/suite",
         {
+          profile: state.runnerDraft.profile,
+          channel: state.runnerDraft.channel,
+          channelDriver: state.runnerDraft.channelDriver,
+          evidenceMode: state.runnerDraft.evidenceMode,
           providerMode: state.runnerDraft.providerMode,
           primaryModel: state.runnerDraft.primaryModel,
           alternateModel: state.runnerDraft.alternateModel,
+          fastMode: state.runnerDraft.fastMode,
+          runtimePair: state.runnerDraft.runtimePair,
+          runtimePairLane: state.runnerDraft.runtimePairLane,
           scenarioIds: state.runnerDraft.scenarioIds,
         },
       );
-      state.runnerDraft = {
-        ...result.runner.selection,
-        scenarioIds: [...result.runner.selection.scenarioIds],
-      };
+      state.runnerDraft = cloneRunnerSelection(result.runner.selection);
       state.runnerDraftDirty = false;
+      state.runnerPlanOverride = null;
       state.activeTab = "chat";
       await refresh();
     } catch (error) {
+      if (error instanceof QaLabHttpError) {
+        const plan = (error.payload as { plan?: RunnerResolvedPlan } | null)?.plan;
+        if (plan) {
+          state.runnerPlanOverride = plan;
+          state.sidebarPanel = "run";
+        }
+      }
       state.error = formatErrorMessage(error);
       render();
     } finally {
       state.busy = false;
+      render();
+    }
+  }
+
+  async function loadEvidence(pathOverride?: string) {
+    const evidencePath = (pathOverride ?? state.evidencePathDraft).trim();
+    if (!evidencePath) {
+      state.evidenceError = "Evidence path is required.";
+      render();
+      return;
+    }
+    state.evidenceLoading = true;
+    state.evidenceError = null;
+    render();
+    try {
+      const payload = await getJson<EvidenceEnvelope>(
+        `/api/evidence?path=${encodeURIComponent(evidencePath)}`,
+      );
+      state.evidence = payload.evidence;
+      state.evidencePathDraft = payload.evidence?.evidencePath ?? evidencePath;
+      state.selectedEvidenceEntryKey = payload.evidence?.entries[0]?.key ?? null;
+      const url = new URL(window.location.href);
+      url.pathname = "/evidence";
+      url.searchParams.set("path", state.evidencePathDraft);
+      window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+    } catch (error) {
+      state.evidence = null;
+      state.selectedEvidenceEntryKey = null;
+      state.evidenceError = formatErrorMessage(error);
+    } finally {
+      state.evidenceLoading = false;
       render();
     }
   }
@@ -745,20 +742,15 @@ export async function createQaLabApp(root: HTMLDivElement) {
 
   function bindEvents() {
     /* Tabs */
-    root.querySelectorAll<HTMLElement>("[data-tab]").forEach((node) => {
-      node.addEventListener("click", () => {
-        const nextTab = node.dataset.tab as TabId | undefined;
-        if (nextTab) {
-          state.activeTab = nextTab;
-          render();
-        }
-      });
+    bindTabNavigation(root, (nextTab) => {
+      state.activeTab = nextTab;
+      render();
     });
 
     /* Conversation chips */
-    root.querySelectorAll<HTMLElement>("[data-conversation-id]").forEach((node) => {
+    root.querySelectorAll<HTMLElement>("[data-conversation-key]").forEach((node) => {
       node.addEventListener("click", () => {
-        state.selectedConversationId = node.dataset.conversationId ?? null;
+        state.selectedConversationKey = node.dataset.conversationKey ?? null;
         state.selectedThreadId = null;
         if (state.activeTab !== "chat") {
           state.activeTab = "chat";
@@ -775,9 +767,9 @@ export async function createQaLabApp(root: HTMLDivElement) {
           state.selectedThreadId = null;
         } else {
           state.selectedThreadId = val ?? null;
-          const conv = node.dataset.threadConv;
-          if (conv) {
-            state.selectedConversationId = conv;
+          const conversationKey = node.dataset.threadConversationKey;
+          if (conversationKey) {
+            state.selectedConversationKey = conversationKey;
           }
         }
         render();
@@ -831,6 +823,19 @@ export async function createQaLabApp(root: HTMLDivElement) {
     root
       .querySelector<HTMLElement>("[data-action='download-report']")
       ?.addEventListener("click", downloadReport);
+    root
+      .querySelector<HTMLElement>("[data-action='load-evidence']")
+      ?.addEventListener("click", () => void loadEvidence());
+    root
+      .querySelector<HTMLElement>("[data-action='open-run-evidence']")
+      ?.addEventListener("click", () => {
+        const evidencePath = state.bootstrap?.runner.artifacts?.evidencePath;
+        if (!evidencePath) {
+          return;
+        }
+        state.activeTab = "evidence";
+        void loadEvidence(evidencePath);
+      });
 
     /* Scenario All/None */
     root
@@ -844,7 +849,7 @@ export async function createQaLabApp(root: HTMLDivElement) {
     root
       .querySelector<HTMLElement>("[data-action='clear-scenarios']")
       ?.addEventListener("click", () => {
-        updateRunnerDraft((d) => ({ ...d, scenarioIds: [] }));
+        updateRunnerDraft((d) => ({ ...d, scenarioIds: null }));
       });
 
     /* Scenario toggles */
@@ -855,7 +860,13 @@ export async function createQaLabApp(root: HTMLDivElement) {
           return;
         }
         updateRunnerDraft((draft) => {
-          const selected = new Set(draft.scenarioIds);
+          const selected = new Set(
+            draft.scenarioIds ??
+              (!state.runnerDraftDirty
+                ? state.bootstrap?.runner.plan?.selectedScenarios.map((scenario) => scenario.id)
+                : undefined) ??
+              [],
+          );
           if (node.checked) {
             selected.add(scenarioId);
           } else {
@@ -870,6 +881,19 @@ export async function createQaLabApp(root: HTMLDivElement) {
     });
 
     /* Config form */
+    root.querySelector<HTMLSelectElement>("#run-profile")?.addEventListener("change", (e) => {
+      const profile = (e.currentTarget as HTMLSelectElement).value;
+      const profileDefaults = state.bootstrap?.runnerCatalog.profiles.find(
+        (entry) => entry.id === profile,
+      );
+      updateRunnerDraft((draft) => ({
+        ...draft,
+        profile,
+        channelDriver: profileDefaults?.channelDriver ?? draft.channelDriver,
+        evidenceMode: profileDefaults?.evidenceMode ?? draft.evidenceMode,
+        scenarioIds: null,
+      }));
+    });
     root.querySelector<HTMLSelectElement>("#provider-mode")?.addEventListener("change", (e) => {
       const mode =
         (e.currentTarget as HTMLSelectElement).value === "live-frontier"
@@ -880,6 +904,33 @@ export async function createQaLabApp(root: HTMLDivElement) {
         providerMode: mode,
         ...defaultModelsForProviderMode(mode, state.bootstrap),
       }));
+    });
+    root.querySelector<HTMLSelectElement>("#channel-driver")?.addEventListener("change", (e) => {
+      const value = (e.currentTarget as HTMLSelectElement).value;
+      const channelDriver = value === "crabline" || value === "live" ? value : "qa-channel";
+      updateRunnerDraft((draft) => ({ ...draft, channelDriver }));
+    });
+    root.querySelector<HTMLSelectElement>("#execution-channel")?.addEventListener("change", (e) => {
+      const channel = (e.currentTarget as HTMLSelectElement).value.trim() || null;
+      updateRunnerDraft((draft) => ({ ...draft, channel }));
+    });
+    root.querySelector<HTMLSelectElement>("#evidence-mode")?.addEventListener("change", (e) => {
+      const evidenceMode =
+        (e.currentTarget as HTMLSelectElement).value === "slim" ? "slim" : "full";
+      updateRunnerDraft((draft) => ({ ...draft, evidenceMode }));
+    });
+    root.querySelector<HTMLSelectElement>("#runtime-pair")?.addEventListener("change", (e) => {
+      const runtimePair: RunnerSelection["runtimePair"] =
+        (e.currentTarget as HTMLSelectElement).value === "openclaw,codex"
+          ? ["openclaw", "codex"]
+          : null;
+      updateRunnerDraft((draft) => ({ ...draft, runtimePair }));
+    });
+    root.querySelector<HTMLSelectElement>("#runtime-pair-lane")?.addEventListener("change", (e) => {
+      const value = (e.currentTarget as HTMLSelectElement).value;
+      const runtimePairLane =
+        value === "core" || value === "extended" || value === "soak" ? value : null;
+      updateRunnerDraft((draft) => ({ ...draft, runtimePairLane }));
     });
     root.querySelector<HTMLSelectElement>("#primary-model")?.addEventListener("change", (e) => {
       const primaryModel = (e.currentTarget as HTMLSelectElement).value;
@@ -896,6 +947,53 @@ export async function createQaLabApp(root: HTMLDivElement) {
         alternateModel,
         fastMode: isQaFastModeEnabled({ primaryModel: d.primaryModel, alternateModel }),
       }));
+    });
+
+    root.querySelector<HTMLInputElement>("#evidence-path")?.addEventListener("input", (e) => {
+      state.evidencePathDraft = (e.currentTarget as HTMLInputElement).value;
+    });
+    root.querySelector<HTMLInputElement>("#evidence-path")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void loadEvidence();
+      }
+    });
+    root
+      .querySelector<HTMLSelectElement>("#evidence-status-filter")
+      ?.addEventListener("change", (e) => {
+        const value = (e.currentTarget as HTMLSelectElement).value;
+        state.evidenceStatusFilter =
+          value === "pass" || value === "fail" || value === "blocked" || value === "skipped"
+            ? value
+            : "all";
+        state.selectedEvidenceEntryKey = null;
+        render();
+      });
+    root
+      .querySelector<HTMLSelectElement>("#evidence-artifact-filter")
+      ?.addEventListener("change", (e) => {
+        const value = (e.currentTarget as HTMLSelectElement).value;
+        state.evidenceArtifactFilter =
+          value === "image" ||
+          value === "video" ||
+          value === "json" ||
+          value === "text" ||
+          value === "file"
+            ? value
+            : "all";
+        state.selectedEvidenceEntryKey = null;
+        render();
+      });
+    root.querySelector<HTMLInputElement>("#evidence-search")?.addEventListener("input", (e) => {
+      state.evidenceSearchText = (e.currentTarget as HTMLInputElement).value;
+      state.selectedEvidenceEntryKey = null;
+      render();
+    });
+    root.querySelectorAll<HTMLElement>("[data-evidence-entry-key]").forEach((node) => {
+      node.addEventListener("click", () => {
+        state.selectedEvidenceEntryKey = node.dataset.evidenceEntryKey ?? null;
+        render();
+      });
     });
 
     root.querySelector<HTMLSelectElement>("#capture-session")?.addEventListener("change", (e) => {
@@ -1561,8 +1659,9 @@ export async function createQaLabApp(root: HTMLDivElement) {
 
     /* Composer form */
     root.querySelector<HTMLSelectElement>("#conversation-kind")?.addEventListener("change", (e) => {
+      const selectedKind = (e.currentTarget as HTMLSelectElement).value;
       state.composer.conversationKind =
-        (e.currentTarget as HTMLSelectElement).value === "channel" ? "channel" : "direct";
+        selectedKind === "channel" || selectedKind === "group" ? selectedKind : "direct";
     });
     root.querySelector<HTMLInputElement>("#conversation-id")?.addEventListener("input", (e) => {
       state.composer.conversationId = (e.currentTarget as HTMLInputElement).value;
@@ -1642,7 +1741,11 @@ export async function createQaLabApp(root: HTMLDivElement) {
 
   render();
   await refresh();
+  if (initialEvidencePath) {
+    await loadEvidence(initialEvidencePath);
+  }
   void pollUiVersion();
   setInterval(() => void refresh(), 1_000);
   setInterval(() => void pollUiVersion(), 1_000);
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

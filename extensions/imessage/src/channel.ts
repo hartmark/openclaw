@@ -1,33 +1,36 @@
+import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
+// Imessage plugin module implements channel behavior.
 import { buildDmGroupAccountAllowlistAdapter } from "openclaw/plugin-sdk/allowlist-config-edit";
-import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
+import type { ChannelApprovalKind } from "openclaw/plugin-sdk/approval-handler-runtime";
+import { formatTrimmedAllowFromEntries } from "openclaw/plugin-sdk/channel-config-helpers";
+import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import {
   createMessageReceiptFromOutboundResults,
   defineChannelMessageAdapter,
   type ChannelMessageSendResult,
   type MessageReceiptPartKind,
+  sanitizeForPlainText,
 } from "openclaw/plugin-sdk/channel-outbound";
-import { sanitizeForPlainText } from "openclaw/plugin-sdk/channel-outbound";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-result";
+import { PAIRING_APPROVED_MESSAGE } from "openclaw/plugin-sdk/channel-status";
 import { buildPassiveProbedChannelStatusSummary } from "openclaw/plugin-sdk/extension-shared";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import { questionGatewayRuntime } from "openclaw/plugin-sdk/question-gateway-runtime";
+import { chunkMarkdownText } from "openclaw/plugin-sdk/reply-runtime";
 import { buildOutboundBaseSessionKey, type RoutePeer } from "openclaw/plugin-sdk/routing";
 import {
+  collectStatusIssuesFromLastError,
   createComputedAccountStatusAdapter,
   createDefaultChannelRuntimeState,
 } from "openclaw/plugin-sdk/status-helpers";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveIMessageAccount, type ResolvedIMessageAccount } from "./accounts.js";
 import { imessageMessageActions } from "./actions.js";
 import {
   imessageApprovalCapability,
   shouldSuppressLocalIMessageExecApprovalPrompt,
 } from "./approval-native.js";
-import {
-  chunkTextForOutbound,
-  collectStatusIssuesFromLastError,
-  DEFAULT_ACCOUNT_ID,
-  formatTrimmedAllowFromEntries,
-  normalizeIMessageMessagingTarget,
-  type ChannelPlugin,
-} from "./channel-api.js";
+import { resolveIMessageDirectChatService } from "./chat-context.js";
 import { createIMessageConversationBindingManager } from "./conversation-bindings.js";
 import {
   matchIMessageAcpConversation,
@@ -39,15 +42,20 @@ import {
   resolveIMessageGroupRequireMention,
   resolveIMessageGroupToolPolicy,
 } from "./group-policy.js";
-import { sanitizeOutboundText } from "./monitor/sanitize-outbound.js";
+import {
+  sanitizeIMessageFinalOutboundText,
+  sanitizeOutboundText,
+} from "./monitor/sanitize-outbound.js";
+import { normalizeIMessageMessagingTarget } from "./normalize.js";
 import type { IMessageProbe } from "./probe.js";
-import { imessageSetupAdapter } from "./setup-core.js";
+import { imessageSetupContract } from "./setup-core.js";
 import {
   createIMessagePluginBase,
   imessageSecurityAdapter,
   imessageSetupWizard,
 } from "./shared.js";
 import { probeIMessageStatusAccount } from "./status-core.js";
+import { isIMessagePhoneLikeHandle } from "./target-identifiers.js";
 import {
   inferIMessageTargetChatType,
   looksLikeIMessageExplicitTargetId,
@@ -59,13 +67,18 @@ const loadIMessageChannelRuntime = createLazyRuntimeModule(() => import("./chann
 
 type IMessageMessageContextExtras = {
   deps?: { [channelId: string]: unknown };
+  conversationReadOrigin?: "delegated" | "direct-operator";
 };
 
 function toIMessageMessageSendResult(
-  result: { messageId?: string; receipt?: ChannelMessageSendResult["receipt"] },
+  result: {
+    messageId?: string;
+    meta?: Record<string, unknown>;
+    receipt?: ChannelMessageSendResult["receipt"];
+  },
   kind: MessageReceiptPartKind,
   replyToId?: string | null,
-): ChannelMessageSendResult {
+): ChannelMessageSendResult & { meta?: Record<string, unknown> } {
   const receipt =
     result.receipt ??
     createMessageReceiptFromOutboundResults({
@@ -76,7 +89,52 @@ function toIMessageMessageSendResult(
   return {
     messageId: result.messageId || receipt.primaryPlatformMessageId,
     receipt,
+    ...(result.meta && Object.keys(result.meta).length > 0 ? { meta: result.meta } : {}),
   };
+}
+
+const loadIMessageApprovalReactionsModule = createLazyRuntimeModule(
+  () => import("./approval-reactions.js"),
+);
+const loadIMessageQuestionReactionsModule = createLazyRuntimeModule(
+  () => import("./question-reactions.js"),
+);
+
+async function prepareForwardedIMessageApprovalPayload(params: {
+  payload: Parameters<NonNullable<ChannelOutboundAdapter["beforeDeliverPayload"]>>[0]["payload"];
+  approvalKind: ChannelApprovalKind;
+}): Promise<void> {
+  const prepared = (
+    await loadIMessageApprovalReactionsModule()
+  ).addIMessageApprovalReactionHintToStructuredPayload(params);
+  if (prepared) {
+    Object.assign(params.payload, prepared);
+  }
+}
+
+async function registerDeliveredIMessageApprovalPayload(
+  params: Parameters<NonNullable<ChannelOutboundAdapter["afterDeliverPayload"]>>[0],
+): Promise<void> {
+  const accountId = resolveIMessageAccount({
+    cfg: params.cfg,
+    accountId: params.target.accountId,
+  }).accountId;
+  (
+    await loadIMessageQuestionReactionsModule()
+  ).registerIMessageQuestionReactionTargetForDeliveredPayload({
+    accountId,
+    target: params.target,
+    payload: params.payload,
+    results: params.results,
+  });
+  await (
+    await loadIMessageApprovalReactionsModule()
+  ).registerIMessageApprovalReactionTargetForDeliveredPayload({
+    accountId,
+    target: params.target,
+    payload: params.payload,
+    results: params.results,
+  });
 }
 
 const imessageMessageAdapter = defineChannelMessageAdapter({
@@ -100,6 +158,10 @@ const imessageMessageAdapter = defineChannelMessageAdapter({
         accountId: ctx.accountId ?? undefined,
         deps: (ctx as typeof ctx & IMessageMessageContextExtras).deps,
         replyToId: ctx.replyToId ?? undefined,
+        assertDirectAdapterHandoff: ctx.assertDirectAdapterHandoff,
+        onPlatformSendDispatch: ctx.onPlatformSendDispatch,
+        conversationReadOrigin: (ctx as typeof ctx & IMessageMessageContextExtras)
+          .conversationReadOrigin,
       });
       return toIMessageMessageSendResult(result, "text", ctx.replyToId);
     },
@@ -111,12 +173,36 @@ const imessageMessageAdapter = defineChannelMessageAdapter({
         to: ctx.to,
         text: ctx.text,
         mediaUrl: ctx.mediaUrl,
+        mediaAccess: ctx.mediaAccess,
         mediaLocalRoots: ctx.mediaLocalRoots,
+        mediaReadFile: ctx.mediaReadFile,
+        audioAsVoice: ctx.audioAsVoice,
         accountId: ctx.accountId ?? undefined,
         deps: (ctx as typeof ctx & IMessageMessageContextExtras).deps,
         replyToId: ctx.replyToId ?? undefined,
+        assertDirectAdapterHandoff: ctx.assertDirectAdapterHandoff,
+        onPlatformSendDispatch: ctx.onPlatformSendDispatch,
+        conversationReadOrigin: (ctx as typeof ctx & IMessageMessageContextExtras)
+          .conversationReadOrigin,
+        ...(ctx.onDeliveryResult
+          ? {
+              onDeliveryResult: async (acceptedResult) => {
+                await ctx.onDeliveryResult?.(
+                  toIMessageMessageSendResult(
+                    acceptedResult,
+                    ctx.audioAsVoice ? "voice" : "media",
+                    ctx.replyToId,
+                  ),
+                );
+              },
+            }
+          : {}),
       });
-      return toIMessageMessageSendResult(result, "media", ctx.replyToId);
+      return toIMessageMessageSendResult(
+        result,
+        ctx.audioAsVoice ? "voice" : "media",
+        ctx.replyToId,
+      );
     },
   },
 });
@@ -128,6 +214,19 @@ function buildIMessageBaseSessionKey(params: {
   peer: RoutePeer;
 }) {
   return buildOutboundBaseSessionKey({ ...params, channel: "imessage" });
+}
+
+function isCanonicalIMessageDirectHandle(raw: string, normalized: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed || !normalized) {
+    return false;
+  }
+  // Inbound DMs key sessions by normalized phone number or email. Names and
+  // other bridge aliases can deliver, but cannot prove the reply identity.
+  if (normalized.startsWith("+")) {
+    return isIMessagePhoneLikeHandle(trimmed);
+  }
+  return /^[^\s@<>()[\]`]+@[^\s@<>()[\]`]+\.[^\s@<>()[\]`]+$/.test(trimmed);
 }
 
 function resolveIMessageOutboundSessionRoute(params: {
@@ -144,11 +243,9 @@ function resolveIMessageOutboundSessionRoute(params: {
     }
     const account = resolveIMessageAccount({ cfg: params.cfg, accountId: params.accountId });
     const service =
-      parsed.serviceExplicit || parsed.service !== "auto"
-        ? parsed.service
-        : account.config.service === "sms"
-          ? "sms"
-          : "imessage";
+      resolveIMessageDirectChatService(
+        parsed.serviceExplicit ? parsed.service : account.config.service,
+      ) ?? "auto";
     const directTarget = `${service}:${handle}`;
     const peer: RoutePeer = { kind: "direct", id: handle };
     const baseSessionKey = buildIMessageBaseSessionKey({
@@ -160,6 +257,7 @@ function resolveIMessageOutboundSessionRoute(params: {
     return {
       sessionKey: baseSessionKey,
       baseSessionKey,
+      recipientSessionExact: isCanonicalIMessageDirectHandle(parsed.to, handle),
       peer,
       chatType: "direct" as const,
       from: directTarget,
@@ -192,6 +290,7 @@ function resolveIMessageOutboundSessionRoute(params: {
   return {
     sessionKey: baseSessionKey,
     baseSessionKey,
+    recipientSessionExact: false,
     peer,
     chatType: "group" as const,
     from: `imessage:group:${peerId}`,
@@ -204,7 +303,7 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
     base: {
       ...createIMessagePluginBase({
         setupWizard: imessageSetupWizard,
-        setup: imessageSetupAdapter,
+        setupContract: imessageSetupContract,
       }),
       allowlist: buildDmGroupAccountAllowlistAdapter({
         channelId: "imessage",
@@ -219,9 +318,15 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
         resolveRequireMention: resolveIMessageGroupRequireMention,
         resolveToolPolicy: resolveIMessageGroupToolPolicy,
       },
+      agentPrompt: {
+        messageToolHints: () => [
+          "- iMessage current conversation: omit target, to, chatId, chatGuid, and chatIdentifier. OpenClaw resolves the trusted current chat server-side; never copy a redacted display value such as `***` into message actions.",
+        ],
+      },
       doctor: imessageDoctor,
       conversationBindings: {
         supportsCurrentConversationBinding: true,
+        bindingStore: "adapter",
         createManager: ({ cfg, accountId }) =>
           createIMessageConversationBindingManager({
             cfg,
@@ -250,9 +355,9 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
         resolveOutboundSessionRoute: (params) => resolveIMessageOutboundSessionRoute(params),
         targetResolver: {
           looksLikeId: looksLikeIMessageExplicitTargetId,
-          hint: "<handle|chat_id:ID>",
-          resolveTarget: async ({ normalized }) => {
-            const to = normalized?.trim();
+          hint: "<phone|email|chat_id:ID|auto:contact|imessage:contact|sms:contact>",
+          resolveTarget: async ({ input }) => {
+            const to = normalizeIMessageMessagingTarget(input);
             if (!to) {
               return null;
             }
@@ -260,9 +365,16 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
             if (!chatType) {
               return null;
             }
+            const parsed = parseIMessageTarget(to);
+            const display =
+              parsed.kind === "handle" &&
+              !isCanonicalIMessageDirectHandle(parsed.to, normalizeIMessageHandle(parsed.to))
+                ? parsed.to.trim()
+                : undefined;
             return {
               to,
               kind: chatType === "direct" ? "user" : "group",
+              ...(display ? { display } : {}),
               source: "normalized" as const,
             };
           },
@@ -318,21 +430,75 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
     pairing: {
       text: {
         idLabel: "imessageSenderId",
-        message: "OpenClaw: your access has been approved.",
-        notify: async ({ id, cfg }) =>
-          await (await loadIMessageChannelRuntime()).notifyIMessageApproval({ id, cfg }),
+        message: PAIRING_APPROVED_MESSAGE,
+        notify: async (params) => {
+          await (
+            await loadIMessageChannelRuntime()
+          ).sendIMessageOutbound({
+            ...params,
+            to: params.id,
+            text: params.message,
+          });
+        },
       },
     },
     security: imessageSecurityAdapter,
+    threading: {
+      resolveReplyTransport: ({
+        cfg,
+        accountId,
+        replyToId,
+        currentMessageId,
+        replyToCurrent,
+        replyToIsExplicit,
+        replyDelivery,
+      }) => {
+        const account = resolveIMessageAccount({ cfg, accountId });
+        if (account.config.actions?.reply === false) {
+          return { replyToId: null };
+        }
+        const existingReplyToId = normalizeOptionalString(replyToId);
+        const explicitCurrentReply = replyToIsExplicit === true && replyToCurrent === true;
+        // Queued replies carry the originating message separately from explicit reply targets.
+        const implicitReplyToId =
+          replyToCurrent === false ||
+          (replyDelivery?.replyToMode === "off" && !explicitCurrentReply)
+            ? undefined
+            : normalizeOptionalString(currentMessageId);
+        return {
+          replyToId: existingReplyToId ?? implicitReplyToId ?? null,
+          ...(!existingReplyToId && !explicitCurrentReply && implicitReplyToId
+            ? { replyToIdSource: "implicit" as const }
+            : {}),
+        };
+      },
+    },
     outbound: {
       base: {
         deliveryMode: "direct",
-        chunker: chunkTextForOutbound,
-        chunkerMode: "text",
+        chunker: chunkMarkdownText,
+        chunkerMode: "markdown",
         textChunkLimit: 4000,
-        sanitizeText: ({ text }) => sanitizeForPlainText(sanitizeOutboundText(text)),
+        // Native formatting consumes Markdown ranges, so preserve bold and strike semantics.
+        sanitizeText: ({ text }) =>
+          sanitizeForPlainText(sanitizeIMessageFinalOutboundText(sanitizeOutboundText(text)).text, {
+            style: "markdown",
+          }),
         shouldSuppressLocalPayloadPrompt: ({ cfg, accountId, payload, hint }) =>
           shouldSuppressLocalIMessageExecApprovalPrompt({ cfg, accountId, payload, hint }),
+        beforeDeliverPayload: async ({ payload, hint }) => {
+          if (hint?.kind !== "approval-pending") {
+            return;
+          }
+          await prepareForwardedIMessageApprovalPayload({
+            payload,
+            approvalKind: hint.approvalKind,
+          });
+        },
+        renderPresentation: ({ payload, presentation }) =>
+          questionGatewayRuntime.prepareReactionPayloadForDelivery({ payload, presentation }),
+        afterDeliverPayload: async (params) =>
+          await registerDeliveredIMessageApprovalPayload(params),
         deliveryCapabilities: {
           durableFinal: {
             text: true,
@@ -344,7 +510,16 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
       },
       attachedResults: {
         channel: "imessage",
-        sendText: async ({ cfg, to, text, accountId, deps, replyToId }) =>
+        sendText: async ({
+          cfg,
+          to,
+          text,
+          accountId,
+          deps,
+          replyToId,
+          assertDirectAdapterHandoff,
+          onPlatformSendDispatch,
+        }) =>
           await (
             await loadIMessageChannelRuntime()
           ).sendIMessageOutbound({
@@ -354,16 +529,24 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
             accountId: accountId ?? undefined,
             deps,
             replyToId: replyToId ?? undefined,
+            assertDirectAdapterHandoff,
+            onPlatformSendDispatch,
           }),
         sendMedia: async ({
           cfg,
           to,
           text,
           mediaUrl,
+          mediaAccess,
           mediaLocalRoots,
+          mediaReadFile,
+          audioAsVoice,
           accountId,
           deps,
           replyToId,
+          onDeliveryResult,
+          assertDirectAdapterHandoff,
+          onPlatformSendDispatch,
         }) =>
           await (
             await loadIMessageChannelRuntime()
@@ -372,10 +555,30 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
             to,
             text,
             mediaUrl,
+            mediaAccess,
             mediaLocalRoots,
+            mediaReadFile,
+            audioAsVoice,
             accountId: accountId ?? undefined,
             deps,
             replyToId: replyToId ?? undefined,
+            assertDirectAdapterHandoff,
+            onPlatformSendDispatch,
+            ...(onDeliveryResult
+              ? {
+                  onDeliveryResult: async (result) => {
+                    await onDeliveryResult({
+                      channel: "imessage",
+                      ...toIMessageMessageSendResult(
+                        result,
+                        audioAsVoice ? "voice" : "media",
+                        replyToId,
+                      ),
+                      messageId: result.messageId,
+                    });
+                  },
+                }
+              : {}),
           }),
       },
     },

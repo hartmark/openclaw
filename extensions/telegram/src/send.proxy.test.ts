@@ -1,232 +1,165 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { Bot } from "grammy";
+import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { asTelegramClientFetch } from "./client-fetch.js";
+import { TelegramRequestNotStartedError } from "./network-errors.js";
+import {
+  deleteMessageTelegram,
+  reactMessageTelegram,
+  resetTelegramClientOptionsCacheForTests,
+  sendMessageTelegram,
+} from "./send.js";
+import * as sendRuntime from "./send.runtime.js";
+import { useTelegramHttpFixture } from "./send.telegram-http.test-support.js";
+import * as targetWriteback from "./target-writeback.js";
 
-const { botApi, botCtorSpy } = vi.hoisted(() => ({
-  botApi: {
-    config: { use: vi.fn() },
-    sendMessage: vi.fn(),
-    setMessageReaction: vi.fn(),
-    deleteMessage: vi.fn(),
-  },
-  botCtorSpy: vi.fn(),
-}));
+describe("Telegram operation leases through real clients", () => {
+  const fixture = useTelegramHttpFixture();
+  afterEach(() => vi.restoreAllMocks());
 
-const { loadConfig } = vi.hoisted(() => ({
-  loadConfig: vi.fn(() => ({})),
-}));
-
-const { makeProxyFetch } = vi.hoisted(() => ({
-  makeProxyFetch: vi.fn(),
-}));
-
-const { resolveTelegramTransport } = vi.hoisted(() => ({
-  resolveTelegramTransport: vi.fn(),
-}));
-
-const resolveTelegramApiBase = vi.hoisted(
-  () => (apiRoot?: string) => apiRoot?.trim()?.replace(/\/+$/, "") || "https://api.telegram.org",
-);
-
-vi.mock("openclaw/plugin-sdk/plugin-config-runtime", async () => {
-  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/plugin-config-runtime")>(
-    "openclaw/plugin-sdk/plugin-config-runtime",
+  it.each(["media", "mutation"] as const)(
+    "keeps a retired transport usable while %s preparation is pending",
+    async (kind) => {
+      const entered = createDeferred<void>();
+      const release = createDeferred<void>();
+      if (kind === "media") {
+        const load = sendRuntime.loadWebMedia;
+        vi.spyOn(sendRuntime, "loadWebMedia").mockImplementationOnce(async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return load(...args);
+        });
+      } else {
+        const persist = targetWriteback.maybePersistResolvedTelegramTarget;
+        vi.spyOn(targetWriteback, "maybePersistResolvedTelegramTarget").mockImplementationOnce(
+          async (params) => {
+            entered.resolve();
+            await release.promise;
+            return persist(params);
+          },
+        );
+      }
+      const sending =
+        kind === "media"
+          ? sendMessageTelegram("123", "Caption", {
+              cfg: fixture.cfg,
+              mediaUrl: fixture.photoPath,
+              mediaLocalRoots: [fixture.mediaDir],
+            })
+          : reactMessageTelegram("123", 7, "❤", { cfg: fixture.cfg });
+      try {
+        await entered.promise;
+        resetTelegramClientOptionsCacheForTests();
+        expect(fixture.requests).toEqual([]);
+        release.resolve();
+        await sending;
+        expect(fixture.requests.map(({ method }) => method)).toEqual([
+          kind === "media" ? "sendPhoto" : "setMessageReaction",
+        ]);
+      } finally {
+        release.resolve();
+        await Promise.allSettled([sending]);
+      }
+    },
   );
-  return {
-    ...actual,
-    requireRuntimeConfig: (cfg: unknown) => cfg ?? loadConfig(),
-  };
-});
 
-vi.mock("./proxy.js", () => ({
-  makeProxyFetch,
-}));
-
-vi.mock("./fetch.js", () => ({
-  resolveTelegramTransport,
-  resolveTelegramApiBase,
-}));
-
-vi.mock("grammy", () => ({
-  API_CONSTANTS: {
-    DEFAULT_UPDATE_TYPES: ["message"],
-    ALL_UPDATE_TYPES: ["message"],
-  },
-  Bot: class {
-    api = botApi;
-    catch = vi.fn();
-    constructor(
-      public token: string,
-      public options?: { client?: { fetch?: typeof fetch; timeoutSeconds?: number } },
-    ) {
-      botCtorSpy(token, options);
+  it("holds the transport across Telegram's full flood-wait rather than the generic retry cap", async () => {
+    const scheduled = createDeferred<number>();
+    const release = createDeferred<void>();
+    const timer = global.setTimeout;
+    vi.spyOn(global, "setTimeout").mockImplementation((callback, delay, ...args) => {
+      if (delay === 45_000 || delay === 30_000) {
+        scheduled.resolve(delay);
+        return timer(() => {
+          void release.promise.then(() => callback(...args));
+        }, 0);
+      }
+      return timer(callback, delay, ...args);
+    });
+    fixture.rejections.push({
+      error_code: 429,
+      description: "Too Many Requests",
+      parameters: { retry_after: 45 },
+    });
+    const sending = sendMessageTelegram("123", "After flood wait", {
+      cfg: fixture.cfg,
+      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 30_000, jitter: 0 },
+    });
+    try {
+      expect(await scheduled.promise).toBe(45_000);
+      expect(fixture.requests).toHaveLength(1);
+      resetTelegramClientOptionsCacheForTests();
+      release.resolve();
+      await expect(sending).resolves.toMatchObject({ messageId: "2" });
+      expect(fixture.requests.map(({ fields }) => fields.text)).toEqual([
+        "After flood wait",
+        "After flood wait",
+      ]);
+    } finally {
+      release.resolve();
+      await Promise.allSettled([sending]);
     }
-  },
-  GrammyError: class GrammyError extends Error {
-    description = "";
-  },
-  InputFile: function InputFile() {},
-}));
-
-let deleteMessageTelegram: typeof import("./send.js").deleteMessageTelegram;
-let reactMessageTelegram: typeof import("./send.js").reactMessageTelegram;
-let resetTelegramClientOptionsCacheForTests: typeof import("./send.js").resetTelegramClientOptionsCacheForTests;
-let sendMessageTelegram: typeof import("./send.js").sendMessageTelegram;
-
-describe("telegram proxy client", () => {
-  const proxyUrl = "http://proxy.test:8080";
-  const TELEGRAM_PROXY_CFG = {
-    channels: { telegram: { accounts: { foo: { proxy: proxyUrl } } } },
-  };
-
-  const prepareProxyFetch = () => {
-    const proxyFetch = vi.fn();
-    const fetchImpl = vi.fn();
-    makeProxyFetch.mockReturnValue(proxyFetch as unknown as typeof fetch);
-    resolveTelegramTransport.mockReturnValue({
-      fetch: fetchImpl as unknown as typeof fetch,
-      sourceFetch: fetchImpl as unknown as typeof fetch,
-      close: vi.fn(async () => undefined),
-    });
-    return { proxyFetch, fetchImpl };
-  };
-
-  const expectProxyClient = (params: { proxyFetch: ReturnType<typeof vi.fn> }) => {
-    expect(makeProxyFetch).toHaveBeenCalledWith(proxyUrl);
-    expect(resolveTelegramTransport).toHaveBeenCalledWith(params.proxyFetch, {
-      network: undefined,
-    });
-    expect(botCtorSpy).toHaveBeenCalledWith("tok", {
-      client: { fetch: expect.any(Function) },
-    });
-  };
-
-  beforeAll(async () => {
-    ({
-      deleteMessageTelegram,
-      reactMessageTelegram,
-      resetTelegramClientOptionsCacheForTests,
-      sendMessageTelegram,
-    } = await import("./send.js"));
   });
 
-  beforeEach(() => {
-    resetTelegramClientOptionsCacheForTests();
-    vi.unstubAllEnvs();
-    botApi.sendMessage.mockResolvedValue({ message_id: 1, chat: { id: "123" } });
-    botApi.setMessageReaction.mockResolvedValue(undefined);
-    botApi.deleteMessage.mockResolvedValue(true);
-    botApi.config.use.mockClear();
-    botCtorSpy.mockClear();
-    loadConfig.mockReturnValue(TELEGRAM_PROXY_CFG);
-    makeProxyFetch.mockClear();
-    resolveTelegramTransport.mockClear();
-  });
-
-  it("reuses cached Telegram client options for repeated sends with same account transport settings", async () => {
-    const { proxyFetch, fetchImpl: _fetchImpl } = prepareProxyFetch();
-    vi.stubEnv("VITEST", "");
-    vi.stubEnv("NODE_ENV", "production");
-
-    await sendMessageTelegram("123", "first", {
-      cfg: TELEGRAM_PROXY_CFG,
-      token: "tok",
-      accountId: "foo",
-    });
-    await sendMessageTelegram("123", "second", {
-      cfg: TELEGRAM_PROXY_CFG,
-      token: "tok",
-      accountId: "foo",
-    });
-
-    expect(makeProxyFetch).toHaveBeenCalledTimes(1);
-    expect(resolveTelegramTransport).toHaveBeenCalledTimes(1);
-    expect(botCtorSpy).toHaveBeenCalledTimes(2);
-    expect(resolveTelegramTransport).toHaveBeenCalledWith(proxyFetch, { network: undefined });
-    const firstOptions = botCtorSpy.mock.calls[0]?.[1];
-    expect(firstOptions).toEqual({ client: { fetch: expect.any(Function) } });
-    expect(botCtorSpy).toHaveBeenNthCalledWith(2, "tok", firstOptions);
-  });
-
-  it.each([
-    {
-      name: "sendMessage",
-      run: () =>
-        sendMessageTelegram("123", "hi", {
-          cfg: TELEGRAM_PROXY_CFG,
-          token: "tok",
-          accountId: "foo",
-        }),
+  it.each(["not-started", "connect-timeout", "ambiguous"] as const)(
+    "preserves %s custody through grammY's transport error envelope",
+    async (kind) => {
+      let attempts = 0;
+      const error =
+        kind === "not-started"
+          ? new TelegramRequestNotStartedError()
+          : kind === "connect-timeout"
+            ? Object.assign(new Error("Connect Timeout"), { code: "UND_ERR_CONNECT_TIMEOUT" })
+            : new Error("Network request for 'sendMessage' failed after 1 attempts.");
+      const bot = new Bot(fixture.cfg.channels.telegram.botToken, {
+        client: {
+          apiRoot: fixture.cfg.channels.telegram.apiRoot,
+          fetch: asTelegramClientFetch(async () => {
+            attempts += 1;
+            throw error;
+          }),
+        },
+      });
+      const sending = sendMessageTelegram("123", "Never accepted", {
+        cfg: fixture.cfg,
+        api: bot.api,
+        retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
+      });
+      if (kind === "not-started") {
+        await expect(sending).rejects.toBeInstanceOf(PlatformMessageNotDispatchedError);
+      } else {
+        await expect(sending).rejects.not.toBeInstanceOf(PlatformMessageNotDispatchedError);
+      }
+      expect(attempts).toBe(kind === "ambiguous" ? 1 : 2);
+      expect(fixture.requests).toEqual([]);
     },
-    {
-      name: "reactions",
-      run: () =>
-        reactMessageTelegram("123", "456", "✅", {
-          cfg: TELEGRAM_PROXY_CFG,
-          token: "tok",
-          accountId: "foo",
-        }),
-    },
-    {
-      name: "deleteMessage",
-      run: () =>
-        deleteMessageTelegram("123", "456", {
-          cfg: TELEGRAM_PROXY_CFG,
-          token: "tok",
-          accountId: "foo",
-        }),
-    },
-  ])("uses proxy fetch for $name", async (testCase) => {
-    const { proxyFetch } = prepareProxyFetch();
+  );
 
-    await testCase.run();
-
-    expectProxyClient({ proxyFetch });
-  });
-
-  it("wraps direct delete clients with the Telegram deleteMessage request timeout", async () => {
-    vi.useFakeTimers();
-    const { fetchImpl } = prepareProxyFetch();
-    fetchImpl.mockImplementation(
-      (_input: RequestInfo | URL, init?: RequestInit) =>
-        new Promise((_resolve, reject) => {
-          const signal = init?.signal as AbortSignal;
-          signal.addEventListener(
-            "abort",
-            () => reject(toLintErrorObject(signal.reason, "Non-Error rejection")),
-            { once: true },
-          );
-        }),
-    );
-
-    await deleteMessageTelegram("123", "456", {
-      cfg: TELEGRAM_PROXY_CFG,
-      token: "tok",
-      accountId: "foo",
+  it("bounds a direct delete request with the control-call deadline", async () => {
+    const held = { arrived: createDeferred<void>(), release: createDeferred<void>() };
+    fixture.requestHold = held;
+    const timer = global.setTimeout;
+    let deadlineObserved = false;
+    vi.spyOn(global, "setTimeout").mockImplementation((callback, delay, ...args) => {
+      if (delay === 15_000 && !deadlineObserved) {
+        deadlineObserved = true;
+        return timer(() => {
+          void held.arrived.promise.then(() => callback(...args));
+        }, 0);
+      }
+      return timer(callback, delay, ...args);
     });
-    const clientFetch = (botCtorSpy.mock.calls.at(-1)?.[1] as { client?: { fetch?: unknown } })
-      ?.client?.fetch as (input: RequestInfo | URL, init?: RequestInit) => Promise<unknown>;
-
-    const resultPromise = clientFetch("https://api.telegram.org/bot123456:ABC/deleteMessage");
-    const rejection = expect(resultPromise).rejects.toThrow(
-      "Telegram deletemessage timed out after 15000ms",
-    );
-    await vi.advanceTimersByTimeAsync(15_000);
-
-    await rejection;
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    vi.useRealTimers();
+    const deleting = deleteMessageTelegram("123", 7, { cfg: fixture.cfg, retry: { attempts: 1 } });
+    try {
+      await expect(deleting).rejects.toMatchObject({
+        error: { message: "Telegram deletemessage timed out after 15000ms" },
+      });
+      expect(deadlineObserved).toBe(true);
+      expect(fixture.requests.map(({ method }) => method)).toEqual(["deleteMessage"]);
+    } finally {
+      held.release.resolve();
+      await Promise.allSettled([deleting]);
+    }
   });
 });
-
-function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
-}

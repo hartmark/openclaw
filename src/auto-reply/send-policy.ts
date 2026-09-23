@@ -1,23 +1,11 @@
-import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+/** Parsing for the /send override command embedded in inbound auto-reply text. */
 import { normalizeCommandBody } from "./commands-registry.js";
+import { parseSendPolicyCommandBody } from "./reply/commands-slash-parse.js";
 import { stripInboundMetadata } from "./reply/strip-inbound-meta.js";
 
 type SendPolicyOverride = "allow" | "deny";
 
-function normalizeSendPolicyOverride(raw?: string | null): SendPolicyOverride | undefined {
-  const value = normalizeOptionalLowercaseString(raw);
-  if (!value) {
-    return undefined;
-  }
-  if (value === "allow" || value === "on") {
-    return "allow";
-  }
-  if (value === "deny" || value === "off") {
-    return "deny";
-  }
-  return undefined;
-}
-
+/** Parses /send commands and maps user-facing aliases to allow, deny, or inherit. */
 export function parseSendPolicyCommand(raw?: string): {
   hasCommand: boolean;
   mode?: SendPolicyOverride | "inherit";
@@ -31,17 +19,5 @@ export function parseSendPolicyCommand(raw?: string): {
   }
   const stripped = stripInboundMetadata(trimmed);
   const normalized = normalizeCommandBody(stripped);
-  const match = normalized.match(/^\/send(?:\s+([a-zA-Z]+))?\s*$/i);
-  if (!match) {
-    return { hasCommand: false };
-  }
-  const token = normalizeOptionalLowercaseString(match[1]);
-  if (!token) {
-    return { hasCommand: true };
-  }
-  if (token === "inherit" || token === "default" || token === "reset") {
-    return { hasCommand: true, mode: "inherit" };
-  }
-  const mode = normalizeSendPolicyOverride(token);
-  return { hasCommand: true, mode };
+  return parseSendPolicyCommandBody(normalized);
 }

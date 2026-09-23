@@ -1,31 +1,51 @@
+// Assertions for kitchen-sink plugin E2E scenarios.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { assertClawHubArtifactMetadata } from "../clawhub-artifact-assertions.mjs";
+import { readPositiveIntEnvWithEmptyFallback } from "../env-limits.mjs";
+import { assertRealPathInside, resolveHomePath } from "../openclaw-state-paths.mjs";
 import { readPluginInstallRecords } from "../plugin-index-sqlite.mjs";
+import { hasExpectedPluginUninstallConfigState } from "../plugin-uninstall-assertions.mjs";
 
 const command = process.argv[2];
 const scratchRoot = process.env.KITCHEN_SINK_TMP_DIR || os.tmpdir();
 
 const LOG_SCAN_CHUNK_BYTES = 64 * 1024;
+const LOG_SCAN_FINDING_CONTEXT_CHARS = 2048;
+const LOG_SCAN_MAX_ENTRIES = readPositiveIntEnvWithEmptyFallback(
+  "KITCHEN_SINK_LOG_SCAN_MAX_ENTRIES",
+  20_000,
+);
+const LOG_SCAN_MAX_FILES = 5000;
 const LOG_SCAN_MAX_FINDINGS = 100;
+const LOG_SCAN_MAX_LINE_CHARS = 16 * 1024;
+const LOG_SCAN_SEGMENT_OVERLAP_CHARS = 256;
+const EXPECT_FAILURE_OUTPUT_MAX_BYTES = readPositiveIntEnvWithEmptyFallback(
+  "KITCHEN_SINK_EXPECT_FAILURE_OUTPUT_MAX_BYTES",
+  1024 * 1024,
+);
 
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 const scratchFile = (name) => path.join(scratchRoot, name);
 const normalizedPath = (filePath) => filePath.replaceAll("\\", "/");
 
-function resolveHomePath(value) {
-  if (value === "~") {
-    return process.env.HOME;
+function readTextFileBounded(file, maxBytes, label) {
+  const stats = fs.statSync(file);
+  if (stats.size > maxBytes) {
+    throw new Error(`${label} exceeded ${maxBytes} bytes: ${file} (${stats.size} bytes)`);
   }
-  if (value?.startsWith("~/") || value?.startsWith("~\\")) {
-    return path.join(process.env.HOME, value.slice(2));
-  }
-  return value;
+  return fs.readFileSync(file, "utf8");
 }
 
 function expectFailure() {
   const outputFile = process.argv[3];
-  const output = fs.readFileSync(outputFile, "utf8");
+  const output = readTextFileBounded(
+    outputFile,
+    EXPECT_FAILURE_OUTPUT_MAX_BYTES,
+    "expected failure output",
+  );
   const source = process.env.KITCHEN_SINK_SOURCE;
   const spec = process.env.KITCHEN_SINK_SPEC;
   const displayedSpec = source === "npm" ? spec.replace(/^npm:/u, "") : spec;
@@ -45,29 +65,127 @@ function scanTextFileLines(file, onLine) {
   const fd = fs.openSync(file, "r");
   try {
     const buffer = Buffer.alloc(LOG_SCAN_CHUNK_BYTES);
-    let carry = "";
+    let currentLine = "";
     let lineNumber = 1;
+    const emitLine = (line, info = {}) => onLine(line, lineNumber, info);
+    const appendLineText = (text, complete) => {
+      currentLine += text;
+      while (currentLine.length > LOG_SCAN_MAX_LINE_CHARS) {
+        const segment = currentLine.slice(0, LOG_SCAN_MAX_LINE_CHARS);
+        currentLine = currentLine.slice(LOG_SCAN_MAX_LINE_CHARS - LOG_SCAN_SEGMENT_OVERLAP_CHARS);
+        if (!emitLine(segment, { truncated: true })) {
+          return false;
+        }
+      }
+      if (complete) {
+        if (!emitLine(currentLine)) {
+          return false;
+        }
+        currentLine = "";
+        lineNumber += 1;
+      }
+      return true;
+    };
+
     while (true) {
       const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
       if (bytesRead <= 0) {
         break;
       }
-      const text = carry + buffer.subarray(0, bytesRead).toString("utf8");
+      const text = buffer.subarray(0, bytesRead).toString("utf8");
       const lines = text.split(/\r?\n/u);
-      carry = lines.pop() ?? "";
-      for (const line of lines) {
-        if (onLine(line, lineNumber) === false) {
+      for (let index = 0; index < lines.length - 1; index += 1) {
+        if (!appendLineText(lines[index], true)) {
           return;
         }
-        lineNumber += 1;
+      }
+      if (!appendLineText(lines.at(-1) ?? "", false)) {
+        return;
       }
     }
-    if (carry.length > 0) {
-      onLine(carry, lineNumber);
+    if (currentLine.length > 0) {
+      onLine(currentLine, lineNumber);
     }
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function formatFindingLine(line, pattern, info = {}) {
+  const matchIndex = Math.max(0, line.search(pattern));
+  const halfWindow = Math.floor(LOG_SCAN_FINDING_CONTEXT_CHARS / 2);
+  const start = Math.max(0, matchIndex - halfWindow);
+  const end = Math.min(line.length, start + LOG_SCAN_FINDING_CONTEXT_CHARS);
+  const prefix = start > 0 ? "... " : "";
+  const suffix = end < line.length || info.truncated ? " ..." : "";
+  return `${prefix}${line.slice(start, end)}${suffix}`;
+}
+
+function shouldScanLogFile(entry) {
+  if (!(/\.(?:log|jsonl)$/u.test(entry) || /openclaw-kitchen-sink-/u.test(path.basename(entry)))) {
+    return false;
+  }
+  return !normalizedPath(entry).includes("/.npm/_logs/");
+}
+
+function scanLogFiles(roots, onFile) {
+  let scannedFiles = 0;
+  let visitedEntries = 0;
+  for (const root of roots) {
+    const pending = [{ entry: root, counted: false }];
+    while (pending.length > 0) {
+      const pendingEntry = pending.pop();
+      const entry = pendingEntry?.entry;
+      if (!entry || !fs.existsSync(entry)) {
+        continue;
+      }
+      if (!pendingEntry.counted) {
+        visitedEntries += 1;
+        if (visitedEntries > LOG_SCAN_MAX_ENTRIES) {
+          throw new Error(
+            `kitchen-sink log scan exceeded ${LOG_SCAN_MAX_ENTRIES} filesystem entries`,
+          );
+        }
+      }
+      const entryType = pendingEntry.dirent ?? fs.lstatSync(entry);
+      if (entryType.isSymbolicLink()) {
+        continue;
+      }
+      if (entryType.isDirectory()) {
+        const dir = fs.opendirSync(entry);
+        try {
+          let child;
+          while ((child = dir.readSync()) !== null) {
+            visitedEntries += 1;
+            if (visitedEntries > LOG_SCAN_MAX_ENTRIES) {
+              throw new Error(
+                `kitchen-sink log scan exceeded ${LOG_SCAN_MAX_ENTRIES} filesystem entries`,
+              );
+            }
+            pending.push({
+              counted: true,
+              dirent: child,
+              entry: path.join(entry, child.name),
+            });
+          }
+        } finally {
+          dir.closeSync();
+        }
+        continue;
+      }
+      if (!shouldScanLogFile(entry)) {
+        continue;
+      }
+      scannedFiles += 1;
+      if (scannedFiles > LOG_SCAN_MAX_FILES) {
+        throw new Error(`kitchen-sink log scan exceeded ${LOG_SCAN_MAX_FILES} candidate files`);
+      }
+      if (!onFile(entry, scannedFiles)) {
+        return scannedFiles;
+      }
+    }
+  }
+  return scannedFiles;
 }
 
 function scanLogs() {
@@ -75,32 +193,6 @@ function scanLogs() {
     throw new Error("KITCHEN_SINK_TMP_DIR is required for kitchen-sink log scans");
   }
   const roots = [scratchRoot, path.join(process.env.HOME, ".openclaw")];
-  const files = [];
-  const visit = (entry) => {
-    if (!fs.existsSync(entry)) {
-      return;
-    }
-    const stat = fs.lstatSync(entry);
-    if (stat.isSymbolicLink()) {
-      return;
-    }
-    if (stat.isDirectory()) {
-      for (const child of fs.readdirSync(entry)) {
-        visit(path.join(entry, child));
-      }
-      return;
-    }
-    if (/\.(?:log|jsonl)$/u.test(entry) || /openclaw-kitchen-sink-/u.test(path.basename(entry))) {
-      if (normalizedPath(entry).includes("/.npm/_logs/")) {
-        return;
-      }
-      files.push(entry);
-    }
-  };
-  for (const root of roots) {
-    visit(root);
-  }
-
   const deny = [
     /\buncaught exception\b/iu,
     /\bunhandled rejection\b/iu,
@@ -109,32 +201,43 @@ function scanLogs() {
     /\blevel["']?\s*:\s*["']error["']/iu,
     /\[(?:error|ERROR)\]/u,
   ];
-  const allow = [/0 errors?/iu, /expected no diagnostics errors?/iu, /diagnostics errors?:\s*$/iu];
+  const allow = [
+    /^\s*0 errors?\s*$/iu,
+    /^\s*expected no diagnostics errors?\s*$/iu,
+    /^\s*diagnostics errors?:\s*$/iu,
+  ];
   const findings = [];
   let omittedFindings = false;
-  for (const file of files) {
-    scanTextFileLines(file, (line, lineNumber) => {
+  const scannedFiles = scanLogFiles(roots, (file) => {
+    scanTextFileLines(file, (line, lineNumber, info) => {
       if (allow.some((pattern) => pattern.test(line))) {
         return true;
       }
-      if (deny.some((pattern) => pattern.test(line))) {
+      const matchedPattern = deny.find((pattern) => pattern.test(line));
+      if (matchedPattern) {
         if (findings.length >= LOG_SCAN_MAX_FINDINGS) {
           omittedFindings = true;
           return false;
         }
-        findings.push(`${file}:${lineNumber}: ${line}`);
+        findings.push(`${file}:${lineNumber}: ${formatFindingLine(line, matchedPattern, info)}`);
       }
       return true;
     });
     if (omittedFindings) {
-      break;
+      return false;
     }
+    return true;
+  });
+  if (scannedFiles === 0) {
+    throw new Error(
+      "kitchen-sink log scan found no files under the isolated scratch root or OpenClaw home",
+    );
   }
   if (findings.length > 0) {
     const suffix = omittedFindings ? "\n... additional findings omitted" : "";
     throw new Error(`unexpected error-like log lines:\n${findings.join("\n")}${suffix}`);
   }
-  console.log(`log scan passed (${files.length} file(s))`);
+  console.log(`log scan passed (${scannedFiles} file(s))`);
 }
 
 function readConfig() {
@@ -148,11 +251,20 @@ function readConfig() {
 
 function configureRuntime() {
   const pluginId = process.env.KITCHEN_SINK_ID;
+  const personality = process.env.KITCHEN_SINK_PERSONALITY?.trim();
   const { configPath, config } = readConfig();
   config.plugins = config.plugins || {};
   config.plugins.entries = config.plugins.entries || {};
   config.plugins.entries[pluginId] = {
     ...config.plugins.entries[pluginId],
+    ...(personality
+      ? {
+          config: {
+            ...config.plugins.entries[pluginId]?.config,
+            personality,
+          },
+        }
+      : {}),
     hooks: {
       ...config.plugins.entries[pluginId]?.hooks,
       allowConversationAccess: true,
@@ -196,11 +308,12 @@ const expectMissing = (listValue, expected, field) => {
   }
 };
 
-const INVALID_PROBE_DIAGNOSTIC_SURFACE_MODES = new Set(["full", "conformance", "adversarial"]);
+const INVALID_PROBE_DIAGNOSTIC_SURFACE_MODES = new Set(["full", "adversarial"]);
 const requiredFullDiagnosticCanaries = new Set([
-  "only bundled plugins can register trusted tool policies",
+  "agent tool result middleware must be a function",
+  "trusted tool policy registration requires id, description, and evaluate()",
   "plugin must declare contracts.tools for: kitchen-sink-tool",
-  'channel "kitchen-sink-channel-probe" registration missing required config helpers',
+  'channel "kitchen-sink-channel-probe" registration missing or invalid required capabilities.chatTypes',
   'agent harness "kitchen-sink-agent-harness" registration missing required runtime methods',
   "session scheduler job registration requires unique id, sessionKey, and kind",
 ]);
@@ -209,36 +322,49 @@ function assertExpectedDiagnostics(surfaceMode, errorMessages) {
   const expectedErrorMessages = new Set([
     "cli registration missing explicit commands metadata",
     "only bundled plugins can register Codex app-server extension factories",
-    "only bundled plugins can register agent tool result middleware",
+    "agent tool result middleware must be a function",
     'compaction provider "kitchen-sink-compaction-provider" registration missing summarize',
     "context engine registration missing id",
     "control UI descriptor registration requires id, surface, label, and valid optional fields",
     "hosted media resolver registration missing resolver",
     "http route registration missing or invalid auth: /kitchen-sink/http-route",
+    "invalid widget presenter registration",
     "node invoke policy registration missing commands",
-    "only bundled plugins can register trusted tool policies",
+    "trusted tool policy registration requires id, description, and evaluate()",
     "plugin must declare contracts.embeddingProviders for adapter: kitchen-sink-embedding-provider",
-    "plugin must own memory slot or declare contracts.memoryEmbeddingProviders for adapter: kitchen-sink-memory-embedding-provider",
     "plugin must declare contracts.tools for: kitchen-sink-tool",
-    'channel "kitchen-sink-channel-probe" registration missing required config helpers',
+    'channel "kitchen-sink-channel-probe" registration missing or invalid required capabilities.chatTypes',
     'agent harness "kitchen-sink-agent-harness" registration missing required runtime methods',
+    "memory prompt preparation registration missing prepare function",
     "memory prompt supplement registration missing builder",
+    "MCP server connection resolver registration missing serverName or resolve",
     "model catalog provider registration missing provider",
     "session extension registration requires namespace and description",
     "session scheduler job registration requires unique id, sessionKey, and kind",
     "tool metadata registration missing toolName",
+    "worker provider registration missing method: resolveAllocation",
   ]);
   const optionalErrorMessages = new Set([
     "agent event subscription registration requires id and handle",
   ]);
+  const frozenTargetErrorMessages = new Set();
+  if (process.env.OPENCLAW_FROZEN_PLUGIN_PRERELEASE_FIXTURE_DIALECT === "legacy") {
+    frozenTargetErrorMessages.add(
+      "plugin must own memory slot or declare contracts.memoryEmbeddingProviders for adapter: kitchen-sink-memory-embedding-provider",
+    );
+  }
   const allowedErrorMessages = new Set([...expectedErrorMessages, ...optionalErrorMessages]);
   if (!INVALID_PROBE_DIAGNOSTIC_SURFACE_MODES.has(surfaceMode)) {
-    if (errorMessages.size > 0) {
-      throw new Error(
-        `unexpected kitchen-sink diagnostic errors: ${[...errorMessages].join(", ")}`,
-      );
+    const unexpected = [...errorMessages].filter(
+      (message) => !frozenTargetErrorMessages.has(message),
+    );
+    if (unexpected.length > 0) {
+      throw new Error(`unexpected kitchen-sink diagnostic errors: ${unexpected.join(", ")}`);
     }
     return;
+  }
+  for (const message of frozenTargetErrorMessages) {
+    allowedErrorMessages.add(message);
   }
   for (const message of errorMessages) {
     if (!allowedErrorMessages.has(message)) {
@@ -260,17 +386,6 @@ function assertExpectedDiagnostics(surfaceMode, errorMessages) {
   }
 }
 
-function assertRealPathInside(parentPath, childPath, label) {
-  const parentRealPath = fs.realpathSync(parentPath);
-  const childRealPath = fs.realpathSync(childPath);
-  if (
-    childRealPath !== parentRealPath &&
-    !childRealPath.startsWith(`${parentRealPath}${path.sep}`)
-  ) {
-    throw new Error(`${label} resolved outside ${parentPath}: ${childRealPath}`);
-  }
-}
-
 function assertClawHubExternalInstallContract(installPath) {
   const openclawPeerPath = path.join(installPath, "node_modules", "openclaw");
   if (!fs.existsSync(openclawPeerPath)) {
@@ -288,27 +403,6 @@ function assertClawHubExternalInstallContract(installPath) {
   const dependencyPackagePath = path.join(installPath, "node_modules", "is-number", "package.json");
   if (fs.existsSync(dependencyPackagePath)) {
     assertRealPathInside(installPath, dependencyPackagePath, "kitchen-sink isolated dependency");
-  }
-}
-
-function assertClawHubArtifactMetadata(record) {
-  if (record.artifactKind === "legacy-zip") {
-    if (record.artifactFormat !== "zip") {
-      throw new Error(
-        `missing kitchen-sink legacy ZIP artifact metadata: ${JSON.stringify(record)}`,
-      );
-    }
-    return;
-  }
-
-  if (record.artifactKind !== "npm-pack" || record.artifactFormat !== "tgz") {
-    throw new Error(`missing kitchen-sink ClawHub artifact metadata: ${JSON.stringify(record)}`);
-  }
-  if (!record.clawpackSha256 || typeof record.clawpackSize !== "number") {
-    throw new Error(`missing kitchen-sink ClawPack metadata: ${JSON.stringify(record)}`);
-  }
-  if (!record.npmIntegrity || !record.npmShasum || !record.npmTarballName) {
-    throw new Error(`missing kitchen-sink npm artifact metadata: ${JSON.stringify(record)}`);
   }
 }
 
@@ -343,7 +437,42 @@ function assertCutoverPreinstalled() {
   }
 }
 
-function assertInstalled() {
+// The sweep deletes captured inspection JSON on exit; retain only the failed plugin's cause.
+async function describeInspectionFailure(report) {
+  try {
+    const redactorPath =
+      process.env.OPENCLAW_E2E_REDACTOR_MODULE ||
+      path.join(process.cwd(), "dist", "plugin-sdk", "logging-core.js");
+    const { redactSensitiveText } = await import(pathToFileURL(redactorPath).href);
+    const bounded = (value, limit) => {
+      if (typeof value !== "string") {
+        return undefined;
+      }
+      // Redact the complete field before shortening it, including credentials spanning the limit.
+      const redacted = redactSensitiveText(value, { mode: "tools" });
+      return redacted.length > limit ? `${redacted.slice(0, limit)}…` : redacted;
+    };
+    const plugin = report.plugin;
+    const diagnostics = (Array.isArray(report.diagnostics) ? report.diagnostics : []).filter(
+      (entry) => entry?.level === "error" && (!entry.pluginId || entry.pluginId === plugin?.id),
+    );
+    return `\ninspection failure details: ${JSON.stringify({
+      id: bounded(plugin?.id, 128),
+      source: bounded(plugin?.source, 1024),
+      error: bounded(plugin?.error, 2048),
+      diagnostics: diagnostics.slice(0, 10).map((entry) => ({
+        message: bounded(entry.message, 512),
+        source: bounded(entry.source, 256),
+      })),
+      omittedDiagnostics: Math.max(0, diagnostics.length - 10),
+    })}`;
+  } catch {
+    // A missing or broken redactor must not expose raw inspection data or change the failure.
+    return "\n[inspection details omitted: canonical redaction unavailable]";
+  }
+}
+
+async function assertInstalled() {
   const pluginId = process.env.KITCHEN_SINK_ID;
   const spec = process.env.KITCHEN_SINK_SPEC;
   const source = process.env.KITCHEN_SINK_SOURCE;
@@ -352,9 +481,21 @@ function assertInstalled() {
   const list = readJson(scratchFile(`kitchen-sink-${label}-plugins.json`));
   const inspect = readJson(scratchFile(`kitchen-sink-${label}-inspect.json`));
   const allInspect = readJson(scratchFile(`kitchen-sink-${label}-inspect-all.json`));
+  if (!Array.isArray(allInspect)) {
+    throw new Error("kitchen-sink inspect --all output was not an array");
+  }
   const plugin = (list.plugins || []).find((entry) => entry.id === pluginId);
   if (!plugin) {
     throw new Error(`kitchen-sink plugin not found after install: ${pluginId}`);
+  }
+  const allInspectPlugin = allInspect.find((entry) => entry?.plugin?.id === pluginId);
+  if (!allInspectPlugin) {
+    throw new Error(`kitchen-sink plugin missing from inspect --all output: ${pluginId}`);
+  }
+  if (!allInspectPlugin.plugin?.enabled || allInspectPlugin.plugin?.status !== "loaded") {
+    throw new Error(
+      `expected enabled loaded kitchen-sink plugin in inspect --all, got enabled=${allInspectPlugin.plugin?.enabled} status=${allInspectPlugin.plugin?.status}${await describeInspectionFailure(allInspectPlugin)}`,
+    );
   }
   if (plugin.status !== "loaded") {
     throw new Error(`unexpected kitchen-sink status after enable: ${plugin.status}`);
@@ -362,9 +503,9 @@ function assertInstalled() {
   if (inspect.plugin?.id !== pluginId) {
     throw new Error(`unexpected inspected kitchen-sink plugin id: ${inspect.plugin?.id}`);
   }
-  if (inspect.plugin?.enabled !== true || inspect.plugin?.status !== "loaded") {
+  if (!inspect.plugin?.enabled || inspect.plugin?.status !== "loaded") {
     throw new Error(
-      `expected enabled loaded kitchen-sink plugin, got enabled=${inspect.plugin?.enabled} status=${inspect.plugin?.status}`,
+      `expected enabled loaded kitchen-sink plugin, got enabled=${inspect.plugin?.enabled} status=${inspect.plugin?.status}${await describeInspectionFailure(inspect)}`,
     );
   }
 
@@ -379,7 +520,7 @@ function assertInstalled() {
   const diagnostics = [
     ...(list.diagnostics || []),
     ...(inspect.diagnostics || []),
-    ...(allInspect.diagnostics || []),
+    ...(allInspectPlugin.diagnostics || []),
   ];
   const errorMessages = new Set(
     diagnostics.filter((diag) => diag?.level === "error").map((diag) => String(diag.message || "")),
@@ -438,7 +579,13 @@ function assertInstalled() {
     expectIncludes(inspect.services, "kitchen-sink-service", "services");
     if (surfaceMode === "full") {
       expectIncludesAny(inspect.commands, ["kitchen", "kitchen-sink-command"], "commands");
-      expectIncludesAny(toolNames, ["kitchen_sink_text", "kitchen-sink-tool"], "tools");
+      for (const toolName of [
+        "kitchen_sink_text",
+        "kitchen_sink_search",
+        "kitchen_sink_image_job",
+      ]) {
+        expectIncludes(toolNames, toolName, "tools");
+      }
     } else {
       expectIncludes(inspect.commands, "kitchen", "commands");
       expectIncludes(toolNames, "kitchen_sink_text", "tools");
@@ -487,7 +634,12 @@ function assertInstalled() {
     if (!record.version || !record.integrity || !record.resolvedAt) {
       throw new Error(`missing ClawHub resolution metadata: ${JSON.stringify(record)}`);
     }
-    assertClawHubArtifactMetadata(record);
+    assertClawHubArtifactMetadata(record, {
+      legacyZip: "missing kitchen-sink legacy ZIP artifact metadata",
+      artifact: "missing kitchen-sink ClawHub artifact metadata",
+      clawpack: "missing kitchen-sink ClawPack metadata",
+      npm: "missing kitchen-sink npm artifact metadata",
+    });
   }
   if (typeof record.installPath !== "string" || record.installPath.length === 0) {
     throw new Error("missing kitchen-sink install path");
@@ -495,6 +647,10 @@ function assertInstalled() {
   const installPath = resolveHomePath(record.installPath);
   if (!fs.existsSync(installPath)) {
     throw new Error(`kitchen-sink install path missing: ${record.installPath}`);
+  }
+  if (source === "clawhub") {
+    const extensionsRoot = path.join(process.env.HOME, ".openclaw", "extensions");
+    assertRealPathInside(extensionsRoot, installPath, "kitchen-sink ClawHub install path");
   }
   if (source === "clawhub" && record.artifactKind === "npm-pack") {
     assertClawHubExternalInstallContract(installPath);
@@ -516,8 +672,8 @@ function assertRemoved() {
   }
 
   const { config } = readConfig();
-  if (config.plugins?.entries?.[pluginId]) {
-    throw new Error(`kitchen-sink config entry still present after uninstall: ${pluginId}`);
+  if (!hasExpectedPluginUninstallConfigState(config, pluginId)) {
+    throw new Error(`kitchen-sink exact disabled uninstall marker missing: ${pluginId}`);
   }
   if ((config.plugins?.allow || []).includes(pluginId)) {
     throw new Error(`kitchen-sink allowlist still contains ${pluginId}`);
@@ -551,4 +707,4 @@ const fn = commands[command];
 if (!fn) {
   throw new Error(`unknown kitchen-sink assertion command: ${command}`);
 }
-fn();
+await fn();

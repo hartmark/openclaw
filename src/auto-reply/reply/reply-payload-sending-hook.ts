@@ -1,21 +1,26 @@
+// Runs plugin hooks before outbound reply payloads are sent.
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
-import type { PluginHookReplyPayloadSendingContext } from "../../plugins/hook-types.js";
+import type {
+  PluginHookReplyPayloadSendingContext,
+  PluginHookReplyUsageState,
+} from "../../plugins/hook-types.js";
+import { copyReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../reply-payload.js";
 import type { ReplyDispatchKind } from "./reply-dispatcher.types.js";
 
-export function hasReplyPayloadSendingHooks(): boolean {
-  return getGlobalHookRunner()?.hasHooks("reply_payload_sending") === true;
-}
-
-export async function runReplyPayloadSendingHook(params: {
-  payload: ReplyPayload;
-  kind: ReplyDispatchKind;
-  channel?: string;
-  sessionKey?: string;
-  runId?: string;
-  context: PluginHookReplyPayloadSendingContext;
-}): Promise<ReplyPayload | null> {
-  const hookRunner = getGlobalHookRunner();
+/** Runs plugin hooks that may rewrite or cancel an outbound reply payload. */
+export async function runReplyPayloadSendingHook(
+  params: {
+    payload: ReplyPayload;
+    kind: ReplyDispatchKind;
+    channel?: string;
+    sessionKey?: string;
+    runId?: string;
+    usageState?: PluginHookReplyUsageState;
+    context: PluginHookReplyPayloadSendingContext;
+  },
+  hookRunner = getGlobalHookRunner(),
+): Promise<ReplyPayload | null> {
   if (!hookRunner?.hasHooks("reply_payload_sending")) {
     return params.payload;
   }
@@ -27,6 +32,7 @@ export async function runReplyPayloadSendingHook(params: {
       channel: params.channel,
       sessionKey: params.sessionKey,
       runId: params.runId,
+      usageState: params.usageState,
     },
     params.context,
   );
@@ -34,5 +40,6 @@ export async function runReplyPayloadSendingHook(params: {
   if (result?.cancel) {
     return null;
   }
-  return (result?.payload as ReplyPayload | undefined) ?? params.payload;
+  const payload = (result?.payload as ReplyPayload | undefined) ?? params.payload;
+  return copyReplyPayloadMetadata(params.payload, payload);
 }

@@ -1,3 +1,5 @@
+// Decides when config recovery should use snapshots, backups, or defaults.
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { ConfigFileSnapshot, ConfigValidationIssue } from "./types.openclaw.js";
 
 const PLUGIN_ENTRY_PATH_PREFIX = "plugins.entries.";
@@ -25,7 +27,8 @@ function isPluginPolicyIssue(issue: ConfigValidationIssue): boolean {
   );
 }
 
-export function isPluginPackagingRuntimeOutputIssue(issue: ConfigValidationIssue): boolean {
+/** Return true for plugin validation issues caused by missing compiled runtime output. */
+function isPluginPackagingRuntimeOutputIssue(issue: ConfigValidationIssue): boolean {
   const path = issue.path.trim();
   const message = issue.message.trim().toLowerCase();
   return isPluginsPath(path) && message.includes(COMPILED_RUNTIME_OUTPUT_DIAGNOSTIC);
@@ -57,8 +60,8 @@ function extractPluginNotFoundIssuePluginId(issue: ConfigValidationIssue): strin
 }
 
 /**
- * Returns true when an invalid config snapshot is blocked by an installed plugin
- * package that shipped TypeScript source without compiled JavaScript output.
+ * Return true when an invalid config snapshot is blocked only by plugin packaging fallout.
+ * This lets callers show plugin repair hints instead of treating user config as corrupted.
  */
 export function isPluginPackagingRuntimeOutputInvalidConfigSnapshot(
   snapshot: Pick<ConfigFileSnapshot, "valid" | "issues" | "legacyIssues"> &
@@ -81,6 +84,7 @@ export function isPluginPackagingRuntimeOutputInvalidConfigSnapshot(
       if (isPluginPackagingRuntimeOutputIssue(issue)) {
         return true;
       }
+      // Missing-plugin fallout must belong to the same plugin that emitted the packaging error.
       const pluginId = extractPluginNotFoundIssuePluginId(issue);
       return pluginId !== null && packagingPluginIds.has(pluginId);
     })
@@ -88,7 +92,8 @@ export function isPluginPackagingRuntimeOutputInvalidConfigSnapshot(
 }
 
 /**
- * Returns true when an invalid config snapshot is scoped entirely to stale plugin refs.
+ * Return true when an invalid config snapshot is scoped entirely to stale plugin refs.
+ * Whole-file recovery is skipped for these snapshots so plugin cleanup can preserve user config.
  */
 export function isPluginLocalInvalidConfigSnapshot(
   snapshot: Pick<ConfigFileSnapshot, "valid" | "issues" | "legacyIssues">,
@@ -100,7 +105,8 @@ export function isPluginLocalInvalidConfigSnapshot(
 }
 
 /**
- * Decides whether whole-file last-known-good recovery is safe for a snapshot.
+ * Decide whether whole-file last-known-good recovery is appropriate for an invalid snapshot.
+ * Plugin-local failures stay on the current file so targeted plugin cleanup can run.
  */
 export function shouldAttemptLastKnownGoodRecovery(
   snapshot: Pick<ConfigFileSnapshot, "valid" | "issues" | "legacyIssues">,
@@ -109,4 +115,41 @@ export function shouldAttemptLastKnownGoodRecovery(
     return false;
   }
   return !isPluginLocalInvalidConfigSnapshot(snapshot);
+}
+
+function isSensitiveConfigPath(pathLabel: string): boolean {
+  return /(^|\.)(api[-_]?key|auth|bearer|credential|password|private[-_]?key|secret|token)(\.|$)/i.test(
+    pathLabel,
+  );
+}
+
+export function collectPollutedSecretPlaceholders(
+  value: unknown,
+  pathLabel = "",
+  output: string[] = [],
+): string[] {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "***" || trimmed === "[redacted]") {
+      output.push(pathLabel || "<root>");
+      return output;
+    }
+    if (isSensitiveConfigPath(pathLabel) && (trimmed.includes("...") || trimmed.includes("…"))) {
+      output.push(pathLabel || "<root>");
+    }
+    return output;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) =>
+      collectPollutedSecretPlaceholders(item, `${pathLabel}[${index}]`, output),
+    );
+    return output;
+  }
+  if (isRecord(value)) {
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = pathLabel ? `${pathLabel}.${key}` : key;
+      collectPollutedSecretPlaceholders(child, childPath, output);
+    }
+  }
+  return output;
 }

@@ -1,3 +1,4 @@
+// Vitest extension slack config wires the extension slack test shard.
 import { createScopedVitestConfig } from "./vitest.scoped-config.ts";
 
 export function createExtensionSlackVitestConfig(
@@ -7,10 +8,13 @@ export function createExtensionSlackVitestConfig(
     dir: "extensions",
     env,
     includeOpenClawRuntimeSetup: false,
+    // The non-isolated runner resets each file's mocks and module-local fixtures.
+    isolate: false,
     name: "extension-slack",
+    // The cooldown store uses the application-owned SQLite worker broker.
+    pool: "forks",
     passWithNoTests: true,
     setupFiles: ["test/setup.extensions.ts"],
-    fileParallelism: false,
   });
 }
 

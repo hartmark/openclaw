@@ -1,3 +1,4 @@
+/** Tests Gateway tool streaming to ACP tool-call update mapping. */
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "../gateway/client.js";
@@ -7,8 +8,11 @@ import {
   createToolEvent,
   createChatFinalEvent,
 } from "./translator.bridge-test-helpers.js";
-import { AcpGatewayAgent } from "./translator.js";
-import { createAcpConnection, createAcpGateway } from "./translator.test-helpers.js";
+import {
+  createAcpConnection,
+  createAcpGateway,
+  createAcpGatewayAgent,
+} from "./translator.test-helpers.js";
 
 vi.mock("./commands.js", () => ({
   getAvailableCommands: () => [],
@@ -25,7 +29,7 @@ describe("acp tool streaming bridge behavior", () => {
       }
       return { ok: true };
     }) as GatewayClient["request"];
-    const agent = new AcpGatewayAgent(connection, createAcpGateway(request), {
+    const agent = createAcpGatewayAgent(connection, createAcpGateway(request), {
       sessionStore,
     });
 
@@ -120,7 +124,5 @@ describe("acp tool streaming bridge behavior", () => {
         locations: [{ path: "src/app.ts", line: 12 }],
       },
     });
-
-    sessionStore.clearAllSessionsForTest();
   });
 });

@@ -1,9 +1,11 @@
-import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { getTailnetHostname } from "../infra/tailscale.js";
-import type { MemoryProviderStatus } from "../memory-host-sdk/engine-storage.js";
-import { getActiveMemorySearchManager } from "../plugins/memory-runtime.js";
+// Runtime dependency adapters for status scans.
+// Keeps plugin/runtime modules outside the core scan files until a caller needs them.
 
-export { getTailnetHostname };
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import "../infra/tailscale.js";
+import type { MemoryProviderStatus } from "../memory-host-sdk/engine-storage.js";
+import { getActiveMemorySearchManagerCore } from "../plugins/memory-runtime.js";
+export { getTailnetHostname } from "../infra/tailscale.js";
 
 type StatusMemoryManager = {
   probeVectorStoreAvailability?(): Promise<boolean>;
@@ -12,12 +14,14 @@ type StatusMemoryManager = {
   close?(): Promise<void>;
 };
 
+/** Returns a narrow memory manager adapter for status probing. */
 export async function getMemorySearchManager(params: {
   cfg: OpenClawConfig;
   agentId: string;
   purpose: "status";
+  inspectSources: true;
 }): Promise<{ manager: StatusMemoryManager | null }> {
-  const { manager } = await getActiveMemorySearchManager(params);
+  const { manager } = await getActiveMemorySearchManagerCore(params);
   if (!manager) {
     return { manager: null };
   }
@@ -27,6 +31,7 @@ export async function getMemorySearchManager(params: {
   return {
     manager: {
       probeVectorStoreAvailability,
+      // Expose only the status-facing methods so shared scan code stays decoupled from plugin internals.
       async probeVectorAvailability() {
         return await manager.probeVectorAvailability();
       },

@@ -1,3 +1,4 @@
+// Live-checks Gemini switching after unsigned tool calls from another provider surface.
 import { completeSimple, type Model } from "openclaw/plugin-sdk/llm";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
@@ -10,7 +11,7 @@ const LIVE = isLiveTestEnabled(["GEMINI_LIVE_TEST"]);
 const describeLive = LIVE && GEMINI_KEY ? describe : describe.skip;
 
 describeLive("gemini live switch", () => {
-  const googleModels = ["gemini-3.1-pro-preview", "gemini-2.5-pro"] as const;
+  const googleModels = ["gemini-3.1-pro-preview", "gemini-2.5-flash"] as const;
 
   for (const modelId of googleModels) {
     it(`handles unsigned tool calls from Antigravity when switching to ${modelId}`, async () => {
@@ -73,6 +74,8 @@ describeLive("gemini live switch", () => {
         },
       );
 
+      // Preview models can have upstream transient failures; non-preview
+      // coverage still proves unsigned prior tool calls do not poison Gemini.
       if (modelId.includes("preview") && res.stopReason === "error") {
         return;
       }

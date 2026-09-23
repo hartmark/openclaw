@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+// Memory Core plugin module implements rem harness behavior.
 import path from "node:path";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
@@ -10,8 +10,10 @@ import {
   previewRemDreaming,
   type RemDreamingPreview,
 } from "./dreaming-phases.js";
+import { listWorkspaceDirectory } from "./memory-workspace-files.js";
 import { previewGroundedRemMarkdown, type GroundedRemPreviewResult } from "./rem-evidence.js";
 import {
+  filterLiveShortTermRecallEntries,
   rankShortTermPromotionCandidates,
   readShortTermRecallEntries,
   type PromotionCandidate,
@@ -84,7 +86,7 @@ async function listWorkspaceDailyFiles(workspaceDir: string, limit?: number): Pr
   const memoryDir = path.join(workspaceDir, "memory");
   let entries: string[];
   try {
-    const dirEntries = await fs.readdir(memoryDir, { withFileTypes: true });
+    const dirEntries = await listWorkspaceDirectory(workspaceDir, memoryDir);
     entries = dirEntries
       .filter((entry) => entry.isFile() && DAILY_MEMORY_FILE_NAME_RE.test(entry.name))
       .map((entry) => entry.name);
@@ -130,10 +132,13 @@ export async function previewRemHarness(
     workspaceDir: params.workspaceDir,
     nowMs,
   });
-  const recallEntries = filterRecallEntriesWithinLookback({
-    entries: allRecallEntries,
-    nowMs,
-    lookbackDays: remConfig.lookbackDays,
+  const recallEntries = await filterLiveShortTermRecallEntries({
+    workspaceDir: params.workspaceDir,
+    entries: filterRecallEntriesWithinLookback({
+      entries: allRecallEntries,
+      nowMs,
+      lookbackDays: remConfig.lookbackDays,
+    }),
   });
   const remPreviewLimit = resolveRemPreviewLimit(remConfig.limit, params.remPreviewLimit);
   const remSkipped = remConfig.limit <= 0 || remPreviewLimit <= 0;

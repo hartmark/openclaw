@@ -1,12 +1,14 @@
+// Qa Lab tests cover harness parity plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
   buildHarnessParityCell,
   buildHarnessParityResult,
   type HarnessRuntimeParityCell,
-  type HarnessVariant,
 } from "./harness-parity.js";
 import type { RuntimeId } from "./runtime-parity.js";
 import type { RuntimeParityComparisonMode } from "./runtime-tool-metadata.js";
+
+type HarnessVariant = Parameters<typeof buildHarnessParityCell>[0]["variant"];
 
 const LEFT: HarnessVariant = { id: "left", label: "Left", runtime: "openclaw" };
 const RIGHT: HarnessVariant = { id: "right", label: "Right", runtime: "openclaw" };
@@ -181,7 +183,7 @@ describe("harness parity", () => {
       classify(
         {
           transcriptBytes:
-            '{"type":"model_change","modelId":"gpt-5.5"}\n' +
+            '{"type":"model_change","modelId":"gpt-5.6-luna"}\n' +
             '{"type":"thinking_level_change","thinkingLevel":"off"}\n' +
             '{"type":"custom","customType":"model-snapshot"}\n' +
             '{"message":{"role":"assistant","content":"same"}}\n',
@@ -263,6 +265,112 @@ describe("harness parity", () => {
         "outcome-only",
       ),
     ).toBe("tool-description");
+  });
+
+  it.each([
+    {
+      drift: "failure-mode",
+      right: { transportErrorClass: "transport", runtimeErrorClass: "runtime" },
+      details: "at least one harness variant hit a transport failure",
+    },
+    {
+      drift: "system-prompt",
+      right: {
+        systemPromptReport: {
+          ...BASE_PROMPT_REPORT,
+          systemPrompt: { ...BASE_PROMPT_REPORT.systemPrompt, chars: 101 },
+        },
+      },
+      details: "system prompt report differs",
+      promptDelta: { systemPromptChars: 1 },
+    },
+    {
+      drift: "tool-description",
+      right: {
+        systemPromptReport: {
+          ...BASE_PROMPT_REPORT,
+          tools: {
+            ...BASE_PROMPT_REPORT.tools,
+            entries: [{ ...BASE_PROMPT_REPORT.tools.entries[0], summaryChars: 10 }],
+          },
+        },
+      },
+      details: "tool description summary shape differs",
+      promptDelta: { toolSummaryChars: 2 },
+    },
+    {
+      drift: "tool-schema",
+      right: {
+        systemPromptReport: {
+          ...BASE_PROMPT_REPORT,
+          tools: { ...BASE_PROMPT_REPORT.tools, schemaChars: 22 },
+        },
+      },
+      details: "tool schema shape differs",
+      promptDelta: { toolSchemaChars: 2 },
+    },
+    {
+      drift: "tool-call-shape",
+      right: { toolCalls: [{ tool: "read", argsHash: "b", resultHash: "r" }] },
+      details: "tool call 1 differs (read/a vs read/b)",
+    },
+    {
+      drift: "tool-result-shape",
+      right: { toolCalls: [{ tool: "read", argsHash: "a", resultHash: "changed" }] },
+      details: "tool result 1 differs (read)",
+    },
+    {
+      drift: "structural",
+      right: {
+        transcriptBytes: '{"role":"assistant"}\n{"role":"tool"}\n',
+      },
+      details: "transcript/final-text structure differs (1 message records vs 2 message records)",
+    },
+    {
+      drift: "text-only",
+      right: { finalText: "different" },
+      details: "final text differs after whitespace normalization",
+    },
+    { drift: "none", right: {} },
+  ])("keeps complete result metadata for $drift", ({ drift, right, details, promptDelta }) => {
+    const source = makeCell("openclaw", {
+      toolCalls: [{ tool: "read", argsHash: "a", resultHash: "r" }],
+    });
+    const leftCell = buildHarnessParityCell({
+      variant: LEFT,
+      cell: source,
+      tokenUsageSource: "live-usage",
+    });
+    const rightCell = buildHarnessParityCell({
+      variant: RIGHT,
+      cell: {
+        ...source,
+        transcriptBytes: '{"type":"metadata"}\n' + source.transcriptBytes,
+        usage: { inputTokens: 20, outputTokens: 10, totalTokens: 30 },
+        ...right,
+      },
+      tokenUsageSource: "live-usage",
+    });
+
+    expect(
+      buildHarnessParityResult({ scenarioId: "metadata", left: leftCell, right: rightCell }),
+    ).toStrictEqual({
+      scenarioId: "metadata",
+      left: leftCell,
+      right: rightCell,
+      drift,
+      ...(drift === "none" ? {} : { driftDetails: details, firstDriftTurn: 1 }),
+      promptDelta: {
+        systemPromptChars: 0,
+        projectContextChars: 0,
+        skillPromptChars: 0,
+        toolSummaryChars: 0,
+        toolSchemaChars: 0,
+        toolCount: 0,
+        ...promptDelta,
+      },
+      tokenDeltaPercent: 100,
+    });
   });
 
   it("labels mock token estimates separately from live usage", () => {

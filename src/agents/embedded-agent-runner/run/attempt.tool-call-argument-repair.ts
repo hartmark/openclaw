@@ -1,17 +1,15 @@
-import { extractBalancedJsonPrefix } from "../../../shared/balanced-json.js";
+/**
+ * Repairs malformed tool-call arguments in embedded-agent stream results.
+ */
+import { extractBalancedJsonPrefix } from "@openclaw/normalization-core";
+import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import { normalizeProviderId } from "../../model-selection.js";
 import type { StreamFn } from "../../runtime/index.js";
 import type { MutableAssistantMessageEventStream } from "../../stream-compat.js";
 import { log } from "../logger.js";
-import {
-  createHtmlEntityToolCallArgumentDecodingWrapper,
-  decodeHtmlEntitiesInObject,
-} from "../tool-call-argument-decoding.js";
-import { wrapStreamObjectEvents } from "./stream-wrapper.js";
-
-function isToolCallBlockType(type: unknown): boolean {
-  return type === "toolCall" || type === "toolUse" || type === "functionCall";
-}
+import { createHtmlEntityToolCallArgumentDecodingWrapper } from "../tool-call-argument-decoding.js";
+import { isRunnerToolCallBlock } from "./attempt-tool-call-block-type.js";
+import { mapAssistantMessageStream, wrapStreamObjectEvents } from "./stream-wrapper.js";
 
 const MAX_TOOLCALL_REPAIR_BUFFER_CHARS = 64_000;
 const MAX_TOOLCALL_REPAIR_LEADING_CHARS = 96;
@@ -155,17 +153,6 @@ type ToolCallRepairParsedObject = {
   endIndex: number;
 };
 
-function parseUsableObjectJson(raw: string): Record<string, unknown> | undefined {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function findAsciiStringEnd(raw: string, startIndex: number): number {
   let escaped = false;
   for (let i = startIndex + 1; i < raw.length; i += 1) {
@@ -291,11 +278,14 @@ function shouldCloseSmartQuotedValueAt(
 }
 
 function decodeSmartQuotedJsonStringEscapes(value: string): string {
-  return value.replace(/\\(?:(["\\/bfnrt])|u([0-9a-fA-F]{4}))/g, (_match, escaped, hex) =>
-    typeof hex === "string"
-      ? String.fromCharCode(Number.parseInt(hex, 16))
-      : TOOLCALL_REPAIR_JSON_STRING_ESCAPES[escaped as string],
-  );
+  return value.replace(/\\(?:(["\\/bfnrt])|u([0-9a-fA-F]{4}))/g, (match, escaped, hex) => {
+    if (typeof hex === "string") {
+      return String.fromCharCode(Number.parseInt(hex, 16));
+    }
+    return typeof escaped === "string"
+      ? (TOOLCALL_REPAIR_JSON_STRING_ESCAPES[escaped] ?? match)
+      : match;
+  });
 }
 
 function readSmartQuotedValue(
@@ -492,7 +482,7 @@ function tryExtractUsableToolCallArgumentsFromJson(
     return undefined;
   }
 
-  const parsedExtracted = parseUsableObjectJson(extracted.json);
+  const parsedExtracted = safeParseJsonRecord(extracted.json);
   if (!parsedExtracted) {
     return undefined;
   }
@@ -549,7 +539,7 @@ function tryExtractUsableToolCallArguments(
   if (!raw.trim()) {
     return undefined;
   }
-  const parsedRaw = parseUsableObjectJson(raw);
+  const parsedRaw = safeParseJsonRecord(raw);
   if (parsedRaw) {
     return {
       args: parsedRaw,
@@ -565,23 +555,18 @@ function tryExtractUsableToolCallArguments(
   );
 }
 
-function readToolCallNameInMessage(message: unknown, contentIndex: number): string | undefined {
+function readToolCallBlock(message: unknown, contentIndex: number) {
   if (!message || typeof message !== "object") {
     return undefined;
   }
   const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return undefined;
-  }
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") {
-    return undefined;
-  }
-  const typedBlock = block as { type?: unknown; name?: unknown };
-  if (!isToolCallBlockType(typedBlock.type) || typeof typedBlock.name !== "string") {
-    return undefined;
-  }
-  return normalizeToolCallRepairToolName(typedBlock.name);
+  const block: unknown = Array.isArray(content) ? content[contentIndex] : undefined;
+  return isRunnerToolCallBlock(block) ? block : undefined;
+}
+
+function readToolCallNameInMessage(message: unknown, contentIndex: number): string | undefined {
+  const block = readToolCallBlock(message, contentIndex);
+  return typeof block?.name === "string" ? normalizeToolCallRepairToolName(block.name) : undefined;
 }
 
 function repairToolCallArgumentsInMessage(
@@ -589,81 +574,20 @@ function repairToolCallArgumentsInMessage(
   contentIndex: number,
   repairedArgs: Record<string, unknown>,
 ): void {
-  if (!message || typeof message !== "object") {
-    return;
+  const block = readToolCallBlock(message, contentIndex);
+  if (block) {
+    block.arguments = repairedArgs;
   }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") {
-    return;
-  }
-  const typedBlock = block as { type?: unknown; arguments?: unknown };
-  if (!isToolCallBlockType(typedBlock.type)) {
-    return;
-  }
-  typedBlock.arguments = repairedArgs;
 }
 
 function hasMeaningfulToolCallArgumentsInMessage(message: unknown, contentIndex: number): boolean {
-  if (!message || typeof message !== "object") {
-    return false;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return false;
-  }
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") {
-    return false;
-  }
-  const typedBlock = block as { type?: unknown; arguments?: unknown };
-  if (!isToolCallBlockType(typedBlock.type)) {
-    return false;
-  }
+  const args = readToolCallBlock(message, contentIndex)?.arguments;
   return (
-    typedBlock.arguments !== null &&
-    typeof typedBlock.arguments === "object" &&
-    !Array.isArray(typedBlock.arguments) &&
-    Object.keys(typedBlock.arguments as Record<string, unknown>).length > 0
+    args !== null &&
+    typeof args === "object" &&
+    !Array.isArray(args) &&
+    Object.keys(args).length > 0
   );
-}
-
-function clearToolCallArgumentsInMessage(message: unknown, contentIndex: number): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") {
-    return;
-  }
-  const typedBlock = block as { type?: unknown; arguments?: unknown };
-  if (!isToolCallBlockType(typedBlock.type)) {
-    return;
-  }
-  typedBlock.arguments = {};
-}
-
-function repairMalformedToolCallArgumentsInMessage(
-  message: unknown,
-  repairedArgsByIndex: Map<number, Record<string, unknown>>,
-): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  for (const [index, repairedArgs] of repairedArgsByIndex.entries()) {
-    repairToolCallArgumentsInMessage(message, index, repairedArgs);
-  }
 }
 
 function wrapStreamRepairMalformedToolCallArguments(
@@ -677,7 +601,9 @@ function wrapStreamRepairMalformedToolCallArguments(
   const originalResult = stream.result.bind(stream);
   stream.result = async () => {
     const message = await originalResult();
-    repairMalformedToolCallArgumentsInMessage(message, repairedArgsByIndex);
+    for (const [index, args] of repairedArgsByIndex) {
+      repairToolCallArgumentsInMessage(message, index, args);
+    }
     partialJsonByIndex.clear();
     repairedArgsByIndex.clear();
     hadPreexistingArgsByIndex.clear();
@@ -740,8 +666,8 @@ function wrapStreamRepairMalformedToolCallArguments(
               (hasMeaningfulToolCallArgumentsInMessage(event.partial, event.contentIndex) ||
                 hasMeaningfulToolCallArgumentsInMessage(event.message, event.contentIndex)));
           if (!hadPreexistingArgs) {
-            clearToolCallArgumentsInMessage(event.partial, event.contentIndex);
-            clearToolCallArgumentsInMessage(event.message, event.contentIndex);
+            repairToolCallArgumentsInMessage(event.partial, event.contentIndex, {});
+            repairToolCallArgumentsInMessage(event.message, event.contentIndex, {});
           }
         }
       }
@@ -770,15 +696,11 @@ function wrapStreamRepairMalformedToolCallArguments(
 }
 
 export function wrapStreamFnRepairMalformedToolCallArguments(baseFn: StreamFn): StreamFn {
-  return (model, context, options) => {
-    const maybeStream = baseFn(model, context, options);
-    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
-      return Promise.resolve(maybeStream).then((stream) =>
-        wrapStreamRepairMalformedToolCallArguments(stream),
-      );
-    }
-    return wrapStreamRepairMalformedToolCallArguments(maybeStream);
-  };
+  return (model, context, options) =>
+    mapAssistantMessageStream(
+      baseFn(model, context, options),
+      wrapStreamRepairMalformedToolCallArguments,
+    );
 }
 
 export function shouldRepairMalformedToolCallArguments(params: {
@@ -796,5 +718,3 @@ export function shouldRepairMalformedToolCallArguments(params: {
 export function wrapStreamFnDecodeXaiToolCallArguments(baseFn: StreamFn): StreamFn {
   return createHtmlEntityToolCallArgumentDecodingWrapper(baseFn);
 }
-
-export { decodeHtmlEntitiesInObject };

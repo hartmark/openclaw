@@ -1,3 +1,4 @@
+// Device Pair plugin module implements pair command approve behavior.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -25,20 +26,20 @@ export function selectPendingApprovalRequest(params: {
   pending: PendingPairingEntry[];
   requested?: string;
 }): { pending?: PendingPairingEntry; reply?: { text: string } } {
-  if (params.pending.length === 0) {
+  const [firstPending, ...remainingPending] = params.pending;
+  if (!firstPending) {
     return { reply: { text: "No pending device pairing requests." } };
   }
 
   if (!params.requested) {
-    return params.pending.length === 1
-      ? { pending: params.pending[0] }
+    return remainingPending.length === 0
+      ? { pending: firstPending }
       : { reply: buildMultiplePendingApprovalReply(params.pending) };
   }
 
   if (normalizeLowercaseStringOrEmpty(params.requested) === "latest") {
-    let latest = params.pending[0];
-    for (let index = 1; index < params.pending.length; index += 1) {
-      const pending = params.pending[index];
+    let latest = firstPending;
+    for (const pending of remainingPending) {
       if ((pending.ts ?? 0) > (latest.ts ?? 0)) {
         latest = pending;
       }
@@ -66,11 +67,22 @@ function formatForbiddenPairingRequirement(approved: ForbiddenPairingEntry): str
 export async function approvePendingPairingRequest(params: {
   requestId: string;
   callerScopes?: readonly string[];
+  assertCurrent?: () => void;
 }): Promise<{ text: string }> {
+  const assertCurrent = params.assertCurrent;
+  const isApprovalCurrent = assertCurrent
+    ? () => {
+        assertCurrent();
+        return true;
+      }
+    : undefined;
   const approved =
-    params.callerScopes === undefined
+    params.callerScopes === undefined && !isApprovalCurrent
       ? await approveDevicePairing(params.requestId)
-      : await approveDevicePairing(params.requestId, { callerScopes: params.callerScopes });
+      : await approveDevicePairing(params.requestId, {
+          callerScopes: params.callerScopes,
+          ...(isApprovalCurrent ? { isApprovalCurrent } : {}),
+        });
   if (!approved) {
     return { text: "Pairing request not found." };
   }

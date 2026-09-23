@@ -1,34 +1,18 @@
+// Defines task registry records, statuses, delivery state, and parser helpers.
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 
-export type TaskRuntime = "subagent" | "acp" | "cli" | "cron";
+/** JSON value shape persisted with runtime-owned task detail. */
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
 
-export type TaskStatus =
-  | "queued"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "timed_out"
-  | "cancelled"
-  | "lost";
-
-export type TaskDeliveryStatus =
-  | "pending"
-  | "delivered"
-  | "session_queued"
-  | "failed"
-  | "parent_missing"
-  | "not_applicable";
-
-export type TaskNotifyPolicy = "done_only" | "state_changes" | "silent";
-
-export type TaskTerminalOutcome = "succeeded" | "blocked";
-export type TaskScopeKind = "session" | "system";
-
-export type TaskStatusCounts = Record<TaskStatus, number>;
-export type TaskRuntimeCounts = Record<TaskRuntime, number>;
-
-const TASK_RUNTIMES = new Set<TaskRuntime>(["subagent", "acp", "cli", "cron"]);
-const TASK_STATUSES = new Set<TaskStatus>([
+/** Runtime families that own task run lifecycles. */
+export const TASK_RUNTIMES = ["subagent", "acp", "cron", "cli"] as const;
+const TASK_STATUSES = [
   "queued",
   "running",
   "succeeded",
@@ -36,12 +20,61 @@ const TASK_STATUSES = new Set<TaskStatus>([
   "timed_out",
   "cancelled",
   "lost",
-]);
+] as const;
+export const TASK_STATUS_FILTERS = [...TASK_STATUSES, "blocked"] as const;
+
+export type TaskRuntime = (typeof TASK_RUNTIMES)[number];
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+export type TaskStatusFilter = (typeof TASK_STATUS_FILTERS)[number];
+
+/** Returns whether a task status is terminal for delivery and retention policy. */
+export function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return (
+    status === "succeeded" ||
+    status === "failed" ||
+    status === "timed_out" ||
+    status === "cancelled" ||
+    status === "lost"
+  );
+}
+
+export type TaskDeliveryStatus =
+  | "pending"
+  | "delivered"
+  | "session_queued"
+  | "failed"
+  | "dismissed"
+  | "parent_missing"
+  | "not_applicable";
+
+export type TaskNotifyPolicy = "done_only" | "state_changes" | "silent";
+
+/** Semantic success detail for required-completion task outcomes. */
+export type TaskTerminalOutcome = "succeeded" | "blocked";
+export type TaskScopeKind = "session" | "system";
+
+export type TaskStatusCounts = Record<TaskStatus, number>;
+export type TaskRuntimeCounts = Record<TaskRuntime, number>;
+
+export function matchesTaskStatusFilter(
+  task: Pick<TaskRecord, "status" | "terminalOutcome">,
+  filter: TaskStatusFilter,
+): boolean {
+  // Blocked delivery is projected over a persisted success, so succeeded filters must keep matching.
+  return (
+    task.status === filter ||
+    (filter === "blocked" && task.status === "succeeded" && task.terminalOutcome === "blocked")
+  );
+}
+
+const TASK_RUNTIME_SET = new Set<TaskRuntime>(TASK_RUNTIMES);
+const TASK_STATUS_SET = new Set<TaskStatus>(TASK_STATUSES);
 const TASK_DELIVERY_STATUSES = new Set<TaskDeliveryStatus>([
   "pending",
   "delivered",
   "session_queued",
   "failed",
+  "dismissed",
   "parent_missing",
   "not_applicable",
 ]);
@@ -61,11 +94,11 @@ function parsePersistedTaskValue<T extends string>(
 }
 
 export function parseTaskRuntime(value: unknown): TaskRuntime {
-  return parsePersistedTaskValue(value, TASK_RUNTIMES, "runtime");
+  return parsePersistedTaskValue(value, TASK_RUNTIME_SET, "runtime");
 }
 
 export function parseTaskStatus(value: unknown): TaskStatus {
-  return parsePersistedTaskValue(value, TASK_STATUSES, "status");
+  return parsePersistedTaskValue(value, TASK_STATUS_SET, "status");
 }
 
 export function parseTaskDeliveryStatus(value: unknown): TaskDeliveryStatus {
@@ -94,6 +127,7 @@ export type TaskRegistrySummary = {
   failures: number;
   byStatus: TaskStatusCounts;
   byRuntime: TaskRuntimeCounts;
+  warning?: string;
 };
 
 export type TaskEventKind = TaskStatus | "progress";
@@ -110,6 +144,21 @@ export type TaskDeliveryState = {
   lastNotifiedEventAt?: number;
 };
 
+export type TaskExecutionOwner = {
+  host: string;
+  pid: number;
+  startIdentity: number;
+};
+
+/** A persisted identity narrows a retained owner's operation; it never grants authority. */
+export type TaskPersistenceReceipt = Readonly<
+  Pick<TaskRecord, "taskId" | "runtime" | "ownerKey" | "scopeKind" | "createdAt"> & {
+    runId: string;
+    childSessionKey?: string;
+    taskKind?: string;
+  }
+>;
+
 export type TaskRecord = {
   taskId: string;
   runtime: TaskRuntime;
@@ -122,7 +171,11 @@ export type TaskRecord = {
   parentFlowId?: string;
   parentTaskId?: string;
   agentId?: string;
+  /** Agent store for requester transcripts whose session key is unscoped, such as `global`.
+   * Task authorization remains keyed by ownerKey. */
+  requesterAgentId?: string;
   runId?: string;
+  executionOwner?: TaskExecutionOwner;
   label?: string;
   task: string;
   status: TaskStatus;
@@ -133,13 +186,47 @@ export type TaskRecord = {
   endedAt?: number;
   lastEventAt?: number;
   cleanupAfter?: number;
+  /** Tool invocations observed on this run's agent-event stream. */
+  toolUseCount?: number;
+  /** Name of the most recent tool invocation observed for this run. */
+  lastToolName?: string;
   error?: string;
   progressSummary?: string;
   terminalSummary?: string;
   terminalOutcome?: TaskTerminalOutcome;
+  detail?: JsonValue;
 };
 
-export type TaskRegistrySnapshot = {
-  tasks: TaskRecord[];
-  deliveryStates: TaskDeliveryState[];
+/** Shared run inputs keep runtime contracts independent of transition execution. */
+export type TaskRunStateTransitionParams = {
+  runId: string;
+  taskId?: string;
+  runtime?: TaskRuntime;
+  sessionKey?: string;
+  childSessionKey?: string | null;
+  status?: TaskStatus;
+  startedAt?: number;
+  endedAt?: number;
+  lastEventAt?: number;
+  error?: string;
+  clearError?: boolean;
+  progressSummary?: string | null;
+  terminalSummary?: string | null;
+  preserveTerminalSummary?: boolean;
+  terminalOutcome?: TaskTerminalOutcome | null;
+  detail?: JsonValue;
+  eventSummary?: string | null;
+  suppressDelivery?: boolean;
 };
+
+type TaskRunDeliveryTransitionParams = {
+  runId: string;
+  runtime?: TaskRuntime;
+  sessionKey?: string;
+  deliveryStatus: TaskDeliveryStatus;
+  error?: string;
+};
+
+export type TaskRunTransition =
+  | { kind: "state"; params: TaskRunStateTransitionParams }
+  | { kind: "delivery"; params: TaskRunDeliveryTransitionParams };

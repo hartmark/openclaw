@@ -1,12 +1,32 @@
-import { resolveSessionAgentId } from "../../agents/agent-scope.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
+// Emits session lifecycle hooks for channel plugins and agent runtimes.
+import type { SessionFreshness } from "../../config/sessions/reset.js";
+import type { SessionEntry } from "../../config/sessions/types.js";
 import type {
   PluginHookSessionEndEvent,
   PluginHookSessionEndReason,
   PluginHookSessionStartEvent,
 } from "../../plugins/hook-types.js";
 
-export type SessionHookContext = {
+type ReplySessionEndReason = Extract<
+  PluginHookSessionEndReason,
+  "new" | "reset" | "idle" | "daily" | "unknown"
+>;
+
+export function resolveExplicitSessionEndReason(
+  matchedResetTriggerLower?: string,
+): Extract<ReplySessionEndReason, "new" | "reset"> {
+  return matchedResetTriggerLower === "/reset" ? "reset" : "new";
+}
+
+export function resolveStaleSessionEndReason(params: {
+  entry: SessionEntry | undefined;
+  freshness?: SessionFreshness;
+}): ReplySessionEndReason | undefined {
+  return params.entry ? params.freshness?.staleReason : undefined;
+}
+
+/** Session identity attached to plugin session hook payloads. */
+type SessionHookContext = {
   sessionId: string;
   sessionKey: string;
   agentId: string;
@@ -15,19 +35,20 @@ export type SessionHookContext = {
 function buildSessionHookContext(params: {
   sessionId: string;
   sessionKey: string;
-  cfg: OpenClawConfig;
+  agentId: string;
 }): SessionHookContext {
   return {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
-    agentId: resolveSessionAgentId({ sessionKey: params.sessionKey, config: params.cfg }),
+    agentId: params.agentId,
   };
 }
 
+/** Builds the payload for plugin session-start hooks. */
 export function buildSessionStartHookPayload(params: {
   sessionId: string;
   sessionKey: string;
-  cfg: OpenClawConfig;
+  agentId: string;
   resumedFrom?: string;
 }): {
   event: PluginHookSessionStartEvent;
@@ -42,15 +63,16 @@ export function buildSessionStartHookPayload(params: {
     context: buildSessionHookContext({
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
-      cfg: params.cfg,
+      agentId: params.agentId,
     }),
   };
 }
 
+/** Builds the payload for plugin session-end hooks. */
 export function buildSessionEndHookPayload(params: {
   sessionId: string;
   sessionKey: string;
-  cfg: OpenClawConfig;
+  agentId: string;
   messageCount?: number;
   durationMs?: number;
   reason?: PluginHookSessionEndReason;
@@ -77,7 +99,7 @@ export function buildSessionEndHookPayload(params: {
     context: buildSessionHookContext({
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
-      cfg: params.cfg,
+      agentId: params.agentId,
     }),
   };
 }

@@ -1,5 +1,10 @@
+/**
+ * Public SDK subpath for sandbox backends, SSH execution, and temp workspace helpers.
+ */
 export type {
   CreateSandboxBackendParams,
+  CreateReservedSandboxBackendParamsV1,
+  ReservedSandboxBackendFactoryV1,
   RemoteShellSandboxHandle,
   RunSshSandboxCommandParams,
   SandboxBackendCommandParams,
@@ -11,8 +16,12 @@ export type {
   SandboxBackendHandle,
   SandboxBackendId,
   SandboxBackendManager,
+  SandboxBackendPreparedWorkdirDiscarder,
   SandboxBackendRegistration,
   SandboxBackendRuntimeInfo,
+  SandboxBackendWorkdirValidation,
+  SandboxBackendWorkdirResolver,
+  SandboxBackendWorkdirValidator,
   SandboxContext,
   SandboxResolvedPath,
   SandboxSshConfig,
@@ -20,9 +29,14 @@ export type {
   SshSandboxSettings,
 } from "../agents/sandbox.js";
 export type { OpenClawConfig } from "../config/config.js";
+export type { DirectoryEntry } from "../infra/directory-entries.js";
+export { prepareSandboxProcessCleanup } from "../agents/sandbox/process-cleanup.js";
+export { resolveReadOnlyWorkspaceSkillMounts } from "../agents/sandbox/workspace-mounts.js";
+export { SANDBOX_COMMAND_MAX_BUFFER_BYTES } from "../agents/sandbox/constants.js";
 
 export {
   buildExecRemoteCommand,
+  buildRemoteWorkdirValidationCommand,
   buildRemoteCommand,
   buildSshSandboxArgv,
   buildValidatedExecRemoteCommand,
@@ -33,7 +47,9 @@ export {
   disposeSshSandboxSession,
   getSandboxBackendFactory,
   getSandboxBackendManager,
+  getSandboxBackendWorkdirResolver,
   isToolAllowed,
+  prepareSshSandboxExec,
   registerSandboxBackend,
   requireSandboxBackendFactory,
   resolveSandboxRuntimeStatus,
@@ -60,3 +76,14 @@ export {
   withTempWorkspace,
   withTempWorkspaceSync,
 } from "../infra/private-temp-workspace.js";
+export { SandboxRuntimeRetiredError } from "../agents/sandbox/provisioning-error.js";
+export {
+  createRemoteShellSandboxBackend,
+  type RemoteShellSandboxBackendOptions,
+} from "../agents/sandbox/remote-shell-backend.js";
+export {
+  createRemoteShellSandboxSession,
+  type RemoteShellCommandSpec,
+  type RemoteShellSandboxSession,
+  type RemoteShellSessionOptions,
+} from "../agents/sandbox/remote-shell-transport.js";

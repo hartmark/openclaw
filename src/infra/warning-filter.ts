@@ -1,8 +1,10 @@
+// Filters known noisy process warnings once per runtime.
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 
 const warningFilterKey = Symbol.for("openclaw.warning-filter");
 
-export type ProcessWarning = {
+/** Normalized process warning fields used by the shared warning suppressor. */
+type ProcessWarning = {
   code?: string;
   name?: string;
   message?: string;
@@ -12,7 +14,8 @@ type ProcessWarningInstallState = {
   installed: boolean;
 };
 
-export function shouldIgnoreWarning(warning: ProcessWarning): boolean {
+/** Returns whether a process warning matches a known noisy runtime/dependency warning. */
+function shouldIgnoreWarning(warning: ProcessWarning): boolean {
   if (warning.code === "DEP0040" && warning.message?.includes("punycode")) {
     return true;
   }
@@ -64,6 +67,7 @@ function normalizeWarningArgs(args: unknown[]): ProcessWarning {
   return { name, code, message };
 }
 
+/** Installs the global process warning filter once for the current JS realm. */
 export function installProcessWarningFilter(): void {
   const state = resolveGlobalSingleton<ProcessWarningInstallState>(warningFilterKey, () => ({
     installed: false,
@@ -77,6 +81,8 @@ export function installProcessWarningFilter(): void {
     if (shouldIgnoreWarning(normalizeWarningArgs(args))) {
       return;
     }
+    // Node does not emit Error + options warnings through the same path after wrapping; preserve
+    // visibility by re-emitting a normalized warning object for unsuppressed cases.
     if (
       args[0] instanceof Error &&
       args[1] &&

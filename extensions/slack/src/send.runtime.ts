@@ -1,1 +1,6 @@
-export { sendMessageSlack } from "./send.js";
+export {
+  reconcileSlackUnknownSend,
+  resolveSlackDmChannelId,
+  sendMessageSlack,
+  updateMessageSlack,
+} from "./send.js";

@@ -1,3 +1,4 @@
+// Shared frontmatter helpers parse Markdown frontmatter blocks and body text.
 import {
   normalizeOptionalLowercaseString,
   readStringValue,
@@ -6,6 +7,7 @@ import { normalizeCsvOrLooseStringList } from "@openclaw/normalization-core/stri
 import JSON5 from "json5";
 import { LEGACY_MANIFEST_KEYS, MANIFEST_KEY } from "../compat/legacy-names.js";
 import { parseBooleanValue } from "../utils/boolean.js";
+import { parseJsonWithJson5Fallback } from "../utils/parse-json-compat.js";
 
 /** Normalizes comma-delimited or loose array metadata fields into string lists. */
 export function normalizeStringList(input: unknown): string[] {
@@ -37,7 +39,7 @@ export function resolveOpenClawManifestBlock(params: {
   }
 
   try {
-    const parsed = JSON5.parse(raw);
+    const parsed = parseJsonWithJson5Fallback(raw, JSON5);
     if (!parsed || typeof parsed !== "object") {
       return undefined;
     }
@@ -56,10 +58,14 @@ export function resolveOpenClawManifestBlock(params: {
   }
 }
 
-export type OpenClawManifestRequires = {
+type OpenClawManifestRequires = {
+  /** All binaries that must be available. */
   bins: string[];
+  /** Alternative binaries where any one match is enough. */
   anyBins: string[];
+  /** Environment variables required by the entry. */
   env: string[];
+  /** Config paths required by the entry. */
   config: string[];
 };
 
@@ -98,11 +104,16 @@ export function resolveOpenClawManifestOs(metadataObj: Record<string, unknown>):
   return normalizeStringList(metadataObj.os);
 }
 
-export type ParsedOpenClawManifestInstallBase = {
+type ParsedOpenClawManifestInstallBase = {
+  /** Original install entry for caller-specific parsing. */
   raw: Record<string, unknown>;
+  /** Normalized install kind accepted by the caller. */
   kind: string;
+  /** Optional stable package/tool id from the manifest entry. */
   id?: string;
+  /** Optional human-facing package/tool label. */
   label?: string;
+  /** Optional binaries expected after installation. */
   bins?: string[];
 };
 

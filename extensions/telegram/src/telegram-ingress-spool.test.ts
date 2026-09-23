@@ -1,277 +1,247 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   closeOpenClawStateDatabaseForTest,
   createChannelIngressQueueForTests as createChannelIngressQueue,
+  createPluginStateKeyedStoreForTests,
+  createPluginStateSyncKeyedStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { afterEach, describe, expect, it } from "vitest";
-import { clearTelegramRuntime, setTelegramRuntime } from "./runtime.js";
-import type { TelegramRuntime } from "./runtime.types.js";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { beginTelegramPollRegistration } from "./poll-answer-context.js";
+import { recordTelegramPollRegistryEntry } from "./poll-registry.js";
+import { setTelegramRuntime } from "./runtime.js";
+import { clearTelegramRuntimeForTest } from "./runtime.test-support.js";
+import { createTelegramIngressMonitor } from "./telegram-ingress-drain.js";
 import {
-  claimTelegramSpooledUpdate,
-  deleteTelegramSpooledUpdate,
-  failTelegramSpooledUpdateClaim,
-  isTelegramSpooledUpdateClaimOwnedByOtherLiveProcess,
-  listTelegramSpooledUpdateClaims,
-  listTelegramSpooledUpdates,
-  recoverStaleTelegramSpooledUpdateClaims,
-  releaseTelegramSpooledUpdateClaim,
-  TELEGRAM_SPOOLED_UPDATE_PROCESSING_STALE_MS,
-  writeTelegramSpooledUpdate,
+  openTelegramIngressQueue,
+  resolveTelegramIngressSpoolDir,
+  resolveTelegramUpdateId,
 } from "./telegram-ingress-spool.js";
 
-function installTelegramIngressQueueRuntime(resolveStateDir: () => string): void {
+async function withTempState<T>(
+  fn: (stateDir: string, spoolDir: string) => Promise<T>,
+): Promise<T> {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tg-spool-"));
+  const spoolDir = resolveTelegramIngressSpoolDir({
+    accountId: "acct",
+    env: { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv,
+  });
+  const openKeyedStore = <StoreValue>(
+    options: Parameters<typeof createPluginStateKeyedStoreForTests<StoreValue>>[1],
+  ) => createPluginStateKeyedStoreForTests<StoreValue>("telegram", options);
   setTelegramRuntime({
+    channel: { inbound: { ingress: createPluginRuntimeMock().channel.inbound.ingress } },
     state: {
-      resolveStateDir,
+      resolveStateDir: () => stateDir,
+      openKeyedStore,
+      openSyncKeyedStore: <StoreValue>(
+        options: Parameters<typeof createPluginStateSyncKeyedStoreForTests<StoreValue>>[1],
+      ) => createPluginStateSyncKeyedStoreForTests<StoreValue>("telegram", options),
       openChannelIngressQueue: (
         options?: Omit<Parameters<typeof createChannelIngressQueue>[0], "channelId">,
       ) => createChannelIngressQueue({ ...options, channelId: "telegram" }),
     },
-  } as TelegramRuntime);
-}
-
-async function withTempSpool<T>(fn: (spoolDir: string) => Promise<T>): Promise<T> {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-telegram-spool-"));
-  const spoolDir = path.join(stateDir, "telegram", "ingress-spool-test");
-  await fs.mkdir(spoolDir, { recursive: true });
-  installTelegramIngressQueueRuntime(() => stateDir);
+  } as never);
   try {
-    return await fn(spoolDir);
+    return await fn(stateDir, spoolDir);
   } finally {
-    clearTelegramRuntime();
+    clearTelegramRuntimeForTest();
+    await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
     await fs.rm(stateDir, { recursive: true, force: true });
   }
 }
 
-describe("Telegram ingress spool", () => {
-  afterEach(() => {
-    clearTelegramRuntime();
-    closeOpenClawStateDatabaseForTest();
-  });
+afterEach(async () => {
+  clearTelegramRuntimeForTest();
+  await closeOpenClawStateDatabaseAsync();
+  closeOpenClawStateDatabaseForTest();
+});
 
-  it("persists updates durably in update_id order and deletes handled entries", async () => {
-    await withTempSpool(async (spoolDir) => {
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 11, message: { text: "second" } },
-        now: 2,
+describe("telegram ingress spool ordering", () => {
+  it("keeps a poll vote ahead of a later message from the same topic", async () => {
+    await withTempState(async (_stateDir, spoolDir) => {
+      await recordTelegramPollRegistryEntry({
+        accountId: "acct",
+        pollId: "poll-topic-order",
+        chat: { id: -100123, type: "supergroup", title: "Reviewers", is_forum: true },
+        messageId: 40,
+        threadSpec: { scope: "forum", id: 99 },
+        question: "Ready?",
+        options: ["Yes", "No"],
       });
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 10, message: { text: "first" } },
-        now: 1,
+      const voteUpdate = {
+        update_id: 9,
+        poll_answer: {
+          poll_id: "poll-topic-order",
+          option_ids: [0],
+          user: { id: 111, first_name: "Ada" },
+        },
+      };
+      const messageUpdate = {
+        update_id: 10,
+        message: {
+          chat: { id: -100123, type: "supergroup", title: "Reviewers", is_forum: true },
+          from: { id: 111, first_name: "Ada" },
+          is_topic_message: true,
+          message_id: 41,
+          message_thread_id: 99,
+          text: "after vote",
+        },
+      };
+
+      let releaseVote: (() => void) | undefined;
+      const voteReleased = new Promise<void>((resolve) => {
+        releaseVote = resolve;
       });
-
-      const updates = await listTelegramSpooledUpdates({ spoolDir });
-
-      expect(updates.map((update) => update.updateId)).toEqual([10, 11]);
-      expect(updates.map((update) => update.receivedAt)).toEqual([1, 2]);
-      expect(updates[0]?.update).toEqual({ update_id: 10, message: { text: "first" } });
-
-      if (!updates[0]) {
-        throw new Error("Expected a spooled update");
+      if (!releaseVote) {
+        throw new Error("Expected vote release resolver");
       }
-      await deleteTelegramSpooledUpdate(updates[0]);
+      const dispatchOrder: number[] = [];
+      const onError = vi.fn();
+      const queue = openTelegramIngressQueue(spoolDir);
+      const monitor = createTelegramIngressMonitor({
+        queue,
+        getConfig: () => ({ channels: { telegram: { groupPolicy: "open" } } }) as OpenClawConfig,
+        accountId: "acct",
+        onError,
+        dispatch: async (update) => {
+          const updateId = resolveTelegramUpdateId(update);
+          if (updateId === null) {
+            throw new Error("Expected update id");
+          }
+          dispatchOrder.push(updateId);
+          if (updateId === 9) {
+            await voteReleased;
+          }
+          return { kind: "completed" };
+        },
+      });
 
-      expect(
-        (await listTelegramSpooledUpdates({ spoolDir })).map((update) => update.updateId),
-      ).toEqual([11]);
+      monitor.start();
+      try {
+        await monitor.waitForIdle();
+        const admissions = await Promise.all([
+          monitor.admit(voteUpdate),
+          monitor.admit(messageUpdate),
+        ]);
+        expect(admissions.map((result) => result.kind)).toEqual(["durable", "durable"]);
+        await monitor.waitForPumpIdle();
+        await vi.waitFor(() => expect(dispatchOrder).toEqual([9]));
+        expect(onError).not.toHaveBeenCalled();
+        expect(await queue.listClaims()).toEqual([
+          expect.objectContaining({
+            id: "0000000000000009",
+            laneKey: "telegram:-100123:topic:99",
+            payload: expect.objectContaining({
+              preparedPollAnswer: {
+                entry: expect.objectContaining({ threadSpec: { scope: "forum", id: 99 } }),
+              },
+            }),
+          }),
+        ]);
+        expect(await queue.listPending({ limit: "all" })).toEqual([
+          expect.objectContaining({
+            id: "0000000000000010",
+            laneKey: "telegram:-100123:topic:99",
+          }),
+        ]);
+        releaseVote();
+        await monitor.waitForIdle();
+        expect(dispatchOrder).toEqual([9, 10]);
+      } finally {
+        releaseVote();
+        await monitor.stop();
+      }
     });
   });
 
-  it("claims active updates so they are hidden from pending drain lists", async () => {
-    await withTempSpool(async (spoolDir) => {
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 20, message: { text: "active" } },
+  it("fences a pending poll vote to its topic without blocking unrelated admission", async () => {
+    await withTempState(async (_stateDir, spoolDir) => {
+      const entry = {
+        pollId: "poll-pending-topic",
+        chat: {
+          id: -100123,
+          type: "supergroup" as const,
+          title: "Reviewers",
+          is_forum: true as const,
+        },
+        messageId: 40,
+        threadSpec: { scope: "forum" as const, id: 99 },
+        question: "Ready?",
+        options: ["Yes", "No"],
+      };
+      const registration = beginTelegramPollRegistration({ accountId: "acct", entry });
+      const voteUpdate = {
+        update_id: 9,
+        poll_answer: {
+          poll_id: entry.pollId,
+          option_ids: [0],
+          user: { id: 111, first_name: "Ada" },
+        },
+      };
+      const unrelatedUpdate = {
+        update_id: 10,
+        message: {
+          chat: entry.chat,
+          from: { id: 111, first_name: "Ada" },
+          is_topic_message: true,
+          message_id: 41,
+          message_thread_id: 100,
+          text: "unrelated topic",
+        },
+      };
+      const sameTopicUpdate = {
+        update_id: 11,
+        message: {
+          chat: entry.chat,
+          from: { id: 111, first_name: "Ada" },
+          is_topic_message: true,
+          message_id: 42,
+          message_thread_id: 99,
+          text: "after vote",
+        },
+      };
+      const dispatchOrder: number[] = [];
+      const queue = openTelegramIngressQueue(spoolDir);
+      const monitor = createTelegramIngressMonitor({
+        queue,
+        getConfig: () => ({ channels: { telegram: { groupPolicy: "open" } } }) as OpenClawConfig,
+        accountId: "acct",
+        dispatch: (update) => {
+          const updateId = resolveTelegramUpdateId(update);
+          if (updateId === null) {
+            throw new Error("Expected update id");
+          }
+          dispatchOrder.push(updateId);
+          return { kind: "completed" };
+        },
       });
-      const update = (await listTelegramSpooledUpdates({ spoolDir }))[0];
-      if (!update) {
-        throw new Error("Expected a spooled update");
-      }
 
-      const claimed = await claimTelegramSpooledUpdate(update);
-
-      expect(claimed?.updateId).toBe(20);
-      expect(claimed?.path.endsWith(".json.processing")).toBe(true);
-      expect(await listTelegramSpooledUpdates({ spoolDir })).toEqual([]);
-      expect(
-        (await listTelegramSpooledUpdateClaims({ spoolDir })).map((claim) => claim.updateId),
-      ).toEqual([20]);
-
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 20, message: { text: "duplicate" } },
-      });
-      expect(await listTelegramSpooledUpdates({ spoolDir })).toEqual([]);
-
-      if (!claimed) {
-        throw new Error("Expected a claimed update");
-      }
-      await deleteTelegramSpooledUpdate(claimed);
-      expect(await listTelegramSpooledUpdateClaims({ spoolDir })).toEqual([]);
-    });
-  });
-
-  it("releases failed claims back to the pending spool", async () => {
-    await withTempSpool(async (spoolDir) => {
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 30, message: { text: "retry me" } },
-      });
-      const update = (await listTelegramSpooledUpdates({ spoolDir }))[0];
-      if (!update) {
-        throw new Error("Expected a spooled update");
-      }
-      const claimed = await claimTelegramSpooledUpdate(update);
-      if (!claimed) {
-        throw new Error("Expected a claimed update");
-      }
-
-      await releaseTelegramSpooledUpdateClaim(claimed);
-
-      const updates = await listTelegramSpooledUpdates({ spoolDir });
-      expect(updates.map((entry) => entry.updateId)).toEqual([30]);
-      expect(updates[0]?.path.endsWith(".json")).toBe(true);
-    });
-  });
-
-  it("marks timed out claims failed without requeueing them", async () => {
-    await withTempSpool(async (spoolDir) => {
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 32, message: { text: "poison" } },
-      });
-      const update = (await listTelegramSpooledUpdates({ spoolDir }))[0];
-      if (!update) {
-        throw new Error("Expected a spooled update");
-      }
-      const claimed = await claimTelegramSpooledUpdate(update);
-      if (!claimed) {
-        throw new Error("Expected a claimed update");
-      }
-
+      monitor.start();
+      await monitor.waitForIdle();
       await expect(
-        failTelegramSpooledUpdateClaim({
-          update: claimed,
-          reason: "handler-timeout",
-          message: "timed out",
-          now: 123,
-        }),
-      ).resolves.toBe(true);
+        Promise.all([
+          monitor.admit(voteUpdate),
+          monitor.admit(unrelatedUpdate),
+          monitor.admit(sameTopicUpdate),
+        ]),
+      ).resolves.toMatchObject([{ kind: "durable" }, { kind: "durable" }, { kind: "durable" }]);
+      await vi.waitFor(() => expect(dispatchOrder).toContain(10));
+      expect(dispatchOrder).not.toContain(9);
+      expect(dispatchOrder).not.toContain(11);
+      expect(await queue.listClaims()).toEqual([
+        expect.objectContaining({ laneKey: "telegram:-100123:topic:99" }),
+      ]);
 
-      expect(await listTelegramSpooledUpdates({ spoolDir })).toEqual([]);
-      expect(await listTelegramSpooledUpdateClaims({ spoolDir })).toEqual([]);
-
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 32, message: { text: "redelivered poison" } },
-        now: 124,
-      });
-      expect(await listTelegramSpooledUpdates({ spoolDir })).toEqual([]);
-
-      await expect(recoverStaleTelegramSpooledUpdateClaims({ spoolDir })).resolves.toBe(0);
-      expect(await listTelegramSpooledUpdates({ spoolDir })).toEqual([]);
-      expect(await listTelegramSpooledUpdateClaims({ spoolDir })).toEqual([]);
+      registration.complete(entry);
+      await monitor.waitForIdle();
+      expect(dispatchOrder.indexOf(9)).toBeLessThan(dispatchOrder.indexOf(11));
+      await monitor.stop();
     });
-  });
-
-  it("does not claim an update after the pending file is gone", async () => {
-    await withTempSpool(async (spoolDir) => {
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 35, message: { text: "already handled" } },
-      });
-      const update = (await listTelegramSpooledUpdates({ spoolDir }))[0];
-      if (!update) {
-        throw new Error("Expected a spooled update");
-      }
-      await deleteTelegramSpooledUpdate(update);
-
-      await expect(claimTelegramSpooledUpdate(update)).resolves.toBeNull();
-      expect(await listTelegramSpooledUpdates({ spoolDir })).toEqual([]);
-    });
-  });
-
-  it("recovers stale processing claims selected by the caller", async () => {
-    await withTempSpool(async (spoolDir) => {
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 41, message: { text: "stale" } },
-      });
-      const updates = await listTelegramSpooledUpdates({ spoolDir });
-      const stale = updates.find((update) => update.updateId === 41);
-      if (!stale) {
-        throw new Error("Expected spooled updates");
-      }
-      const claimedStale = await claimTelegramSpooledUpdate(stale);
-      if (!claimedStale) {
-        throw new Error("Expected claimed updates");
-      }
-      const now = Date.now();
-
-      const recovered = await recoverStaleTelegramSpooledUpdateClaims({
-        spoolDir,
-        now: now + TELEGRAM_SPOOLED_UPDATE_PROCESSING_STALE_MS + 1,
-      });
-
-      expect(recovered).toBe(1);
-      expect(
-        (await listTelegramSpooledUpdates({ spoolDir })).map((update) => update.updateId),
-      ).toEqual([41]);
-    });
-  });
-
-  it("lets recovery callers keep a claim in processing", async () => {
-    await withTempSpool(async (spoolDir) => {
-      await writeTelegramSpooledUpdate({
-        spoolDir,
-        update: { update_id: 45, message: { text: "busy" } },
-      });
-      const update = (await listTelegramSpooledUpdates({ spoolDir }))[0];
-      if (!update) {
-        throw new Error("Expected a spooled update");
-      }
-      const claimed = await claimTelegramSpooledUpdate(update);
-      if (!claimed) {
-        throw new Error("Expected a claimed update");
-      }
-      let shouldRecoverCalls = 0;
-      const recovered = await recoverStaleTelegramSpooledUpdateClaims({
-        spoolDir,
-        staleMs: 0,
-        shouldRecover: () => {
-          shouldRecoverCalls += 1;
-          return false;
-        },
-      });
-
-      expect(recovered).toBe(0);
-      expect(shouldRecoverCalls).toBe(1);
-      expect(
-        (await listTelegramSpooledUpdateClaims({ spoolDir })).map((claim) => claim.updateId),
-      ).toEqual([45]);
-    });
-  });
-
-  it("does not treat stale claims with reused pids as live-owned", () => {
-    const now = Date.now();
-    expect(
-      isTelegramSpooledUpdateClaimOwnedByOtherLiveProcess({
-        updateId: 50,
-        path: path.join(os.tmpdir(), "50.json.processing"),
-        pendingPath: path.join(os.tmpdir(), "50.json"),
-        update: { update_id: 50 },
-        receivedAt: now,
-        claim: {
-          processId: "other-process",
-          processPid: process.pid,
-          claimedAt: now - TELEGRAM_SPOOLED_UPDATE_PROCESSING_STALE_MS - 1,
-        },
-      }),
-    ).toBe(false);
   });
 });

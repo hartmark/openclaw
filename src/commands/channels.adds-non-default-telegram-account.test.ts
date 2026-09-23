@@ -1,7 +1,8 @@
+// Channels account tests cover non-default Telegram account setup, status, removal, and binding behavior.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPatchedAccountSetupAdapter } from "../channels/plugins/setup-helpers.js";
-import type { ChannelStatusIssue } from "../channels/plugins/types.core.js";
-import type { ChannelPlugin } from "../channels/plugins/types.js";
+import type { ChannelSetupInput, ChannelStatusIssue } from "../channels/plugins/types.core.js";
+import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import { createScopedChannelConfigAdapter } from "../plugin-sdk/channel-config-helpers.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../routing/session-key.js";
@@ -9,8 +10,12 @@ import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/c
 import { configMocks, offsetMocks, secretMocks } from "./channels.mock-harness.js";
 import { channelsAddCommand } from "./channels/add.js";
 import { channelsRemoveCommand } from "./channels/remove.js";
-import { formatGatewayChannelsStatusLines } from "./channels/status.js";
-import { baseConfigSnapshot, createTestRuntime } from "./test-runtime-config-helpers.js";
+import { formatGatewayChannelsStatusLines } from "./channels/status.runtime.js";
+import {
+  baseConfigSnapshot,
+  createTestConfigSnapshot,
+  createTestRuntime,
+} from "./test-runtime-config-helpers.js";
 
 const runtime = createTestRuntime();
 let minimalChannelsCommandRegistry: ReturnType<typeof createTestRegistry>;
@@ -34,6 +39,8 @@ type ChannelSectionConfig = {
   account?: string;
   accounts?: Record<string, Record<string, unknown>>;
 };
+
+type SignalSetupInput = ChannelSetupInput & { signalNumber?: string };
 
 function formatChannelStatusJoined(channelAccounts: Record<string, unknown>) {
   return formatGatewayChannelsStatusLines({
@@ -124,7 +131,7 @@ function createScopedCommandTestPlugin(params: {
             token: input.token,
             botToken: input.botToken,
             appToken: input.appToken,
-            signalNumber: input.signalNumber,
+            signalNumber: (input as SignalSetupInput).signalNumber,
           }),
       }),
       ...(params.singleAccountKeysToMove
@@ -170,50 +177,6 @@ function createTelegramCommandTestPlugin(): ChannelPlugin {
     onAccountRemoved: async ({ accountId }) => {
       await offsetMocks.deleteTelegramUpdateOffset({ accountId });
     },
-    collectStatusIssues: (accounts) =>
-      accounts.flatMap((account) => {
-        if (account.enabled !== true || account.configured !== true) {
-          return [];
-        }
-        const issues: ChannelStatusIssue[] = [];
-        const issueAccountId = account.accountId ?? DEFAULT_ACCOUNT_ID;
-        if (account.allowUnmentionedGroups === true) {
-          issues.push({
-            channel: "telegram",
-            accountId: issueAccountId,
-            kind: "config",
-            message:
-              "Config allows unmentioned group messages (requireMention=false). Telegram Bot API privacy mode will block most group messages unless disabled.",
-          });
-        }
-        const audit = account.audit as
-          | {
-              hasWildcardUnmentionedGroups?: boolean;
-              groups?: Array<{ chatId?: string; ok?: boolean; status?: string; error?: string }>;
-            }
-          | undefined;
-        if (audit?.hasWildcardUnmentionedGroups === true) {
-          issues.push({
-            channel: "telegram",
-            accountId: issueAccountId,
-            kind: "config",
-            message:
-              'Telegram groups config uses "*" with requireMention=false; membership probing is not possible without explicit group IDs.',
-          });
-        }
-        for (const group of audit?.groups ?? []) {
-          if (group.ok === true || !group.chatId) {
-            continue;
-          }
-          issues.push({
-            channel: "telegram",
-            accountId: issueAccountId,
-            kind: "runtime",
-            message: `Group ${group.chatId} not reachable by bot.${group.status ? ` status=${group.status}` : ""}${group.error ? `: ${group.error}` : ""}`,
-          });
-        }
-        return issues;
-      }),
   });
   return {
     ...plugin,
@@ -488,9 +451,8 @@ describe("channels command", () => {
   });
 
   it("deletes a non-default discord account", async () => {
-    configMocks.readConfigFileSnapshot.mockResolvedValue({
-      ...baseConfigSnapshot,
-      config: {
+    configMocks.readConfigFileSnapshot.mockResolvedValue(
+      createTestConfigSnapshot({
         channels: {
           discord: {
             accounts: {
@@ -499,8 +461,8 @@ describe("channels command", () => {
             },
           },
         },
-      },
-    });
+      }),
+    );
 
     await channelsRemoveCommand({ channel: "discord", account: "work", delete: true }, runtime, {
       hasFlags: true,
@@ -569,12 +531,11 @@ describe("channels command", () => {
   });
 
   it("disables a default provider account when remove has no delete flag", async () => {
-    configMocks.readConfigFileSnapshot.mockResolvedValue({
-      ...baseConfigSnapshot,
-      config: {
+    configMocks.readConfigFileSnapshot.mockResolvedValue(
+      createTestConfigSnapshot({
         channels: { discord: { token: "d0", enabled: true } },
-      },
-    });
+      }),
+    );
 
     await runRemoveWithConfirm({ channel: "discord", account: "default" });
 
@@ -671,6 +632,26 @@ describe("channels command", () => {
     expect(telegramIndex).toBeLessThan(whatsappIndex);
   });
 
+  it("formats phone allowlists without interpreting arbitrary account names", () => {
+    const lines = formatGatewayChannelsStatusLines({
+      channelLabels: { signal: "Signal" },
+      channelAccounts: {
+        signal: [
+          {
+            accountId: "work",
+            name: "+12133734253",
+            configured: true,
+            allowFrom: ["+442079460018", "uuid:123e4567-e89b-12d3-a456-426614174000"],
+          },
+        ],
+      },
+    });
+
+    expect(lines).toContain(
+      "- Signal work (+12133734253): configured, allow:+44 20 7946 0018 (id: +442079460018),uuid:123e4567-e89b-12d3-a456-426614174000",
+    );
+  });
+
   it.each([
     {
       name: "surfaces Discord privileged intent issues in channels status output",
@@ -713,20 +694,6 @@ describe("channels command", () => {
       },
       patterns: [/Warnings:/, /permission audit/i, /Channel 111/i],
     },
-    {
-      name: "surfaces Telegram privacy-mode hints when allowUnmentionedGroups is enabled",
-      channelAccounts: {
-        telegram: [
-          {
-            accountId: "default",
-            enabled: true,
-            configured: true,
-            allowUnmentionedGroups: true,
-          },
-        ],
-      },
-      patterns: [/Warnings:/, /Telegram Bot API privacy mode/i],
-    },
   ])("$name", ({ channelAccounts, patterns }) => {
     const joined = formatChannelStatusJoined(channelAccounts);
     for (const pattern of patterns) {
@@ -746,33 +713,6 @@ describe("channels command", () => {
       ],
     });
     expect(joined).toMatch(/bot:@openclaw_bot/);
-  });
-
-  it("surfaces Telegram group membership audit issues in channels status output", () => {
-    const joined = formatChannelStatusJoined({
-      telegram: [
-        {
-          accountId: "default",
-          enabled: true,
-          configured: true,
-          audit: {
-            hasWildcardUnmentionedGroups: true,
-            unresolvedGroups: 1,
-            groups: [
-              {
-                chatId: "-1001",
-                ok: false,
-                status: "left",
-                error: "not in group",
-              },
-            ],
-          },
-        },
-      ],
-    });
-    expect(joined).toMatch(/Warnings:/);
-    expect(joined).toMatch(/membership probing is not possible/i);
-    expect(joined).toMatch(/Group -1001/i);
   });
 
   it("surfaces WhatsApp auth/runtime hints when unlinked or disconnected", () => {
@@ -809,14 +749,13 @@ describe("channels command", () => {
   });
 
   it("cleans up telegram update offset when deleting a telegram account", async () => {
-    configMocks.readConfigFileSnapshot.mockResolvedValue({
-      ...baseConfigSnapshot,
-      config: {
+    configMocks.readConfigFileSnapshot.mockResolvedValue(
+      createTestConfigSnapshot({
         channels: {
           telegram: { botToken: "123:abc", enabled: true },
         },
-      },
-    });
+      }),
+    );
 
     await channelsRemoveCommand(
       { channel: "telegram", account: "default", delete: true },
@@ -830,9 +769,8 @@ describe("channels command", () => {
   });
 
   it("does not clean up offset when deleting a non-telegram channel", async () => {
-    configMocks.readConfigFileSnapshot.mockResolvedValue({
-      ...baseConfigSnapshot,
-      config: {
+    configMocks.readConfigFileSnapshot.mockResolvedValue(
+      createTestConfigSnapshot({
         channels: {
           discord: {
             accounts: {
@@ -840,8 +778,8 @@ describe("channels command", () => {
             },
           },
         },
-      },
-    });
+      }),
+    );
 
     await channelsRemoveCommand({ channel: "discord", account: "default", delete: true }, runtime, {
       hasFlags: true,
@@ -851,14 +789,13 @@ describe("channels command", () => {
   });
 
   it("does not clean up offset when disabling (not deleting) a telegram account", async () => {
-    configMocks.readConfigFileSnapshot.mockResolvedValue({
-      ...baseConfigSnapshot,
-      config: {
+    configMocks.readConfigFileSnapshot.mockResolvedValue(
+      createTestConfigSnapshot({
         channels: {
           telegram: { botToken: "123:abc", enabled: true },
         },
-      },
-    });
+      }),
+    );
 
     await runRemoveWithConfirm({ channel: "telegram", account: "default" });
 

@@ -1,10 +1,13 @@
+// Zalo plugin module implements send behavior.
 import {
   createMessageReceiptFromOutboundResults,
   type MessageReceipt,
   type MessageReceiptPartKind,
 } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { stripChannelTargetPrefix, stripTargetKindPrefix } from "openclaw/plugin-sdk/core";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { resolveZaloAccount } from "./accounts.js";
 import type { ZaloFetch } from "./api.js";
 import { sendMessage, sendPhoto } from "./api.js";
@@ -19,6 +22,7 @@ type ZaloSendOptions = {
   caption?: string;
   verbose?: boolean;
   proxy?: string;
+  assertDirectAdapterHandoff?: () => void;
 };
 
 type ZaloSendResult = {
@@ -76,12 +80,32 @@ function toZaloSendResult(
 async function runZaloSend(
   failureMessage: string,
   params: { chatId: string; kind: MessageReceiptPartKind },
-  send: () => Promise<{ ok?: boolean; result?: { message_id?: string } }>,
+  assertDirectAdapterHandoff: (() => void) | undefined,
+  send: (assertCurrent: (() => void) | undefined) => Promise<{
+    ok?: boolean;
+    result?: { message_id?: string };
+  }>,
 ): Promise<ZaloSendResult> {
+  let handoffRejected = false;
+  let handoffError: unknown;
+  const assertCurrent = assertDirectAdapterHandoff
+    ? () => {
+        try {
+          assertDirectAdapterHandoff();
+        } catch (error) {
+          handoffRejected = true;
+          handoffError = error;
+          throw error;
+        }
+      }
+    : undefined;
   try {
-    const result = toZaloSendResult(await send(), params);
+    const result = toZaloSendResult(await send(assertCurrent), params);
     return result.ok ? result : { ok: false, error: failureMessage, receipt: result.receipt };
   } catch (err) {
+    if (handoffRejected && Object.is(handoffError, err)) {
+      throw err;
+    }
     return {
       ok: false,
       error: formatErrorMessage(err),
@@ -117,11 +141,15 @@ function resolveValidatedSendContext(
   if (!token) {
     return { ok: false, error: "No Zalo bot token configured" };
   }
-  const trimmedChatId = chatId?.trim();
+  const trimmedChatId = normalizeZaloSendChatId(chatId);
   if (!trimmedChatId) {
     return { ok: false, error: "No chat_id provided" };
   }
   return { ok: true, chatId: trimmedChatId, token, fetcher };
+}
+
+function normalizeZaloSendChatId(chatId: string): string {
+  return stripTargetKindPrefix(stripChannelTargetPrefix(chatId, "zalo", "zl"));
 }
 
 function resolveSendContextOrFailure(
@@ -153,55 +181,47 @@ export async function sendMessageZalo(
   }
   const { context } = resolved;
 
-  if (options.mediaUrl) {
-    return sendPhotoZalo(context.chatId, options.mediaUrl, {
-      ...options,
-      token: context.token,
-      caption: text || options.caption,
-    });
+  if (options.mediaUrl && (options.mediaUrl.trim() || !text)) {
+    const photoUrl = options.mediaUrl.trim();
+    if (!photoUrl) {
+      return {
+        ok: false,
+        error: "No photo URL provided",
+        receipt: createZaloSendReceipt({ chatId: context.chatId, kind: "media" }),
+      };
+    }
+    const caption = text || options.caption;
+    return await runZaloSend(
+      "Failed to send photo",
+      { chatId: context.chatId, kind: "media" },
+      options.assertDirectAdapterHandoff,
+      (assertCurrent) =>
+        sendPhoto(
+          context.token,
+          {
+            chat_id: context.chatId,
+            photo: photoUrl,
+            caption,
+          },
+          context.fetcher,
+          assertCurrent,
+        ),
+    );
   }
 
-  return await runZaloSend("Failed to send message", { chatId: context.chatId, kind: "text" }, () =>
-    sendMessage(
-      context.token,
-      {
-        chat_id: context.chatId,
-        text: text.slice(0, 2000),
-      },
-      context.fetcher,
-    ),
-  );
-}
-
-export async function sendPhotoZalo(
-  chatId: string,
-  photoUrl: string,
-  options: ZaloSendOptions = {},
-): Promise<ZaloSendResult> {
-  const resolved = resolveSendContextOrFailure(chatId, options);
-  if ("failure" in resolved) {
-    return resolved.failure;
-  }
-  const { context } = resolved;
-
-  if (!photoUrl?.trim()) {
-    return {
-      ok: false,
-      error: "No photo URL provided",
-      receipt: createZaloSendReceipt({ chatId: context.chatId, kind: "media" }),
-    };
-  }
-
-  return await runZaloSend("Failed to send photo", { chatId: context.chatId, kind: "media" }, () =>
-    (async () =>
-      sendPhoto(
+  return await runZaloSend(
+    "Failed to send message",
+    { chatId: context.chatId, kind: "text" },
+    options.assertDirectAdapterHandoff,
+    (assertCurrent) =>
+      sendMessage(
         context.token,
         {
           chat_id: context.chatId,
-          photo: photoUrl.trim(),
-          caption: options.caption?.slice(0, 2000),
+          text: truncateUtf16Safe(text, 2000),
         },
         context.fetcher,
-      ))(),
+        assertCurrent,
+      ),
   );
 }

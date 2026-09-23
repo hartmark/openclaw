@@ -1,8 +1,7 @@
-import { readFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
 import { isFutureDateTimestampMs } from "openclaw/plugin-sdk/number-runtime";
-import { privateFileStoreSync } from "openclaw/plugin-sdk/security-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { MSTeamsConfig } from "../runtime-api.js";
+import { loadMSTeamsDelegatedTokens, saveMSTeamsDelegatedTokens } from "./delegated-state.js";
 import type { MSTeamsDelegatedTokens } from "./oauth.shared.js";
 import { refreshMSTeamsDelegatedTokens } from "./oauth.token.js";
 import {
@@ -10,11 +9,10 @@ import {
   normalizeResolvedSecretInputString,
   normalizeSecretInputString,
 } from "./secret-input.js";
-import { resolveMSTeamsStorePath } from "./storage.js";
 
 // ── Credential types ───────────────────────────────────────────────────────
 
-export type MSTeamsSecretCredentials = {
+type MSTeamsSecretCredentials = {
   type: "secret";
   appId: string;
   appPassword: string;
@@ -49,6 +47,18 @@ function resolveAuthType(cfg?: MSTeamsConfig): "secret" | "federated" {
   return "secret";
 }
 
+function resolveFederatedPath(configValue?: string, envValue?: string): string | undefined {
+  // Reject blank settings without trimming a real path: surrounding whitespace
+  // can be part of the certificate filename on the filesystem.
+  if (normalizeOptionalString(configValue)) {
+    return configValue;
+  }
+  if (normalizeOptionalString(envValue)) {
+    return envValue;
+  }
+  return undefined;
+}
+
 // ── hasConfiguredMSTeamsCredentials ────────────────────────────────────────
 
 export function hasConfiguredMSTeamsCredentials(cfg?: MSTeamsConfig): boolean {
@@ -64,7 +74,9 @@ export function hasConfiguredMSTeamsCredentials(cfg?: MSTeamsConfig): boolean {
   );
 
   if (authType === "federated") {
-    const hasCert = Boolean(cfg?.certificatePath || process.env.MSTEAMS_CERTIFICATE_PATH);
+    const hasCert = Boolean(
+      resolveFederatedPath(cfg?.certificatePath, process.env.MSTEAMS_CERTIFICATE_PATH),
+    );
     const hasManagedIdentity =
       cfg?.useManagedIdentity ?? process.env.MSTEAMS_USE_MANAGED_IDENTITY === "true";
 
@@ -97,8 +109,10 @@ export function resolveMSTeamsCredentials(cfg?: MSTeamsConfig): MSTeamsCredentia
   }
 
   if (authType === "federated") {
-    const certificatePath =
-      cfg?.certificatePath || process.env.MSTEAMS_CERTIFICATE_PATH || undefined;
+    const certificatePath = resolveFederatedPath(
+      cfg?.certificatePath,
+      process.env.MSTEAMS_CERTIFICATE_PATH,
+    );
 
     const certificateThumbprint =
       cfg?.certificateThumbprint || process.env.MSTEAMS_CERTIFICATE_THUMBPRINT || undefined;
@@ -143,24 +157,12 @@ export function resolveMSTeamsCredentials(cfg?: MSTeamsConfig): MSTeamsCredentia
 // Delegated token storage / resolution
 // ---------------------------------------------------------------------------
 
-const DELEGATED_TOKEN_FILENAME = "msteams-delegated.json";
-
-function resolveDelegatedTokenPath(): string {
-  return resolveMSTeamsStorePath({ filename: DELEGATED_TOKEN_FILENAME });
+export function loadDelegatedTokens(): Promise<MSTeamsDelegatedTokens | undefined> {
+  return loadMSTeamsDelegatedTokens();
 }
 
-export function loadDelegatedTokens(): MSTeamsDelegatedTokens | undefined {
-  try {
-    const content = readFileSync(resolveDelegatedTokenPath(), "utf8");
-    return JSON.parse(content) as MSTeamsDelegatedTokens;
-  } catch {
-    return undefined;
-  }
-}
-
-export function saveDelegatedTokens(tokens: MSTeamsDelegatedTokens): void {
-  const tokenPath = resolveDelegatedTokenPath();
-  privateFileStoreSync(dirname(tokenPath)).writeJson(basename(tokenPath), tokens);
+export function saveDelegatedTokens(tokens: MSTeamsDelegatedTokens): Promise<void> {
+  return saveMSTeamsDelegatedTokens(tokens);
 }
 
 export async function resolveDelegatedAccessToken(params: {
@@ -168,7 +170,7 @@ export async function resolveDelegatedAccessToken(params: {
   clientId: string;
   clientSecret: string;
 }): Promise<string | undefined> {
-  const tokens = loadDelegatedTokens();
+  const tokens = await loadDelegatedTokens();
   if (!tokens) {
     return undefined;
   }
@@ -187,7 +189,7 @@ export async function resolveDelegatedAccessToken(params: {
       refreshToken: tokens.refreshToken,
       scopes: tokens.scopes,
     });
-    saveDelegatedTokens(refreshed);
+    await saveDelegatedTokens(refreshed);
     return refreshed.accessToken;
   } catch {
     return undefined;

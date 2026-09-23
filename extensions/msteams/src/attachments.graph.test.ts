@@ -1,5 +1,7 @@
+// Msteams tests cover attachments.graph plugin behavior.
 import { mockPinnedHostnameResolution } from "openclaw/plugin-sdk/test-env";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cancelTrackedTextResponse } from "../../test-support/streaming-error-response.js";
 import type { PluginRuntime } from "../runtime-api.js";
 import { readRemoteMediaResponse } from "./attachments.test-helpers.js";
 import { downloadMSTeamsGraphMedia } from "./attachments/graph.js";
@@ -72,6 +74,9 @@ const saveResponseMediaMock = vi.fn(
     },
   ) => {
     const buffer = Buffer.from(await res.arrayBuffer());
+    if (options.maxBytes !== undefined && buffer.byteLength > options.maxBytes) {
+      throw new Error(`payload exceeds maxBytes ${options.maxBytes}`);
+    }
     return await saveMediaBufferMock(
       buffer,
       options.fallbackContentType,
@@ -158,7 +163,7 @@ const expectMediaBufferSaved = () => {
 };
 
 const createHostedContentsWithType = (contentType: string, ...ids: string[]) =>
-  ids.map((id) => ({ id, contentType, contentBytes: PNG_BUFFER.toString("base64") }));
+  ids.map((id) => ({ id, contentType }));
 const createHostedImageContents = (...ids: string[]) =>
   createHostedContentsWithType(CONTENT_TYPE_IMAGE_PNG, ...ids);
 const createReferenceAttachment = (shareUrl = DEFAULT_SHARE_REFERENCE_URL) => ({
@@ -262,7 +267,13 @@ const runGraphMediaSuccessCase = async ({
 
 const GRAPH_MEDIA_SUCCESS_CASES: GraphMediaSuccessCase[] = [
   withLabel("downloads hostedContents images", {
-    buildOptions: () => ({ hostedContents: createHostedImageContents("1") }),
+    buildOptions: () => ({
+      hostedContents: createHostedImageContents("1"),
+      onUnhandled: (url) =>
+        url.endsWith("/hostedContents/1/$value")
+          ? createBufferResponse(PNG_BUFFER, CONTENT_TYPE_IMAGE_PNG)
+          : undefined,
+    }),
     expectedLength: 1,
     assert: ({ fetchMock }) => {
       expect(fetchMock).toHaveBeenCalled();
@@ -287,6 +298,10 @@ const GRAPH_MEDIA_SUCCESS_CASES: GraphMediaSuccessCase[] = [
         hostedContents: createHostedImageContents("hosted-1"),
         ...buildDefaultShareReferenceGraphFetchOptions({
           onShareRequest: () => createPdfResponse(),
+          onUnhandled: (url) =>
+            url.endsWith("/hostedContents/hosted-1/$value")
+              ? createBufferResponse(PNG_BUFFER, CONTENT_TYPE_IMAGE_PNG)
+              : undefined,
         }),
       };
     },
@@ -309,6 +324,32 @@ describe("msteams graph attachments", () => {
   });
 
   it.each<GraphMediaSuccessCase>(GRAPH_MEDIA_SUCCESS_CASES)("$label", runGraphMediaSuccessCase);
+
+  it("cancels non-OK Graph collection bodies before returning empty hosted content", async () => {
+    const tracked = cancelTrackedTextResponse("missing hosted contents", { status: 404 });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = resolveRequestUrl(input);
+      if (url === DEFAULT_MESSAGE_URL) {
+        return createJsonResponse({ attachments: [] });
+      }
+      if (url === `${DEFAULT_MESSAGE_URL}/hostedContents`) {
+        return tracked.response;
+      }
+      return createNotFoundResponse();
+    });
+
+    const media = await downloadMSTeamsGraphMedia({
+      messageUrl: DEFAULT_MESSAGE_URL,
+      tokenProvider: createTokenProvider(),
+      maxBytes: DEFAULT_MAX_BYTES,
+      fetchFn: asFetchFn(fetchMock),
+      resolveFn: resolvePublicHost,
+    });
+
+    expect(media.media).toEqual([]);
+    expect(media.hostedStatus).toBe(404);
+    expect(tracked.wasCanceled()).toBe(true);
+  });
 
   it("does not forward Authorization for SharePoint redirects outside auth allowlist", async () => {
     const tokenProvider = createTokenProvider("top-secret-token");
@@ -375,40 +416,32 @@ describe("msteams graph attachments", () => {
       },
     );
 
-    expectAttachmentMediaLength(media.media, 0);
+    expect(media.media).toEqual([{ kind: "document", sourceId: "ref-1" }]);
     const calledUrls = fetchMock.mock.calls.map((call) => call[0]);
     const expectedSharesUrl = `${GRAPH_SHARES_URL_PREFIX}${encodeGraphShareId(DEFAULT_SHARE_REFERENCE_URL)}/driveItem/content`;
     expect(calledUrls).toEqual([
       DEFAULT_MESSAGE_URL,
       expectedSharesUrl,
       `${DEFAULT_MESSAGE_URL}/hostedContents`,
-      expectedSharesUrl,
     ]);
     expect(calledUrls).not.toContain(escapedUrl);
   });
 
-  it("skips inline hosted content when estimated decoded bytes exceed maxBytes", async () => {
-    const oversizedBase64 = "A".repeat(16);
-    const bufferFromSpy = vi.spyOn(Buffer, "from");
+  it("enforces maxBytes while streaming hosted content", async () => {
+    const { media } = await downloadGraphMediaWithMockOptions(
+      {
+        hostedContents: createHostedImageContents("hosted-oversized"),
+        onUnhandled: (url) =>
+          url.endsWith("/hostedContents/hosted-oversized/$value")
+            ? createBufferResponse("too large", CONTENT_TYPE_IMAGE_PNG)
+            : undefined,
+      },
+      { maxBytes: 4 },
+    );
 
-    try {
-      const { media } = await downloadGraphMediaWithMockOptions(
-        {
-          hostedContents: [
-            {
-              id: "hosted-oversized",
-              contentType: CONTENT_TYPE_IMAGE_PNG,
-              contentBytes: oversizedBase64,
-            },
-          ],
-        },
-        { maxBytes: 4 },
-      );
-
-      expect(media.media).toStrictEqual([]);
-      expect(bufferFromSpy).not.toHaveBeenCalledWith(oversizedBase64, "base64");
-    } finally {
-      bufferFromSpy.mockRestore();
-    }
+    expect(media.media).toStrictEqual([
+      { kind: "image", contentType: "image/png", sourceId: "hosted-oversized" },
+    ]);
+    expect(saveResponseMediaMock).toHaveBeenCalledTimes(1);
   });
 });

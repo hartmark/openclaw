@@ -40,6 +40,10 @@ export class InteractionResponseController {
   recordReplyEdit(): void {
     this.state = "replied";
   }
+
+  recordReplyDelete(): void {
+    this.state = "replied";
+  }
 }
 
 export function needsComponentsV2Query(body: unknown): boolean {

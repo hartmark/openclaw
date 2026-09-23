@@ -1,9 +1,10 @@
+// PDF model config tests cover provider precedence and fallback model selection
+// for PDF understanding tools.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { resolvePdfModelConfigForTool } from "./pdf-tool.model-config.js";
-import { resetPdfToolAuthEnv } from "./pdf-tool.test-support.js";
 
-const ANTHROPIC_PDF_MODEL = "anthropic/claude-opus-4-8";
+const PINNED_ANTHROPIC_PDF_MODEL = "anthropic/claude-opus-5";
 const TEST_AGENT_DIR = "/tmp/openclaw-pdf-model-config";
 
 vi.mock("./model-config.helpers.js", () => ({
@@ -59,9 +60,47 @@ function withDefaultModel(primary: string): OpenClawConfig {
   } as OpenClawConfig;
 }
 
+function withMiniMaxModel(
+  primary: string,
+  modelId = "MiniMax-M2.7",
+  provider = "minimax",
+): OpenClawConfig {
+  return {
+    ...withDefaultModel(primary),
+    models: {
+      providers: {
+        [provider]: {
+          baseUrl: "https://api.minimax.io/anthropic",
+          models: [
+            {
+              id: modelId,
+              name: modelId,
+              reasoning: false,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 128_000,
+              maxTokens: 8_192,
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
 describe("resolvePdfModelConfigForTool", () => {
   beforeEach(() => {
-    resetPdfToolAuthEnv();
+    // These are the only auth inputs consumed by this file's narrow auth stub.
+    for (const name of [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_OAUTH_TOKEN",
+      "OPENAI_API_KEY",
+      "GOOGLE_API_KEY",
+      "GEMINI_API_KEY",
+      "MINIMAX_API_KEY",
+    ]) {
+      vi.stubEnv(name, "");
+    }
   });
 
   afterEach(() => {
@@ -78,12 +117,12 @@ describe("resolvePdfModelConfigForTool", () => {
       agents: {
         defaults: {
           model: { primary: "openai/gpt-5.4" },
-          pdfModel: { primary: ANTHROPIC_PDF_MODEL },
+          pdfModel: { primary: PINNED_ANTHROPIC_PDF_MODEL },
         },
       },
     } as OpenClawConfig;
     expect(resolvePdfModelConfigForTool({ cfg, agentDir: TEST_AGENT_DIR })).toEqual({
-      primary: ANTHROPIC_PDF_MODEL,
+      primary: PINNED_ANTHROPIC_PDF_MODEL,
     });
   });
 
@@ -101,46 +140,23 @@ describe("resolvePdfModelConfigForTool", () => {
     });
   });
 
-  it("prefers anthropic when available for native PDF support", () => {
-    vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test");
-    vi.stubEnv("OPENAI_API_KEY", "openai-test");
-    const cfg = withDefaultModel("openai/gpt-5.4");
-    expect(resolvePdfModelConfigForTool({ cfg, agentDir: TEST_AGENT_DIR })?.primary).toBe(
-      ANTHROPIC_PDF_MODEL,
-    );
-  });
-
-  it("uses anthropic primary when provider is anthropic", () => {
-    vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test");
-    const cfg = withDefaultModel(ANTHROPIC_PDF_MODEL);
-    expect(resolvePdfModelConfigForTool({ cfg, agentDir: TEST_AGENT_DIR })?.primary).toBe(
-      ANTHROPIC_PDF_MODEL,
-    );
-  });
+  it.each(["openai/gpt-5.4", "anthropic/claude-opus-5"])(
+    "uses the native Anthropic PDF default rather than the %s chat primary",
+    (primary) => {
+      vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test");
+      vi.stubEnv("OPENAI_API_KEY", primary.startsWith("openai/") ? "openai-test" : "");
+      const cfg = withDefaultModel(primary);
+      expect(resolvePdfModelConfigForTool({ cfg, agentDir: TEST_AGENT_DIR })?.primary).toBe(
+        "anthropic/claude-opus-5-5",
+      );
+    },
+  );
 
   it("uses configured MiniMax chat models for PDF text extraction fallback", () => {
+    // MiniMax VLM models do not provide the text extraction fallback contract;
+    // choose configured chat-capable models instead.
     vi.stubEnv("MINIMAX_API_KEY", "minimax-test");
-    const cfg = {
-      ...withDefaultModel("openai/gpt-5.4"),
-      models: {
-        providers: {
-          minimax: {
-            baseUrl: "https://api.minimax.io/anthropic",
-            models: [
-              {
-                id: "MiniMax-M2.7",
-                name: "MiniMax M2.7",
-                reasoning: false,
-                input: ["text"],
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 128_000,
-                maxTokens: 8_192,
-              },
-            ],
-          },
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = withMiniMaxModel("openai/gpt-5.4");
 
     expect(resolvePdfModelConfigForTool({ cfg, agentDir: TEST_AGENT_DIR })).toEqual({
       primary: "minimax/MiniMax-M2.7",
@@ -149,59 +165,21 @@ describe("resolvePdfModelConfigForTool", () => {
   });
 
   it("preserves generic image provider precedence when the default model is not MiniMax", () => {
+    // MiniMax remains a fallback for PDF text extraction, but should not jump
+    // ahead of an authenticated generic image/PDF provider.
     vi.stubEnv("OPENAI_API_KEY", "openai-test");
     vi.stubEnv("MINIMAX_API_KEY", "minimax-test");
-    const cfg = {
-      ...withDefaultModel("openai/gpt-5.4"),
-      models: {
-        providers: {
-          minimax: {
-            baseUrl: "https://api.minimax.io/anthropic",
-            models: [
-              {
-                id: "MiniMax-M2.7",
-                name: "MiniMax M2.7",
-                reasoning: false,
-                input: ["text"],
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 128_000,
-                maxTokens: 8_192,
-              },
-            ],
-          },
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = withMiniMaxModel("openai/gpt-5.4");
 
     expect(resolvePdfModelConfigForTool({ cfg, agentDir: TEST_AGENT_DIR })).toEqual({
-      primary: "openai/gpt-5.5",
+      primary: "openai/gpt-6-astra",
       fallbacks: ["minimax/MiniMax-M2.7", "minimax-portal/MiniMax-M2.7"],
     });
   });
 
   it("preserves explicit MiniMax text models for PDF text extraction fallback", () => {
     vi.stubEnv("MINIMAX_API_KEY", "minimax-test");
-    const cfg = {
-      ...withDefaultModel("minimax/MiniMax-M2.7-highspeed"),
-      models: {
-        providers: {
-          minimax: {
-            baseUrl: "https://api.minimax.io/anthropic",
-            models: [
-              {
-                id: "MiniMax-M2.7-highspeed",
-                name: "MiniMax M2.7 Highspeed",
-                reasoning: false,
-                input: ["text"],
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 128_000,
-                maxTokens: 8_192,
-              },
-            ],
-          },
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = withMiniMaxModel("minimax/MiniMax-M2.7-highspeed", "MiniMax-M2.7-highspeed");
 
     expect(resolvePdfModelConfigForTool({ cfg, agentDir: TEST_AGENT_DIR })).toEqual({
       primary: "minimax/MiniMax-M2.7-highspeed",
@@ -211,27 +189,7 @@ describe("resolvePdfModelConfigForTool", () => {
 
   it("preserves explicit MiniMax text models from normalized provider keys", () => {
     vi.stubEnv("MINIMAX_API_KEY", "minimax-test");
-    const cfg = {
-      ...withDefaultModel("openai/gpt-5.4"),
-      models: {
-        providers: {
-          Minimax: {
-            baseUrl: "https://api.minimax.io/anthropic",
-            models: [
-              {
-                id: "MiniMax-M2.7-highspeed",
-                name: "MiniMax M2.7 Highspeed",
-                reasoning: false,
-                input: ["text"],
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 128_000,
-                maxTokens: 8_192,
-              },
-            ],
-          },
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = withMiniMaxModel("openai/gpt-5.4", "MiniMax-M2.7-highspeed", "Minimax");
 
     expect(resolvePdfModelConfigForTool({ cfg, agentDir: TEST_AGENT_DIR })).toEqual({
       primary: "minimax/MiniMax-M2.7-highspeed",

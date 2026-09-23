@@ -1,4 +1,4 @@
-import fs from "node:fs";
+/** Loads bundled channel config schema metadata from source or public surface modules. */
 import path from "node:path";
 import {
   buildChannelConfigSchema,
@@ -16,11 +16,8 @@ import type {
   PluginManifest,
   PluginManifestChannelConfig,
 } from "./manifest.js";
-import {
-  createPluginModuleLoaderCache,
-  getCachedPluginModuleLoader,
-  type PluginModuleLoaderCache,
-} from "./plugin-module-loader-cache.js";
+import { pluginCacheExistsSync } from "./plugin-cache-files.js";
+import { getCachedPluginModuleLoader } from "./plugin-module-loader-cache.js";
 import { PUBLIC_SURFACE_SOURCE_EXTENSIONS } from "./public-surface-runtime.js";
 
 const SOURCE_CONFIG_SCHEMA_CANDIDATES = [
@@ -38,8 +35,6 @@ type ChannelConfigSurface = {
   uiHints?: Record<string, PluginConfigUiHint>;
   runtime?: ChannelConfigRuntimeSchema;
 };
-
-const moduleLoaders: PluginModuleLoaderCache = createPluginModuleLoaderCache();
 
 function isBuiltChannelConfigSchema(value: unknown): value is ChannelConfigSurface {
   if (!value || typeof value !== "object") {
@@ -100,7 +95,6 @@ function resolveConfigSchemaExport(imported: Record<string, unknown>): ChannelCo
 
 function getModuleLoader(modulePath: string) {
   return getCachedPluginModuleLoader({
-    cache: moduleLoaders,
     modulePath,
     importerUrl: import.meta.url,
     preferBuiltDist: true,
@@ -111,14 +105,14 @@ function getModuleLoader(modulePath: string) {
 function resolveChannelConfigSchemaModulePath(pluginDir: string): string | undefined {
   for (const relativePath of SOURCE_CONFIG_SCHEMA_CANDIDATES) {
     const candidate = path.join(pluginDir, relativePath);
-    if (fs.existsSync(candidate)) {
+    if (pluginCacheExistsSync(candidate)) {
       return candidate;
     }
   }
   for (const basename of PUBLIC_CONFIG_SURFACE_BASENAMES) {
     for (const extension of PUBLIC_SURFACE_SOURCE_EXTENSIONS) {
       const candidate = path.join(pluginDir, `${basename}${extension}`);
-      if (fs.existsSync(candidate)) {
+      if (pluginCacheExistsSync(candidate)) {
         return candidate;
       }
     }
@@ -143,7 +137,7 @@ function resolvePackageChannelMeta(
   return channelMeta?.id?.trim() === channelId ? channelMeta : undefined;
 }
 
-export function collectBundledChannelConfigs(params: {
+export function collectBundledChannelConfigsCore(params: {
   pluginDir: string;
   manifest: PluginManifest;
   packageManifest?: OpenClawPackageManifest;

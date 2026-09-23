@@ -1,11 +1,16 @@
+/** Tests ACP prompt cwd-prefix provenance behavior. */
 import os from "node:os";
 import path from "node:path";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
 import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "../gateway/client.js";
-import { AcpGatewayAgent } from "./translator.js";
-import { createAcpConnection, createAcpGateway } from "./translator.test-helpers.js";
+import { withEnvAsync } from "../test-utils/env.js";
+import {
+  createAcpConnection,
+  createAcpGateway,
+  createAcpGatewayAgent,
+} from "./translator.test-helpers.js";
 
 const TEST_SESSION_ID = "session-1";
 const TEST_SESSION_KEY = "agent:main:main";
@@ -50,7 +55,7 @@ describe("acp prompt cwd prefix", () => {
     });
 
     const requestSpy = createStopAfterSendSpy();
-    const agent = new AcpGatewayAgent(
+    const agent = createAcpGatewayAgent(
       createAcpConnection(),
       createAcpGateway(requestSpy as unknown as GatewayClient["request"]),
       {
@@ -71,25 +76,10 @@ describe("acp prompt cwd prefix", () => {
 
   async function runPromptWithCwd(cwd: string) {
     const pinnedHome = os.homedir();
-    const previousOpenClawHome = process.env.OPENCLAW_HOME;
-    const previousHome = process.env.HOME;
-    delete process.env.OPENCLAW_HOME;
-    process.env.HOME = pinnedHome;
-
-    try {
-      return await runPromptAndCaptureRequest({ cwd, prefixCwd: true });
-    } finally {
-      if (previousOpenClawHome === undefined) {
-        delete process.env.OPENCLAW_HOME;
-      } else {
-        process.env.OPENCLAW_HOME = previousOpenClawHome;
-      }
-      if (previousHome === undefined) {
-        delete process.env.HOME;
-      } else {
-        process.env.HOME = previousHome;
-      }
-    }
+    return await withEnvAsync(
+      { OPENCLAW_HOME: undefined, HOME: pinnedHome },
+      async () => await runPromptAndCaptureRequest({ cwd, prefixCwd: true }),
+    );
   }
 
   it("redacts home directory in prompt prefix", async () => {
@@ -158,7 +148,7 @@ describe("acp prompt cwd prefix", () => {
       sessionKey: TEST_SESSION_KEY,
       cwd: path.join(os.homedir(), "openclaw-test"),
     });
-    const agent = new AcpGatewayAgent(
+    const agent = createAcpGatewayAgent(
       createAcpConnection(),
       createAcpGateway(requestSpy as unknown as GatewayClient["request"]),
       {

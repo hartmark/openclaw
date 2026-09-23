@@ -1,24 +1,27 @@
+// Coverage for bootstrap context injection and heartbeat filtering in attempts.
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { filterHeartbeatTranscriptArtifacts } from "../../../auto-reply/heartbeat-filter.js";
 import { HEARTBEAT_PROMPT } from "../../../auto-reply/heartbeat.js";
+import type { BootstrapContextRunKind } from "../../bootstrap-mode.js";
+import { assembleHarnessContextEngine } from "../../harness/context-engine-lifecycle.js";
 import { limitHistoryTurns } from "../history.js";
-import { buildEmbeddedMessageActionDiscoveryInput } from "../message-action-discovery-input.js";
 import {
-  assembleAttemptContextEngine,
   type AttemptContextEngine,
   resolveAttemptBootstrapContext,
-} from "./attempt.context-engine-helpers.js";
-import { resetEmbeddedAttemptHarness } from "./attempt.spawn-workspace.test-support.js";
+} from "./attempt-context-engine-helpers.js";
+import { resetEmbeddedAttemptHarness } from "./attempt-spawn-workspace.test-support.js";
 
 async function resolveBootstrapContext(params: {
   contextInjectionMode?: "always" | "continuation-skip" | "never";
   bootstrapContextMode?: string;
-  bootstrapContextRunKind?: string;
+  bootstrapContextRunKind?: BootstrapContextRunKind;
   bootstrapMode?: "full" | "limited" | "none";
   completed?: boolean;
   resolver?: () => Promise<{ bootstrapFiles: unknown[]; contextFiles: unknown[] }>;
 }) {
+  // Helper exposes both resolved context and dependency calls so tests can
+  // assert when bootstrap probing is skipped.
   const hasCompletedBootstrapTurn = vi.fn(async () => params.completed ?? false);
   const resolveBootstrapContextForRun =
     params.resolver ??
@@ -32,7 +35,6 @@ async function resolveBootstrapContext(params: {
     bootstrapContextMode: params.bootstrapContextMode ?? "full",
     bootstrapContextRunKind: params.bootstrapContextRunKind ?? "default",
     bootstrapMode: params.bootstrapMode ?? "none",
-    sessionFile: "/tmp/session.jsonl",
     hasCompletedBootstrapTurn,
     resolveBootstrapContextForRun,
   });
@@ -55,7 +57,7 @@ describe("embedded attempt context injection", () => {
     expect(result.isContinuationTurn).toBe(true);
     expect(result.bootstrapFiles).toStrictEqual([]);
     expect(result.contextFiles).toStrictEqual([]);
-    expect(hasCompletedBootstrapTurn).toHaveBeenCalledWith("/tmp/session.jsonl");
+    expect(hasCompletedBootstrapTurn).toHaveBeenCalledOnce();
     expect(resolveBootstrapContextForRun).not.toHaveBeenCalled();
   });
 
@@ -94,6 +96,8 @@ describe("embedded attempt context injection", () => {
   });
 
   it("does not let a stale completed marker suppress pending workspace bootstrap", async () => {
+    // Pending BOOTSTRAP.md content takes precedence over completed-turn markers
+    // from earlier sessions.
     const resolver = vi.fn(async () => ({
       bootstrapFiles: [{ name: "BOOTSTRAP.md" }],
       contextFiles: [{ path: "BOOTSTRAP.md" }],
@@ -113,45 +117,23 @@ describe("embedded attempt context injection", () => {
     expect(resolver).toHaveBeenCalledTimes(1);
   });
 
-  it("builds embedded message-action discovery routing context", () => {
-    const input = buildEmbeddedMessageActionDiscoveryInput({
-      cfg: {},
-      channel: "matrix",
-      currentChannelId: "room",
-      currentThreadTs: "thread",
-      currentMessageId: 123,
-      accountId: "work",
-      sessionKey: "agent:main",
-      sessionId: "session",
-      agentId: "main",
-      senderId: "@alice:example.org",
-    });
+  it.each(["heartbeat"] as const)(
+    "never skips %s bootstrap filtering",
+    async (bootstrapContextRunKind) => {
+      const { result, hasCompletedBootstrapTurn, resolveBootstrapContextForRun } =
+        await resolveBootstrapContext({
+          contextInjectionMode: "continuation-skip",
+          bootstrapContextMode: "lightweight",
+          bootstrapContextRunKind,
+          completed: true,
+        });
 
-    expect(input.channel).toBe("matrix");
-    expect(input.currentChannelId).toBe("room");
-    expect(input.currentThreadTs).toBe("thread");
-    expect(input.currentMessageId).toBe(123);
-    expect(input.accountId).toBe("work");
-    expect(input.sessionKey).toBe("agent:main");
-    expect(input.sessionId).toBe("session");
-    expect(input.agentId).toBe("main");
-    expect(input.requesterSenderId).toBe("@alice:example.org");
-  });
-
-  it("never skips heartbeat bootstrap filtering", async () => {
-    const { result, hasCompletedBootstrapTurn, resolveBootstrapContextForRun } =
-      await resolveBootstrapContext({
-        contextInjectionMode: "continuation-skip",
-        bootstrapContextMode: "lightweight",
-        bootstrapContextRunKind: "heartbeat",
-        completed: true,
-      });
-
-    expect(result.isContinuationTurn).toBe(false);
-    expect(result.shouldRecordCompletedBootstrapTurn).toBe(false);
-    expect(hasCompletedBootstrapTurn).not.toHaveBeenCalled();
-    expect(resolveBootstrapContextForRun).toHaveBeenCalledTimes(1);
-  });
+      expect(result.isContinuationTurn).toBe(false);
+      expect(result.shouldRecordCompletedBootstrapTurn).toBe(false);
+      expect(hasCompletedBootstrapTurn).not.toHaveBeenCalled();
+      expect(resolveBootstrapContextForRun).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("runs full bootstrap injection after a successful non-heartbeat turn", async () => {
     const resolver = vi.fn(async () => ({
@@ -170,15 +152,18 @@ describe("embedded attempt context injection", () => {
     expect(result.bootstrapFiles).toEqual([{ name: "AGENTS.md", content: "bootstrap context" }]);
   });
 
-  it("does not record full bootstrap completion for heartbeat runs", async () => {
-    const { result } = await resolveBootstrapContext({
-      bootstrapContextMode: "lightweight",
-      bootstrapContextRunKind: "heartbeat",
-      bootstrapMode: "none",
-    });
+  it.each(["heartbeat"] as const)(
+    "does not record full bootstrap completion for %s runs",
+    async (bootstrapContextRunKind) => {
+      const { result } = await resolveBootstrapContext({
+        bootstrapContextMode: "lightweight",
+        bootstrapContextRunKind,
+        bootstrapMode: "none",
+      });
 
-    expect(result.shouldRecordCompletedBootstrapTurn).toBe(false);
-  });
+      expect(result.shouldRecordCompletedBootstrapTurn).toBe(false);
+    },
+  );
 
   it("allows continuation skip again for limited bootstrap mode", async () => {
     const { result, hasCompletedBootstrapTurn, resolveBootstrapContextForRun } =
@@ -189,12 +174,14 @@ describe("embedded attempt context injection", () => {
       });
 
     expect(result.isContinuationTurn).toBe(true);
-    expect(hasCompletedBootstrapTurn).toHaveBeenCalledWith("/tmp/session.jsonl");
+    expect(hasCompletedBootstrapTurn).toHaveBeenCalledOnce();
     expect(resolveBootstrapContextForRun).not.toHaveBeenCalled();
     expect(result.shouldRecordCompletedBootstrapTurn).toBe(false);
   });
 
   it("filters no-op heartbeat pairs before history limiting and context-engine assembly", async () => {
+    // Heartbeat artifacts should not consume the limited turn budget passed into
+    // context-engine assembly.
     const assemble = vi.fn(async ({ messages }: { messages: AgentMessage[] }) => ({
       messages,
       estimatedTokens: 1,
@@ -203,7 +190,14 @@ describe("embedded attempt context injection", () => {
       { role: "user", content: "real question", timestamp: 1 } as AgentMessage,
       { role: "assistant", content: "real answer", timestamp: 2 } as unknown as AgentMessage,
       { role: "user", content: HEARTBEAT_PROMPT, timestamp: 3 } as AgentMessage,
-      { role: "assistant", content: "HEARTBEAT_OK", timestamp: 4 } as unknown as AgentMessage,
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "Checking the heartbeat." },
+          { type: "text", text: "HEARTBEAT_OK" },
+        ],
+        timestamp: 4,
+      } as unknown as AgentMessage,
     ];
 
     const heartbeatFiltered = filterHeartbeatTranscriptArtifacts(
@@ -212,7 +206,7 @@ describe("embedded attempt context injection", () => {
       HEARTBEAT_PROMPT,
     );
     const limited = limitHistoryTurns(heartbeatFiltered, 1);
-    await assembleAttemptContextEngine({
+    await assembleHarnessContextEngine({
       contextEngine: {
         info: { id: "test", name: "Test", version: "0.0.1" },
         ingest: async () => ({ ingested: true }),

@@ -1,3 +1,8 @@
+/**
+ * Logging tests for tool adapter failures.
+ * Verifies retryable parameter errors expose useful context while intentional
+ * hook blocks and exec secrets stay out of raw logs.
+ */
 import type { AgentTool } from "openclaw/plugin-sdk/agent-core";
 import { Type } from "typebox";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,10 +18,11 @@ vi.mock("../logger.js", () => ({
 }));
 
 let toToolDefinitions: typeof import("./agent-tool-definition-adapter.js").toToolDefinitions;
-let BeforeToolCallBlockedError: typeof import("./agent-tools.before-tool-call.js").BeforeToolCallBlockedError;
+let createBeforeToolCallBlockedError: typeof import("./agent-tools.before-tool-call.test-support.js").createBeforeToolCallBlockedError;
 let wrapToolParamValidation: typeof import("./agent-tools.params.js").wrapToolParamValidation;
 let REQUIRED_PARAM_GROUPS: typeof import("./agent-tools.params.js").REQUIRED_PARAM_GROUPS;
 let logError: typeof import("../logger.js").logError;
+let withToolOperatorHint: typeof import("./tool-operator-hint.js").withToolOperatorHint;
 
 type ToolExecute = ReturnType<
   typeof import("./agent-tool-definition-adapter.js").toToolDefinitions
@@ -30,9 +36,11 @@ function firstLogErrorMessage(): unknown {
 describe("agent tool definition adapter logging", () => {
   beforeAll(async () => {
     ({ toToolDefinitions } = await import("./agent-tool-definition-adapter.js"));
-    ({ BeforeToolCallBlockedError } = await import("./agent-tools.before-tool-call.js"));
+    ({ createBeforeToolCallBlockedError } =
+      await import("./agent-tools.before-tool-call.test-support.js"));
     ({ wrapToolParamValidation, REQUIRED_PARAM_GROUPS } = await import("./agent-tools.params.js"));
     ({ logError } = await import("../logger.js"));
+    ({ withToolOperatorHint } = await import("./tool-operator-hint.js"));
   });
 
   beforeEach(() => {
@@ -73,6 +81,42 @@ describe("agent tool definition adapter logging", () => {
     );
   });
 
+  it("logs the operator hint for a contained tool failure without exposing it to the model", async () => {
+    const baseTool = {
+      name: "apply_patch",
+      label: "apply_patch",
+      description: "patches files",
+      parameters: Type.Object({ input: Type.String() }),
+      execute: async () => {
+        throw withToolOperatorHint(
+          new Error("Path escapes sandbox root (~/workspace): /outside/note.md"),
+          "apply_patch is restricted to the workspace by default. Set tools.exec.applyPatch.workspaceOnly to false.",
+        );
+      },
+    } satisfies AgentTool;
+    const [def] = toToolDefinitions([baseTool]);
+    if (!def) {
+      throw new Error("missing tool definition");
+    }
+
+    const result = await def.execute(
+      "call-hint-1",
+      { input: "*** Begin Patch" },
+      undefined,
+      undefined,
+      extensionContext,
+    );
+
+    const logged = String(firstLogErrorMessage());
+    expect(logged).toContain("Path escapes sandbox root");
+    expect(logged).toContain("tools.exec.applyPatch.workspaceOnly");
+
+    // The model-visible result carries the rejection but never the way to lift it.
+    const modelText = JSON.stringify(result);
+    expect(modelText).toContain("Path escapes sandbox root");
+    expect(modelText).not.toContain("workspaceOnly");
+  });
+
   it("does not log raw params for intentional before_tool_call blocks", async () => {
     const baseTool = {
       name: "bash",
@@ -82,7 +126,7 @@ describe("agent tool definition adapter logging", () => {
         command: Type.String(),
       }),
       execute: async () => {
-        throw new BeforeToolCallBlockedError("blocked by policy");
+        throw createBeforeToolCallBlockedError("blocked by policy");
       },
     } satisfies AgentTool;
     const [def] = toToolDefinitions([baseTool]);
@@ -341,8 +385,8 @@ describe("agent tool definition adapter logging", () => {
       thrown = error;
     }
     expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).toBe(controller.signal.reason);
     expect((thrown as Error).name).toBe("AbortError");
-    expect((thrown as Error).message).toBe("This operation was aborted");
     expect(logError).not.toHaveBeenCalled();
   });
 

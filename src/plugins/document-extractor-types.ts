@@ -1,9 +1,11 @@
+/** Image extracted from a document page. */
 export type DocumentExtractedImage = {
   type: "image";
   data: string;
   mimeType: string;
 };
 
+/** Request passed to plugin document extractors. */
 export type DocumentExtractionRequest = {
   buffer: Buffer;
   mimeType: string;
@@ -12,14 +14,18 @@ export type DocumentExtractionRequest = {
   minTextChars: number;
   password?: string;
   pageNumbers?: number[];
+  /** Cancels queued extraction and stops active work when supported by the extractor. */
+  signal?: AbortSignal;
   onImageExtractionError?: (error: unknown) => void;
 };
 
+/** Text and image result returned by a document extractor. */
 export type DocumentExtractionResult = {
   text: string;
   images: DocumentExtractedImage[];
 };
 
+/** Plugin document extractor capability contract. */
 export type DocumentExtractorPlugin = {
   id: string;
   label: string;
@@ -28,6 +34,7 @@ export type DocumentExtractorPlugin = {
   extract: (request: DocumentExtractionRequest) => Promise<DocumentExtractionResult | null>;
 };
 
+/** Registered document extractor with owning plugin id. */
 export type PluginDocumentExtractorEntry = DocumentExtractorPlugin & {
   pluginId: string;
 };

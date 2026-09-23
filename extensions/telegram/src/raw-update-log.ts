@@ -1,5 +1,8 @@
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
+
 const MAX_RAW_UPDATE_STRING = 500;
 const MAX_RAW_UPDATE_ARRAY = 20;
+const MAX_RAW_UPDATE_CHARS = 8000;
 const REDACTED_TELEGRAM_FIELD = "[redacted]";
 const TELEGRAM_RAW_UPDATE_ALWAYS_REDACT_KEYS = new Set([
   "added_to_attachment_menu",
@@ -71,7 +74,7 @@ function isTelegramUserObject(value: Record<string, unknown>): boolean {
   );
 }
 
-export function stringifyTelegramRawUpdateForLog(update: unknown): string {
+export function formatTelegramRawUpdateForLog(update: unknown): string {
   const seen = new WeakSet<object>();
   const transform = (value: unknown, key = "", parentKey?: string): unknown => {
     if (shouldRedactTelegramRawUpdateValue(key, parentKey)) {
@@ -79,7 +82,7 @@ export function stringifyTelegramRawUpdateForLog(update: unknown): string {
     }
     if (typeof value === "string") {
       return value.length > MAX_RAW_UPDATE_STRING
-        ? `${value.slice(0, MAX_RAW_UPDATE_STRING)}...`
+        ? `${truncateUtf16Safe(value, MAX_RAW_UPDATE_STRING)}...`
         : value;
     }
     if (Array.isArray(value)) {
@@ -106,5 +109,8 @@ export function stringifyTelegramRawUpdateForLog(update: unknown): string {
     }
     return value;
   };
-  return JSON.stringify(transform(update ?? null));
+  const raw = JSON.stringify(transform(update ?? null));
+  return raw.length > MAX_RAW_UPDATE_CHARS
+    ? `${truncateUtf16Safe(raw, MAX_RAW_UPDATE_CHARS)}...`
+    : raw;
 }

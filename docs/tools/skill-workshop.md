@@ -1,266 +1,85 @@
 ---
-summary: "Create and update workspace skills through Skill Workshop review"
+summary: "Index of the Skill Workshop documentation, one page per reader job"
 read_when:
   - You want the agent to create or update a skill from chat
   - You need to review, apply, reject, or quarantine a generated skill draft
   - You are configuring Skill Workshop approval, autonomy, storage, or limits
+  - You are looking for the Skill Workshop page that matches your task
 title: "Skill Workshop"
 sidebarTitle: "Skill Workshop"
 ---
 
-Skill Workshop is OpenClaw's governed path for creating and updating workspace
-skills.
+Skill Workshop is OpenClaw's governed path for creating and updating its own
+generated skills. Through this path, agents and operators create a **proposal** (pending
+draft with content, target binding, scanner state, hashes, and rollback
+metadata) that becomes a live skill only when applied.
 
-Agents and operators do not write active `SKILL.md` files directly through this
-path. They create a **proposal** first. A proposal is a pending draft containing
-the proposed skill content, target binding, scanner state, hashes, support-file
-metadata, and rollback metadata. It becomes a live skill only when applied.
+Automatic background learning and weekly collection review instead maintain the
+Workshop directory with normal agent file tools. These direct edits do not create
+proposals or automatic rollback snapshots. Choose `propose` mode when each new
+skill change needs review before publication.
 
-Skill Workshop writes workspace skills only. It does not mutate bundled,
-plugin, ClawHub, extra-root, managed, personal-agent, or system skills.
+By default, Skill Workshop writes only under the active agent's
+`<state-dir>/agents/<agentId>/agent/workshop-skills`. When `agents.entries.<id>.agentDir` is
+configured, it writes under `<agentDir>/workshop-skills` instead. Operators edit
+bundled, plugin, ClawHub, extra-root, managed, personal-agent, project, and
+workspace skills through their owning tools or files. The same authoring tool
+also supports [personal library skills](/tools/skills#personal-skills-on-a-shared-gateway)
+when the Gateway supplies an authorized library target. Those operations publish
+managed revisions rather than Workshop proposals.
 
-## How it works
+Workshop storage is installation-managed and separate from the session
+workspace and managed skill library. `OPENCLAW_STATE_DIR` selects the state
+directory. `~/.openclaw` is the default.
 
-- **Proposal first:** generated skill content is stored as `PROPOSAL.md`, not
-  `SKILL.md`.
-- **Apply is the only live write:** create, update, and revise do not change
-  active skills.
-- **Workspace scoped:** creates target the workspace `skills/` root. Updates
-  are allowed only for writable workspace skills.
-- **No clobber:** create fails if the target skill already exists.
-- **Hash bound:** update proposals bind to the current target hash and become
-  stale if the live skill changes before apply.
-- **Scanner gated:** apply reruns scanning before writing.
-- **Recoverable:** apply writes rollback metadata before changing live files.
-- **Consistent surfaces:** chat, CLI, and Gateway all call the same Skill
-  Workshop service.
+This page is an index. Skill Workshop is documented on eight pages, one per
+reader job. Open the page that matches your task.
 
-## Lifecycle
+| Page                                                                                   | Read it when                                                                       |
+| -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| [Personal library authoring](/tools/skill-workshop/personal-library)                   | You are authoring a profile-owned personal skill on a shared Gateway.              |
+| [How Skill Workshop works](/tools/skill-workshop/how-it-works)                         | You need the proposal rules, the Control UI review surfaces, or the state diagram. |
+| [Collection review](/tools/skill-workshop/collection-review)                           | You are enabling weekly review, or recovering a skill from a retained backup.      |
+| [Chat and CLI authoring](/tools/skill-workshop/authoring)                              | You are creating, revising, or applying a proposal from chat or the CLI.           |
+| [Proposal content, support files, and the agent tool](/tools/skill-workshop/proposals) | You are writing `PROPOSAL.md`, adding support files, or calling `skill_workshop`.  |
+| [Self-learning and approval settings](/tools/skill-workshop/configuration)             | You are configuring autonomy, approval policy, or Workshop size caps.              |
+| [Gateway methods, storage, and limits](/tools/skill-workshop/reference)                | You need the Gateway method list, the on-disk layout, or the hard limits.          |
+| [Skill Workshop troubleshooting](/tools/skill-workshop/troubleshooting)                | A proposal fails, does not appear, or the agent cannot call the tool.              |
 
-```text
-create/update -> pending
-revise        -> pending
-apply         -> applied
-reject        -> rejected
-quarantine    -> quarantined
-target change -> stale
-```
+## Where each section moved
 
-Only `pending` proposals can be revised, applied, rejected, or quarantined.
+Every section heading id from the previous single-page version keeps its
+anchor here, so an existing link such as
+`/tools/skill-workshop#collection-review` still resolves. Each entry points at
+the page that now holds the content.
 
-## Chat
-
-Ask the agent for the skill you want. The agent calls `skill_workshop` and
-returns a proposal id.
-
-Create:
-
-```text
-Make a skill called morning-catchup that runs my Monday inbox routine.
-```
-
-Update an existing workspace skill:
-
-```text
-Update trip-planning to also check seat maps before booking.
-```
-
-Iterate on a pending proposal:
-
-```text
-Show me the morning-catchup proposal.
-Revise it to also flag anything marked urgent.
-Apply the morning-catchup proposal.
-```
-
-By default, agent-initiated `apply`, `reject`, and `quarantine` show an
-approval prompt before they run. Set `skills.workshop.approvalPolicy` to
-`"auto"` to skip the prompt for trusted environments.
-
-## CLI
-
-Create a new skill proposal:
-
-```bash
-openclaw skills workshop propose-create \
-  --name morning-catchup \
-  --description "Daily inbox catch-up: triage, archive, surface, draft, plan" \
-  --proposal ./PROPOSAL.md
-```
-
-Create an update proposal for an existing workspace skill:
-
-```bash
-openclaw skills workshop propose-update trip-planning --proposal ./PROPOSAL.md
-```
-
-List and inspect:
-
-```bash
-openclaw skills workshop list
-openclaw skills workshop inspect <proposal-id>
-```
-
-Revise before approval:
-
-```bash
-openclaw skills workshop revise <proposal-id> --proposal ./PROPOSAL.md
-```
-
-Close out the proposal:
-
-```bash
-openclaw skills workshop apply <proposal-id>
-openclaw skills workshop reject <proposal-id> --reason "Duplicate"
-openclaw skills workshop quarantine <proposal-id> --reason "Needs security review"
-```
-
-## Proposal content
-
-While pending, the proposal is stored as `PROPOSAL.md` with proposal-only
-frontmatter:
-
-```markdown
----
-name: "morning-catchup"
-description: "Daily inbox catch-up: triage, archive, surface, draft, plan"
-status: proposal
-version: "v1"
-date: "2026-05-30T00:00:00.000Z"
----
-```
-
-On apply, Skill Workshop writes the active `SKILL.md` and removes proposal-only
-fields: `status`, proposal `version`, and proposal `date`.
-
-## Support files
-
-Use `--proposal-dir` when the proposed skill needs files beside `PROPOSAL.md`:
-
-```bash
-openclaw skills workshop propose-create \
-  --name weekly-update \
-  --description "Friday wrap-up: stats, highlights, next week's top three" \
-  --proposal-dir ./weekly-update-proposal
-```
-
-The directory must contain `PROPOSAL.md`. Support files must be under:
-
-- `assets/`
-- `examples/`
-- `references/`
-- `scripts/`
-- `templates/`
-
-Skill Workshop scans, hashes, and stores support files with the proposal. They
-are written beside the live `SKILL.md` only on apply.
-
-Rejected support-file paths include absolute paths, hidden path segments, path
-traversal, overlapping paths, executable files from proposal directories,
-non-UTF-8 text, null bytes, and files outside the standard support folders.
-
-## Agent tool
-
-The model uses `skill_workshop`:
-
-```text
-action: create | update | revise | list | inspect | apply | reject | quarantine
-```
-
-Agents must use `skill_workshop` for generated skill work. They must not create
-or change proposal files through `write`, `edit`, `exec`, shell commands, or
-direct filesystem operations.
-
-## Approval and autonomy
-
-```json5
-{
-  skills: {
-    workshop: {
-      autonomous: {
-        enabled: false,
-      },
-      approvalPolicy: "pending",
-      maxPending: 50,
-      maxSkillBytes: 40000,
-    },
-  },
-}
-```
-
-- `autonomous.enabled`: allows OpenClaw to create pending proposals from durable
-  conversation signals after successful turns. Default: `false`.
-- `approvalPolicy: "pending"`: requires an approval prompt before
-  agent-initiated `apply`, `reject`, or `quarantine`.
-- `approvalPolicy: "auto"`: skips that approval prompt. The agent must still
-  call the action.
-- `maxPending`: caps pending and quarantined proposals per workspace.
-- `maxSkillBytes`: caps proposal body size. Default: `40000`.
-
-Proposal descriptions are always capped at 160 bytes.
-
-## Gateway methods
-
-```text
-skills.proposals.list
-skills.proposals.inspect
-skills.proposals.create
-skills.proposals.update
-skills.proposals.revise
-skills.proposals.apply
-skills.proposals.reject
-skills.proposals.quarantine
-```
-
-Read-only methods require `operator.read`. Mutating methods require
-`operator.admin`.
-
-## Storage
-
-```text
-<OPENCLAW_STATE_DIR>/skill-workshop/
-  proposals.json
-  proposals/<proposal-id>/
-    proposal.json
-    PROPOSAL.md
-    rollback.json
-    assets/
-    examples/
-    references/
-    scripts/
-    templates/
-```
-
-Default state directory: `~/.openclaw`.
-
-- `proposal.json`: canonical proposal record.
-- `proposals.json`: fast listing index, rebuildable from proposal folders.
-- `PROPOSAL.md`: pending skill proposal.
-- `rollback.json`: recovery metadata written before apply changes live files.
-
-## Limits
-
-- Description: 160 bytes.
-- Proposal body: `skills.workshop.maxSkillBytes` (default 40,000).
-- Support files: 64 per proposal.
-- Support file size: 256 KB each, 2 MB total.
-- Pending and quarantined proposals: `skills.workshop.maxPending` per workspace
-  (default 50).
-
-## Troubleshooting
-
-| Problem                                        | Resolution                                                                                   |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `Skill proposal description is too large`      | Shorten `description` to 160 bytes or less.                                                  |
-| `Skill proposal content is too large`          | Shorten the proposal body or raise `skills.workshop.maxSkillBytes`.                          |
-| `Target skill changed after proposal creation` | Revise the proposal against the current target, or create a new proposal.                    |
-| `Proposal scan failed`                         | Inspect scanner findings, then revise or quarantine the proposal.                            |
-| `Support file paths must be under one of...`   | Move support files under `assets/`, `examples/`, `references/`, `scripts/`, or `templates/`. |
-| Proposal does not show in list                 | Check the selected `--agent` workspace and `OPENCLAW_STATE_DIR`.                             |
+- <a id="personal-library-authoring" />[Personal library authoring](/tools/skill-workshop/personal-library#personal-library-authoring)
+- <a id="how-it-works" />[How it works](/tools/skill-workshop/how-it-works#how-it-works)
+- <a id="review-in-the-control-ui" />[Review in the Control UI](/tools/skill-workshop/how-it-works#review-in-the-control-ui)
+- <a id="lifecycle" />[Lifecycle](/tools/skill-workshop/how-it-works#lifecycle)
+- <a id="collection-review" />[Collection review](/tools/skill-workshop/collection-review#collection-review)
+- <a id="changes-and-recovery" />[Changes and recovery](/tools/skill-workshop/collection-review#changes-and-recovery)
+- <a id="when-an-older-backup-cannot-be-restored-automatically" />[When an older backup cannot be restored automatically](/tools/skill-workshop/collection-review#when-an-older-backup-cannot-be-restored-automatically)
+- <a id="chat" />[Chat](/tools/skill-workshop/authoring#chat)
+- <a id="learn-from-recent-work" />[Learn from recent work](/tools/skill-workshop/authoring#learn-from-recent-work)
+- <a id="cli" />[CLI](/tools/skill-workshop/authoring#cli)
+- <a id="plugin-evaluation-and-lifecycle-hooks" />[Plugin evaluation and lifecycle hooks](/tools/skill-workshop/proposals#plugin-evaluation-and-lifecycle-hooks)
+- <a id="proposal-content" />[Proposal content](/tools/skill-workshop/proposals#proposal-content)
+- <a id="support-files" />[Support files](/tools/skill-workshop/proposals#support-files)
+- <a id="agent-tool" />[Agent tool](/tools/skill-workshop/proposals#agent-tool)
+- <a id="self-learning" />[Self-learning](/tools/skill-workshop/configuration#self-learning)
+- <a id="scan-past-sessions" />[Scan past sessions](/tools/skill-workshop/configuration#scan-past-sessions)
+- <a id="approval-and-autonomy" />[Approval and autonomy](/tools/skill-workshop/configuration#approval-and-autonomy)
+- <a id="gateway-methods" />[Gateway methods](/tools/skill-workshop/reference#gateway-methods)
+- <a id="storage" />[Storage](/tools/skill-workshop/reference#storage)
+- <a id="limits" />[Limits](/tools/skill-workshop/reference#limits)
+- <a id="troubleshooting" />[Troubleshooting](/tools/skill-workshop/troubleshooting#troubleshooting)
+- <a id="tool-policy-diagnostic" />[Tool-policy diagnostic](/tools/skill-workshop/troubleshooting#tool-policy-diagnostic)
 
 ## Related
 
 - [Skills](/tools/skills) for load order, precedence, and visibility
+- [Self-learning](/tools/self-learning) for conservative post-run skill proposals
 - [Creating skills](/tools/creating-skills) for hand-written `SKILL.md`
   basics
 - [Skills config](/tools/skills-config) for the full `skills.workshop` schema

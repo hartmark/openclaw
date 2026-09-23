@@ -1,12 +1,8 @@
+import type { PhotoSize } from "grammy/types";
 import * as ssrf from "openclaw/plugin-sdk/ssrf-runtime";
 import { afterEach, beforeAll, beforeEach, expect, vi, type Mock } from "vitest";
-import * as harness from "./bot.media.e2e-harness.js";
-
-type StickerSpy = Mock<(...args: unknown[]) => unknown>;
-
-export const cacheStickerSpy: StickerSpy = vi.fn();
-export const getCachedStickerSpy: StickerSpy = vi.fn();
-export const describeStickerImageSpy: StickerSpy = vi.fn();
+import { telegramBotInfoForTest } from "./bot.create-telegram-bot.test-support.js";
+import * as harness from "./bot.media.e2e.test-harness.js";
 
 const resolvePinnedHostname = ssrf.resolvePinnedHostname;
 const lookupMock = vi.fn();
@@ -16,6 +12,10 @@ export const TELEGRAM_TEST_TIMINGS = {
   mediaGroupFlushMs: 20,
   textFragmentGapMs: 30,
 } as const;
+
+export function createTelegramPhotoForTest(fileId: string): PhotoSize {
+  return { file_id: fileId, file_unique_id: `unique-${fileId}`, width: 100, height: 100 };
+}
 
 let createTelegramBotRef: typeof import("./bot.js").createTelegramBot;
 let replySpyRef: ReturnType<typeof vi.fn>;
@@ -61,6 +61,9 @@ export async function createBotHandlerWithOptions(options: {
   const effectiveProxyFetch = options.proxyFetch ?? (undiciFetchSpyRef as unknown as typeof fetch);
   createTelegramBotRef({
     token: "tok",
+    // Production always constructs the bot from getMe(), so inbound handlers may
+    // resolve the bot user id from botInfo when a test ctx carries only a username.
+    botInfo: telegramBotInfoForTest,
     config: harness.telegramBotDepsForTest.getRuntimeConfig(),
     testTimings: TELEGRAM_TEST_TIMINGS,
     ...(effectiveProxyFetch ? { proxyFetch: effectiveProxyFetch } : {}),
@@ -80,24 +83,6 @@ export async function createBotHandlerWithOptions(options: {
   return { handler, replySpy: replySpyRef, runtimeError };
 }
 
-export function mockTelegramFileDownload(params: {
-  contentType: string;
-  bytes: Uint8Array;
-}): FetchMockHandle {
-  undiciFetchSpyRef.mockResolvedValueOnce(
-    new Response(Buffer.from(params.bytes), {
-      status: 200,
-      headers: { "content-type": params.contentType },
-    }),
-  );
-  readRemoteMediaBufferSpyRef.mockResolvedValueOnce({
-    buffer: Buffer.from(params.bytes),
-    contentType: params.contentType,
-    fileName: "mock-file",
-  });
-  return createFetchMockHandle();
-}
-
 export function mockTelegramPngDownload(): FetchMockHandle {
   undiciFetchSpyRef.mockResolvedValue(
     new Response(Buffer.from(new Uint8Array([0x89, 0x50, 0x4e, 0x47])), {
@@ -113,10 +98,6 @@ export function mockTelegramPngDownload(): FetchMockHandle {
   return createFetchMockHandle();
 }
 
-export function watchTelegramFetch(): FetchMockHandle {
-  return createFetchMockHandle();
-}
-
 async function loadTelegramBotHarness() {
   onSpyRef = harness.onSpy;
   sendChatActionSpyRef = harness.sendChatActionSpy;
@@ -124,11 +105,6 @@ async function loadTelegramBotHarness() {
   undiciFetchSpyRef = harness.undiciFetchSpy;
   resetReadRemoteMediaBufferMockRef = harness.resetReadRemoteMediaBufferMock;
   const botModule = await import("./bot.js");
-  botModule.setTelegramBotRuntimeForTest(
-    harness.telegramBotRuntimeForTest as unknown as Parameters<
-      typeof botModule.setTelegramBotRuntimeForTest
-    >[0],
-  );
   createTelegramBotRef = (opts) =>
     botModule.createTelegramBot({
       ...opts,
@@ -157,12 +133,3 @@ afterEach(() => {
   resolvePinnedHostnameSpy?.mockRestore();
   resolvePinnedHostnameSpy = null;
 });
-
-vi.mock("./sticker-cache.js", () => ({
-  cacheSticker: (...args: unknown[]) => cacheStickerSpy(...args),
-  getCachedSticker: (...args: unknown[]) => getCachedStickerSpy(...args),
-  describeStickerImage: (...args: unknown[]) => describeStickerImageSpy(...args),
-  getAllCachedStickers: vi.fn(() => []),
-  getCacheStats: vi.fn(() => ({ count: 0 })),
-  searchStickers: vi.fn(() => []),
-}));

@@ -1,19 +1,29 @@
+/**
+ * Tests auth health rollups.
+ * Covers OAuth/API-key status classification, external CLI bootstrap, provider
+ * auth ordering, and prompt-free credential checks.
+ */
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { parseLegacyCredentialEntry } from "./auth-profiles/persisted.js";
 import type { OAuthCredential } from "./auth-profiles/types.js";
+import type { ProviderAuthAliasLookupParams } from "./provider-auth-aliases.js";
 
-const { readCodexCliCredentialsCachedMock } = vi.hoisted(() => ({
-  readCodexCliCredentialsCachedMock: vi.fn<() => OAuthCredential | null>(() => null),
+const { readCodexCliCredentialsCachedMock, resolveProviderIdForAuthMock } = vi.hoisted(() => ({
+  readCodexCliCredentialsCachedMock: vi.fn<
+    (options?: { allowKeychainPrompt?: boolean }) => OAuthCredential | null
+  >(() => null),
+  resolveProviderIdForAuthMock: vi.fn<(provider: string, params?: unknown) => string>(
+    (provider: string) => (provider === "codex-cli" ? "openai" : provider),
+  ),
 }));
 
 vi.mock("./cli-credentials.js", () => ({
-  readClaudeCliCredentialsCached: () => null,
   readCodexCliCredentialsCached: readCodexCliCredentialsCachedMock,
   readMiniMaxCliCredentialsCached: () => null,
-  resetCliCredentialCachesForTest: () => undefined,
 }));
 vi.mock("./provider-auth-aliases.js", () => ({
-  resolveProviderIdForAuth: (provider: string) => (provider === "codex-cli" ? "openai" : provider),
+  resolveProviderIdForAuth: resolveProviderIdForAuthMock,
 }));
 
 import {
@@ -65,9 +75,20 @@ describe("buildAuthHealthSummary", () => {
   beforeEach(() => {
     readCodexCliCredentialsCachedMock.mockReset();
     readCodexCliCredentialsCachedMock.mockReturnValue(null);
+    resolveProviderIdForAuthMock.mockReset();
+    resolveProviderIdForAuthMock.mockImplementation((provider: string) =>
+      provider === "codex-cli" ? "openai" : provider,
+    );
   });
 
-  it("classifies OAuth and API key profiles", () => {
+  it.each([
+    { name: "default warning window", warnAfterMs: undefined, shortLivedStatus: "ok" },
+    {
+      name: "explicit warning window",
+      warnAfterMs: DEFAULT_OAUTH_WARN_MS,
+      shortLivedStatus: "expiring",
+    },
+  ])("classifies OAuth and API key profiles with $name", ({ warnAfterMs, shortLivedStatus }) => {
     vi.spyOn(Date, "now").mockReturnValue(now);
     const store = {
       version: 1,
@@ -86,6 +107,20 @@ describe("buildAuthHealthSummary", () => {
           refresh: "refresh",
           expires: now + 10_000,
         },
+        "anthropic:short-lived": {
+          type: "oauth" as const,
+          provider: "anthropic",
+          access: "access",
+          refresh: "refresh",
+          expires: now + 60 * 60_000,
+        },
+        "anthropic:manual-renewal": parseLegacyCredentialEntry({
+          type: "oauth",
+          provider: "anthropic",
+          access: "access",
+          refresh: "",
+          expires: now + 60 * 60_000,
+        })!,
         "anthropic:expired": {
           type: "oauth" as const,
           provider: "anthropic",
@@ -103,13 +138,15 @@ describe("buildAuthHealthSummary", () => {
 
     const summary = buildAuthHealthSummary({
       store,
-      warnAfterMs: DEFAULT_OAUTH_WARN_MS,
+      warnAfterMs,
     });
 
     const statuses = profileStatuses(summary);
 
     expect(statuses["anthropic:ok"]).toBe("ok");
     expect(statuses["anthropic:expiring"]).toBe("expiring");
+    expect(statuses["anthropic:short-lived"]).toBe(shortLivedStatus);
+    expect(statuses["anthropic:manual-renewal"]).toBe("expiring");
     expect(statuses["anthropic:expired"]).toBe("expired");
     expect(statuses["anthropic:api"]).toBe("static");
 
@@ -118,6 +155,86 @@ describe("buildAuthHealthSummary", () => {
     expect(
       provider?.profiles.find((profile) => profile.profileId === "anthropic:expired")?.status,
     ).toBe("expired");
+  });
+
+  it("reports unresolved legacy Codex OAuth sidecars as missing auth", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    mockFreshCodexCliCredentials();
+    const store = {
+      version: 1,
+      profiles: {
+        "openai-codex:default": {
+          type: "oauth" as const,
+          provider: "openai-codex",
+          expires: now + DEFAULT_OAUTH_WARN_MS + 60_000,
+          oauthRef: {
+            source: "openclaw-credentials" as const,
+            provider: "openai-codex" as const,
+            id: "0123456789abcdef0123456789abcdef",
+          },
+        } as unknown as OAuthCredential,
+      },
+    };
+
+    const summary = buildAuthHealthSummary({
+      store,
+      warnAfterMs: DEFAULT_OAUTH_WARN_MS,
+    });
+
+    expect(profileStatuses(summary)["openai-codex:default"]).toBe("missing");
+    expect(profileReasonCodes(summary)["openai-codex:default"]).toBe("unresolved_ref");
+    expect(summary.providers.find((entry) => entry.provider === "openai-codex")?.status).toBe(
+      "missing",
+    );
+  });
+
+  it("does not replace missing OpenClaw auth with a native Codex login", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    mockFreshCodexCliCredentials();
+    const store = {
+      version: 1,
+      profiles: {
+        "openai:default": {
+          type: "oauth" as const,
+          provider: "openai",
+        } as unknown as OAuthCredential,
+      },
+    };
+
+    const summary = buildAuthHealthSummary({
+      store,
+      warnAfterMs: DEFAULT_OAUTH_WARN_MS,
+    });
+
+    expect(profileStatuses(summary)["openai:default"]).toBe("missing");
+    expect(profileReasonCodes(summary)["openai:default"]).toBe("missing_credential");
+    const provider = summary.providers.find((entry) => entry.provider === "openai");
+    expect(provider?.status).toBe("missing");
+    expect(provider?.expiresAt).toBeUndefined();
+    expect(readCodexCliCredentialsCachedMock).not.toHaveBeenCalled();
+  });
+
+  it("does not open Codex credentials during prompt-free health checks", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    mockFreshCodexCliCredentials();
+    const store = {
+      version: 1,
+      profiles: {
+        "openai:default": {
+          type: "oauth" as const,
+          provider: "openai",
+        } as unknown as OAuthCredential,
+      },
+    };
+
+    const summary = buildAuthHealthSummary({
+      store,
+      warnAfterMs: DEFAULT_OAUTH_WARN_MS,
+      allowKeychainPrompt: false,
+    });
+
+    expect(profileStatuses(summary)["openai:default"]).toBe("missing");
+    expect(readCodexCliCredentialsCachedMock).not.toHaveBeenCalled();
   });
 
   it("uses ordered usable profiles for provider health while keeping stale inventory visible", () => {
@@ -218,6 +335,29 @@ describe("buildAuthHealthSummary", () => {
     const statuses = profileStatuses(summary);
 
     expect(statuses["google:no-refresh"]).toBe("expired");
+  });
+
+  it("reports command-shaped API-key profiles as missing malformed auth", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const store = {
+      version: 1,
+      profiles: {
+        "zai:default": {
+          type: "api_key" as const,
+          provider: "zai",
+          key: "openclaw onboard --auth-choice zai-coding-global",
+        },
+      },
+    };
+
+    const summary = buildAuthHealthSummary({
+      store,
+      warnAfterMs: DEFAULT_OAUTH_WARN_MS,
+    });
+
+    expect(profileStatuses(summary)["zai:default"]).toBe("missing");
+    expect(profileReasonCodes(summary)["zai:default"]).toBe("malformed_api_key");
+    expect(summary.providers.find((entry) => entry.provider === "zai")?.status).toBe("missing");
   });
 
   it("uses runtime provider credentials for profile health", () => {
@@ -405,6 +545,34 @@ describe("buildAuthHealthSummary", () => {
     expect(provider?.expiresAt).toBeUndefined();
   });
 
+  it("keeps unavailable profiles in explicit auth order authoritative", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const store = {
+      version: 1,
+      profiles: {
+        "claude-cli:token": {
+          type: "token" as const,
+          provider: "claude-cli",
+          token: "fake-token",
+        },
+      },
+    };
+    const cfg = {
+      auth: {
+        order: {
+          "claude-cli": ["claude-cli:old-oauth"],
+        },
+      },
+    };
+
+    const summary = buildAuthHealthSummary({ cfg, store });
+
+    const provider = summary.providers.find((entry) => entry.provider === "claude-cli");
+    expect(provider?.status).toBe("missing");
+    expect(provider?.effectiveProfiles).toEqual([]);
+    expect(provider?.profiles.map((profile) => profile.profileId)).toEqual(["claude-cli:token"]);
+  });
+
   it("does not normalize provider aliases when filtering and grouping profile health", () => {
     vi.spyOn(Date, "now").mockReturnValue(now);
     const store = {
@@ -437,6 +605,50 @@ describe("buildAuthHealthSummary", () => {
         profiles: [],
       },
     ]);
+  });
+
+  it("uses caller-owned plugin metadata when resolving explicit auth order", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    resolveProviderIdForAuthMock.mockImplementation((provider: string, params?: unknown) => {
+      const metadata = (params as { metadataSnapshot?: { plugins?: unknown[] } } | undefined)
+        ?.metadataSnapshot;
+      return provider === "fixture-alias" && metadata?.plugins?.length
+        ? "fixture-provider"
+        : provider;
+    });
+    const metadataSnapshot = {
+      plugins: [
+        {
+          id: "fixture-auth-alias",
+          origin: "bundled" as const,
+          providerAuthAliases: { "fixture-alias": "fixture-provider" },
+        },
+      ],
+    } as unknown as NonNullable<ProviderAuthAliasLookupParams["metadataSnapshot"]>;
+    const summary = buildAuthHealthSummary({
+      cfg: { auth: { order: { "fixture-provider": [] } } },
+      store: {
+        version: 1,
+        profiles: {
+          "fixture-alias:token": {
+            type: "token",
+            provider: "fixture-alias",
+            token: "fake-token",
+          },
+        },
+      },
+      authAliasLookupParams: {
+        metadataSnapshot,
+      },
+    });
+
+    expect(summary.providers).toMatchObject([
+      { provider: "fixture-alias", status: "missing", effectiveProfiles: [] },
+    ]);
+    expect(resolveProviderIdForAuthMock).toHaveBeenCalledWith(
+      "fixture-alias",
+      expect.objectContaining({ metadataSnapshot }),
+    );
   });
 });
 

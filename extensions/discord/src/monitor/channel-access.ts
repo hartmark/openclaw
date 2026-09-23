@@ -56,7 +56,7 @@ function resolveDiscordChannelStringWithAliasSafe(
   return resolveDiscordChannelStringPropertySafe(rawData, snakeKey);
 }
 
-export type DiscordChannelInfoSafe = {
+type DiscordChannelInfoSafe = {
   name?: string;
   topic?: string;
   type?: number;
@@ -81,7 +81,7 @@ export function resolveDiscordChannelParentIdSafe(channel: unknown): string | un
   return resolveDiscordChannelStringWithAliasSafe(channel, "parentId");
 }
 
-export function resolveDiscordChannelOwnerIdSafe(channel: unknown): string | undefined {
+function resolveDiscordChannelOwnerIdSafe(channel: unknown): string | undefined {
   return resolveDiscordChannelStringWithAliasSafe(channel, "ownerId");
 }
 

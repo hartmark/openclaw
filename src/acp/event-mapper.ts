@@ -1,17 +1,19 @@
+/** Converts ACP prompt and tool-event shapes into Gateway-friendly text, files, and metadata. */
 import type {
   ContentBlock,
-  ImageContent,
   ToolCallContent,
   ToolCallLocation,
   ToolKind,
 } from "@agentclientprotocol/sdk";
-import { asRecord } from "@openclaw/acp-core/record-shared";
+import { hasHttpUrlPrefix } from "@openclaw/net-policy/url-protocol";
+import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   hasNonEmptyString,
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
   readStringValue,
 } from "@openclaw/normalization-core/string-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 
 type GatewayAttachment = {
   type: string;
@@ -64,37 +66,11 @@ const INLINE_CONTROL_ESCAPE_MAP: Readonly<Record<string, string>> = {
 };
 
 function escapeInlineControlChars(value: string): string {
-  let escaped = "";
-  for (const char of value) {
-    const codePoint = char.codePointAt(0);
-    if (codePoint === undefined) {
-      escaped += char;
-      continue;
-    }
-
-    const isInlineControl =
-      codePoint <= 0x1f ||
-      (codePoint >= 0x7f && codePoint <= 0x9f) ||
-      codePoint === 0x2028 ||
-      codePoint === 0x2029;
-    if (!isInlineControl) {
-      escaped += char;
-      continue;
-    }
-
-    const mapped = INLINE_CONTROL_ESCAPE_MAP[char];
-    if (mapped) {
-      escaped += mapped;
-      continue;
-    }
-
-    // Keep escaped control bytes readable and stable in logs/prompts.
-    escaped +=
-      codePoint <= 0xff
-        ? `\\x${codePoint.toString(16).padStart(2, "0")}`
-        : `\\u${codePoint.toString(16).padStart(4, "0")}`;
-  }
-  return escaped;
+  return value.replace(
+    /[\p{Cc}\u2028\u2029]/gu,
+    (char) =>
+      INLINE_CONTROL_ESCAPE_MAP[char] || `\\x${char.charCodeAt(0).toString(16).padStart(2, "0")}`,
+  );
 }
 
 function escapeResourceTitle(value: string): string {
@@ -113,7 +89,7 @@ function normalizeToolLocationPath(value: string): string | undefined {
   ) {
     return undefined;
   }
-  if (/^https?:\/\//i.test(trimmed)) {
+  if (hasHttpUrlPrefix(trimmed)) {
     return undefined;
   }
   if (/^file:\/\//i.test(trimmed)) {
@@ -242,6 +218,7 @@ function collectToolLocations(
   }
 }
 
+/** Extracts bounded text content from an ACP prompt block list. */
 export function extractTextFromPrompt(prompt: ContentBlock[], maxBytes?: number): string {
   const parts: string[] = [];
   // Track accumulated byte count per block to catch oversized prompts before full concatenation
@@ -250,11 +227,8 @@ export function extractTextFromPrompt(prompt: ContentBlock[], maxBytes?: number)
     let blockText: string | undefined;
     if (block.type === "text") {
       blockText = block.text;
-    } else if (block.type === "resource") {
-      const resource = block.resource as { text?: string } | undefined;
-      if (resource?.text) {
-        blockText = resource.text;
-      }
+    } else if (block.type === "resource" && "text" in block.resource && block.resource.text) {
+      blockText = block.resource.text;
     } else if (block.type === "resource_link") {
       const title = block.title ? ` (${escapeResourceTitle(block.title)})` : "";
       const uri = block.uri ? escapeInlineControlChars(block.uri) : "";
@@ -275,25 +249,26 @@ export function extractTextFromPrompt(prompt: ContentBlock[], maxBytes?: number)
   return parts.join("\n");
 }
 
+/** Extracts image/file prompt blocks into Gateway attachment payloads. */
 export function extractAttachmentsFromPrompt(prompt: ContentBlock[]): GatewayAttachment[] {
   const attachments: GatewayAttachment[] = [];
   for (const block of prompt) {
     if (block.type !== "image") {
       continue;
     }
-    const image = block as ImageContent;
-    if (!image.data || !image.mimeType) {
+    if (!block.data || !block.mimeType) {
       continue;
     }
     attachments.push({
       type: "image",
-      mimeType: image.mimeType,
-      content: image.data,
+      mimeType: block.mimeType,
+      content: block.data,
     });
   }
   return attachments;
 }
 
+/** Builds the display title used for ACP tool-call events. */
 export function formatToolTitle(
   name: string | undefined,
   args: Record<string, unknown> | undefined,
@@ -304,7 +279,7 @@ export function formatToolTitle(
   }
   const parts = Object.entries(args).map(([key, value]) => {
     const raw = typeof value === "string" ? value : JSON.stringify(value);
-    const safe = raw.length > 100 ? `${raw.slice(0, 100)}...` : raw;
+    const safe = raw.length > 100 ? `${truncateUtf16Safe(raw, 100)}...` : raw;
     return `${key}: ${safe}`;
   });
   // Sanitize at the source so session updates and permission requests never
@@ -312,6 +287,7 @@ export function formatToolTitle(
   return escapeInlineControlChars(`${base}: ${parts.join(", ")}`);
 }
 
+/** Infers ACP tool kind from a normalized tool name. */
 export function inferToolKind(name?: string): ToolKind {
   if (!name) {
     return "other";
@@ -341,6 +317,7 @@ export function inferToolKind(name?: string): ToolKind {
   return "other";
 }
 
+/** Extracts textual ACP tool-call content from unknown runtime payloads. */
 export function extractToolCallContent(value: unknown): ToolCallContent[] | undefined {
   if (hasNonEmptyString(value)) {
     return value.trim()
@@ -400,6 +377,7 @@ export function extractToolCallContent(value: unknown): ToolCallContent[] | unde
   ];
 }
 
+/** Extracts bounded file locations from nested tool-call payloads. */
 export function extractToolCallLocations(...values: unknown[]): ToolCallLocation[] | undefined {
   const locations = new Map<string, ToolCallLocation>();
   for (const value of values) {

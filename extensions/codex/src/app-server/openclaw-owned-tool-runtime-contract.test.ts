@@ -7,25 +7,23 @@ import {
   resetOpenClawOwnedToolHooks,
   textToolResult,
 } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
+// Codex tests cover openclaw owned tool runtime contract plugin behavior.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { toCodexDynamicToolProtocolResponse } from "./dynamic-tool-execution.js";
 import { createCodexDynamicToolBridge } from "./dynamic-tools.js";
 
 function createContractTool(overrides: Partial<AnyAgentTool>): AnyAgentTool {
   return {
     name: "exec",
     description: "Run a command.",
-    parameters: { type: "object", properties: {} },
+    parameters: { type: "object", properties: {}, additionalProperties: true },
     execute: vi.fn(),
     ...overrides,
   } as unknown as AnyAgentTool;
 }
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null) {
-    throw new Error(`${label} was not an object`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("object", "label-not-object");
 
 function expectRecordFields(record: Record<string, unknown>, fields: Record<string, unknown>) {
   for (const [key, value] of Object.entries(fields)) {
@@ -108,7 +106,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
       arguments: { command: "pwd" },
     });
 
-    expect(result).toEqual({
+    expect(toCodexDynamicToolProtocolResponse(result)).toEqual({
       success: true,
       contentItems: [{ type: "inputText", text: "done" }],
     });
@@ -160,7 +158,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
       expectRecordFields(eventRecord, {
         toolName: "exec",
         toolCallId: "call-middleware",
-        args: { command: "status" },
+        args: mergedParams,
       });
       expectRecordFields(requireRecord(eventRecord.result, "tool_result middleware result"), {
         content: [{ type: "text", text: "raw output" }],
@@ -189,7 +187,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
       arguments: { command: "status" },
     });
 
-    expect(result).toEqual({
+    expect(toCodexDynamicToolProtocolResponse(result)).toEqual({
       success: true,
       contentItems: [{ type: "inputText", text: "compacted output" }],
     });
@@ -237,7 +235,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
       },
     });
 
-    expect(result).toEqual({
+    expect(toCodexDynamicToolProtocolResponse(result)).toEqual({
       success: false,
       contentItems: [{ type: "inputText", text: "blocked by policy" }],
     });
@@ -293,7 +291,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
       arguments: { command: "false" },
     });
 
-    expect(result).toEqual({
+    expect(toCodexDynamicToolProtocolResponse(result)).toEqual({
       success: false,
       contentItems: [{ type: "inputText", text: "tool failed" }],
     });
@@ -317,7 +315,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
 
   it("records successful Codex messaging text, media, and target telemetry", async () => {
     const hooks = installOpenClawOwnedToolHooks();
-    const execute = vi.fn(async () => textToolResult("Sent."));
+    const execute = vi.fn(async () => textToolResult("Sent.", { messageId: "message-1" }));
     const bridge = createCodexDynamicToolBridge({
       tools: [createContractTool({ name: "message", execute })],
       signal: new AbortController().signal,
@@ -340,7 +338,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
       },
     });
 
-    expect(result).toEqual({
+    expect(toCodexDynamicToolProtocolResponse(result)).toEqual({
       success: true,
       contentItems: [{ type: "inputText", text: "Sent." }],
     });
@@ -397,7 +395,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
       arguments: { text: "hello" },
     });
 
-    expect(result).toEqual({
+    expect(toCodexDynamicToolProtocolResponse(result)).toEqual({
       success: true,
       contentItems: [{ type: "inputText", text: "Generated media reply." }],
     });
@@ -446,7 +444,7 @@ describe("OpenClaw-owned tool runtime contract — Codex app-server adapter", ()
       arguments: { command: "pwd" },
     });
 
-    expect(result).toEqual({
+    expect(toCodexDynamicToolProtocolResponse(result)).toEqual({
       success: true,
       contentItems: [{ type: "inputText", text: "done" }],
     });

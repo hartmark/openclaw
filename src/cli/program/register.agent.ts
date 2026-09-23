@@ -1,10 +1,11 @@
+// Agent and agents command registration with lazy command-module loading for startup speed.
 import type { Command } from "commander";
 import { formatDocsLink } from "../../../packages/terminal-core/src/links.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
+import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
 import { hasExplicitOptions } from "../command-options.js";
 import { formatHelpExamples } from "../help-format.js";
 import { collectOption } from "./helpers.js";
-import { registerAgentTurnCommand } from "./register.agent-turn.js";
 
 type AgentsAddModule = typeof import("../../commands/agents.commands.add.js");
 type AgentsBindModule = typeof import("../../commands/agents.commands.bind.js");
@@ -14,11 +15,9 @@ type AgentsListModule = typeof import("../../commands/agents.commands.list.js");
 type CliUtilsModule = typeof import("../cli-utils.js");
 type RuntimeModule = typeof import("../../runtime.js");
 
-let agentsBindModulePromise: Promise<AgentsBindModule> | undefined;
-
-function loadAgentsBindModule(): Promise<AgentsBindModule> {
-  return (agentsBindModulePromise ??= import("../../commands/agents.commands.bind.js"));
-}
+const loadAgentsBindModule = createLazyRuntimeModule(
+  () => import("../../commands/agents.commands.bind.js"),
+);
 
 async function loadAgentsAddCommand(): Promise<AgentsAddModule["agentsAddCommand"]> {
   return (await import("../../commands/agents.commands.add.js")).agentsAddCommand;
@@ -70,14 +69,7 @@ async function runAgentsCommandAction(
   });
 }
 
-export function registerAgentCommands(
-  program: Command,
-  args: { agentChannelOptions: string },
-): void {
-  registerAgentTurnCommand(program, args);
-  registerAgentsCommands(program);
-}
-
+/** Register `agents` management subcommands for config, bindings, identity, and deletion. */
 export function registerAgentsCommands(program: Command): void {
   const agents = program
     .command("agents")
@@ -93,11 +85,16 @@ export function registerAgentsCommands(program: Command): void {
     .description("List configured agents")
     .option("--json", "Output JSON instead of text", false)
     .option("--bindings", "Include routing bindings", false)
+    .option("--tree", "Render agent creation hierarchy", false)
     .action(async (opts): Promise<void> => {
       await runAgentsCommandAction(async (runtime) => {
         const agentsListCommand = await loadAgentsListCommand();
         await agentsListCommand(
-          { json: Boolean(opts.json), bindings: Boolean(opts.bindings) },
+          {
+            json: Boolean(opts.json),
+            bindings: Boolean(opts.bindings),
+            tree: Boolean(opts.tree),
+          },
           runtime,
         );
       });
@@ -172,14 +169,19 @@ export function registerAgentsCommands(program: Command): void {
     .command("add [name]")
     .description("Add a new isolated agent")
     .option("--workspace <dir>", "Workspace directory for the new agent")
+    .option("--role <role>", "Seed a role: coordinator, researcher, writer, reviewer")
     .option("--model <id>", "Model id for this agent")
     .option("--agent-dir <dir>", "Agent state directory for this agent")
     .option("--bind <channel[:accountId]>", "Route channel binding (repeatable)", collectOption, [])
-    .option("--non-interactive", "Disable prompts; requires --workspace", false)
+    .option(
+      "--non-interactive",
+      "Disable prompts; requires --workspace unless --role is set",
+      false,
+    )
     .option("--json", "Output JSON summary", false)
     .action(async (name, opts, command): Promise<void> => {
       await runAgentsCommandAction(async (runtime) => {
-        const hasFlags = hasExplicitOptions(command, [
+        const hasAutomationFlags = hasExplicitOptions(command, [
           "workspace",
           "model",
           "agentDir",
@@ -191,6 +193,7 @@ export function registerAgentsCommands(program: Command): void {
           {
             name: typeof name === "string" ? name : undefined,
             workspace: opts.workspace as string | undefined,
+            role: typeof opts.role === "string" ? opts.role : undefined,
             model: opts.model as string | undefined,
             agentDir: opts.agentDir as string | undefined,
             bind: Array.isArray(opts.bind) ? (opts.bind as string[]) : undefined,
@@ -198,7 +201,35 @@ export function registerAgentsCommands(program: Command): void {
             json: Boolean(opts.json),
           },
           runtime,
-          { hasFlags },
+          { hasAutomationFlags },
+        );
+      });
+    });
+
+  agents
+    .command("team")
+    .description("Create a coordinated team of agents")
+    .command("create")
+    .description("Create a coordinator and specialists from a bundled preset")
+    .option("--preset <name>", "Team preset (team)", "team")
+    .option("--coordinator <id>", "Coordinator agent id", "coordinator")
+    .option("--prefix <p>", "Prefix every team agent id with <p>-")
+    .option("--workspace-root <dir>", "Parent directory for separate team workspaces")
+    .option("--non-interactive", "Disable prompts", false)
+    .option("--json", "Output JSON summary", false)
+    .action(async (opts): Promise<void> => {
+      await runAgentsCommandAction(async (runtime) => {
+        const { agentsTeamCreateCommand } = await import("../../commands/agents.commands.team.js");
+        await agentsTeamCreateCommand(
+          {
+            preset: typeof opts.preset === "string" ? opts.preset : undefined,
+            coordinator: typeof opts.coordinator === "string" ? opts.coordinator : undefined,
+            prefix: typeof opts.prefix === "string" ? opts.prefix : undefined,
+            workspaceRoot: typeof opts.workspaceRoot === "string" ? opts.workspaceRoot : undefined,
+            nonInteractive: Boolean(opts.nonInteractive),
+            json: Boolean(opts.json),
+          },
+          runtime,
         );
       });
     });
@@ -207,7 +238,10 @@ export function registerAgentsCommands(program: Command): void {
     .command("set-identity")
     .description("Update an agent identity (name/theme/emoji/avatar)")
     .option("--agent <id>", "Agent id to update")
-    .option("--workspace <dir>", "Workspace directory used to locate the agent + IDENTITY.md")
+    .option(
+      "--workspace <dir>",
+      "Locate the agent and IDENTITY.md; does not change the stored workspace",
+    )
     .option("--identity-file <path>", "Explicit IDENTITY.md path to read")
     .option("--from-identity", "Read values from IDENTITY.md", false)
     .option("--name <name>", "Identity name")

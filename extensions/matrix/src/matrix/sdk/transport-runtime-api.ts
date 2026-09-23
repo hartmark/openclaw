@@ -1,5 +1,6 @@
-import { fetchWithRuntimeDispatcherOrMockedGlobal } from "openclaw/plugin-sdk/runtime-fetch";
-import {
+// Matrix API module exposes the plugin public contract.
+export { fetchWithRuntimeDispatcherOrMockedGlobal } from "openclaw/plugin-sdk/runtime-fetch";
+export {
   closeDispatcher,
   createPinnedDispatcher,
   resolvePinnedHostnameWithPolicy,
@@ -7,12 +8,3 @@ import {
   type SsrFPolicy,
 } from "openclaw/plugin-sdk/ssrf-dispatcher";
 export { buildTimeoutAbortSignal } from "./timeout-abort-signal.js";
-
-export {
-  closeDispatcher,
-  createPinnedDispatcher,
-  fetchWithRuntimeDispatcherOrMockedGlobal,
-  resolvePinnedHostnameWithPolicy,
-  type PinnedDispatcherPolicy,
-  type SsrFPolicy,
-};

@@ -1,8 +1,9 @@
+// Coverage for cache-retention defaults and overrides in extra params.
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createLlmStreamSimpleMock } from "../../../test/helpers/agents/llm-stream-simple-mock.js";
-import { isOpenRouterAnthropicModelRef } from "../../llm/providers/stream-wrappers/anthropic-family-cache-semantics.js";
-import { testing as extraParamsTesting, applyExtraParamsToAgent } from "./extra-params.js";
+import { applyExtraParamsToAgent } from "./extra-params.js";
+import { runExtraParamsCase, testing as extraParamsTesting } from "./extra-params.test-support.js";
+import { log } from "./logger.js";
 import { resolveCacheRetention } from "./prompt-cache-retention.js";
 
 function applyAndExpectWrapped(params: {
@@ -12,7 +13,9 @@ function applyAndExpectWrapped(params: {
   model?: Parameters<typeof applyExtraParamsToAgent>[8];
   provider: string;
 }) {
-  const agent: { streamFn?: StreamFn } = {};
+  // Wrapping is the observable signal that cache-retention handling was enabled
+  // without requiring a real provider stream call.
+  const agent: { streamFn?: StreamFn } = { streamFn: vi.fn() as StreamFn };
 
   applyExtraParamsToAgent(
     agent,
@@ -31,17 +34,17 @@ function applyAndExpectWrapped(params: {
   }
 }
 
-// Mock the logger to avoid noise in tests
+// Keep cache-retention warning/debug output out of assertion logs.
 vi.mock("./logger.js", () => ({
   log: {
+    isEnabled: () => false,
     debug: vi.fn(),
     warn: vi.fn(),
   },
 }));
 
-vi.mock("../../llm/stream.js", () => createLlmStreamSimpleMock());
-
 beforeEach(() => {
+  vi.mocked(log.warn).mockClear();
   extraParamsTesting.setProviderRuntimeDepsForTest({
     prepareProviderExtraParams: () => undefined,
     resolveProviderExtraParamsForTransport: () => undefined,
@@ -54,6 +57,58 @@ afterEach(() => {
 });
 
 describe("cacheRetention default behavior", () => {
+  it.each(["openai-responses", "openai-chatgpt-responses", "openai-completions"] as const)(
+    "forwards configured native OpenAI retention to %s stream options",
+    (api) => {
+      for (const cacheRetention of ["none", "short", "long"] as const) {
+        for (const baseUrl of ["https://api.openai.com/v1", "https://proxy.example/v1"]) {
+          const captured = runExtraParamsCase({
+            model: {
+              id: "gpt-5.4",
+              name: "GPT-5.4",
+              api,
+              provider: "openai",
+              baseUrl,
+              reasoning: true,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 128_000,
+              maxTokens: 4096,
+            },
+            cfg: { agents: { defaults: { params: { cacheRetention } } } },
+            payload: {},
+          });
+          expect(captured.options?.cacheRetention).toBe(
+            baseUrl === "https://api.openai.com/v1" ? cacheRetention : undefined,
+          );
+        }
+      }
+    },
+  );
+
+  it.each([undefined, "none", "short", "long"] as const)(
+    "forwards Model Studio explicit retention %s without opting into cache keys",
+    (cacheRetention) => {
+      const captured = runExtraParamsCase({
+        model: {
+          id: "qwen-plus",
+          name: "Qwen Plus",
+          api: "openai-completions",
+          provider: "qwen",
+          baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128_000,
+          maxTokens: 4_096,
+        },
+        cfg: { agents: { defaults: { params: { temperature: 0.5, cacheRetention } } } },
+        payload: {},
+      });
+      expect(captured.options?.cacheRetention).toBe(cacheRetention);
+    },
+  );
+
   it("returns 'short' for Anthropic when not configured", () => {
     applyAndExpectWrapped({
       modelId: "claude-3-sonnet",
@@ -168,6 +223,8 @@ describe("cacheRetention default behavior", () => {
   });
 
   it("respects cacheRetention for custom provider with anthropic-messages API", () => {
+    // Custom Anthropic-compatible providers only receive cache markers when
+    // config explicitly opts in; no native-provider default should leak in.
     applyAndExpectWrapped({
       cfg: {
         agents: {
@@ -253,6 +310,44 @@ describe("cacheRetention default behavior", () => {
     ).toBe("long");
   });
 
+  it.each([undefined, "short", "long", "none"] as const)(
+    "preserves %s retention for the Bedrock Converse policy owner",
+    (cacheRetention) => {
+      expect(
+        resolveCacheRetention(
+          { cacheRetention },
+          "amazon-bedrock",
+          "bedrock-converse-stream",
+          "amazon.nova-micro-v1:0",
+        ),
+      ).toBe(cacheRetention);
+    },
+  );
+
+  it("warns instead of creating an undocumented cacheRetention alias", () => {
+    applyAndExpectWrapped({
+      cfg: {
+        agents: {
+          defaults: {
+            models: {
+              "amazon-bedrock/us.anthropic.claude-sonnet-4-6": {
+                params: { cacheRetention: "standard" },
+              },
+            },
+          },
+        },
+      },
+      modelId: "us.anthropic.claude-sonnet-4-6",
+      model: { api: "openai-completions" } as Parameters<typeof applyExtraParamsToAgent>[8],
+      provider: "amazon-bedrock",
+    });
+
+    expect(log.warn).toHaveBeenCalledOnce();
+    expect(log.warn).toHaveBeenCalledWith(
+      'ignoring invalid cacheRetention param; expected "none", "short", or "long"',
+    );
+  });
+
   it("defaults to 'short' for anthropic-vertex without explicit config", () => {
     expect(
       resolveCacheRetention(
@@ -317,13 +412,5 @@ describe("cacheRetention default behavior", () => {
         "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/z27qyso459da",
       ),
     ).toBeUndefined();
-  });
-});
-
-describe("anthropic-family cache semantics", () => {
-  it("classifies OpenRouter Anthropic model refs centrally", () => {
-    expect(isOpenRouterAnthropicModelRef("openrouter", "anthropic/claude-opus-4-6")).toBe(true);
-    expect(isOpenRouterAnthropicModelRef("openrouter", "google/gemini-2.5-pro")).toBe(false);
-    expect(isOpenRouterAnthropicModelRef("OpenRouter", "Anthropic/Claude-Sonnet-4")).toBe(true);
   });
 });

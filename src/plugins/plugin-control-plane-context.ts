@@ -1,29 +1,23 @@
+/** Tracks control-plane plugin metadata context during registry and status operations. */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { hashJson } from "./installed-plugin-index-hash.js";
 import { resolveInstalledPluginIndexPolicyHash } from "./installed-plugin-index-policy.js";
 import type { InstalledPluginIndex } from "./installed-plugin-index.js";
 import { resolveInstalledManifestRegistryIndexFingerprint } from "./manifest-registry-installed.js";
-import { resolvePluginCacheInputs, type PluginSourceRoots } from "./roots.js";
+import { resolvePluginCacheInputs } from "./roots.js";
 
-export type PluginDiscoveryContext = {
-  roots: PluginSourceRoots;
-  loadPaths: readonly string[];
-};
+/** Discovery inputs that affect plugin source resolution. */
+type PluginDiscoveryContext = ReturnType<typeof resolvePluginCacheInputs>;
 
-export type PluginControlPlaneContext = {
-  discovery: PluginDiscoveryContext;
-  policyFingerprint: string;
-  inventoryFingerprint?: string;
-  activationFingerprint?: string;
-};
-
-export type ResolvePluginDiscoveryContextParams = {
+/** Parameters used to resolve plugin discovery roots and load paths. */
+type ResolvePluginDiscoveryContextParams = {
   config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
   workspaceDir?: string;
   loadPaths?: readonly string[];
 };
 
+/** Parameters used to resolve the plugin control-plane fingerprint. */
 export type ResolvePluginControlPlaneContextParams = ResolvePluginDiscoveryContextParams & {
   activationFingerprint?: string;
   index?: InstalledPluginIndex;
@@ -38,48 +32,31 @@ function resolveConfiguredPluginLoadPaths(
   return Array.isArray(paths) ? paths : undefined;
 }
 
+/** Resolves plugin discovery roots and load paths for cache/fingerprint callers. */
 export function resolvePluginDiscoveryContext(
   params: ResolvePluginDiscoveryContextParams = {},
 ): PluginDiscoveryContext {
   return resolvePluginCacheInputs({
     env: params.env ?? process.env,
     workspaceDir: params.workspaceDir,
-    loadPaths: [...(params.loadPaths ?? resolveConfiguredPluginLoadPaths(params.config) ?? [])],
+    loadPaths: params.loadPaths ?? resolveConfiguredPluginLoadPaths(params.config),
   });
 }
 
-export function resolvePluginDiscoveryFingerprint(
-  params: ResolvePluginDiscoveryContextParams = {},
-): string {
-  return fingerprintPluginDiscoveryContext(resolvePluginDiscoveryContext(params));
-}
-
-export function fingerprintPluginDiscoveryContext(context: PluginDiscoveryContext): string {
-  return hashJson(context);
-}
-
-export function resolvePluginControlPlaneContext(
+/** Resolves a stable fingerprint for plugin control-plane activation state. */
+export function resolvePluginControlPlaneFingerprint(
   params: ResolvePluginControlPlaneContextParams = {},
-): PluginControlPlaneContext {
+): string {
   const inventoryFingerprint =
     params.inventoryFingerprint ??
     (params.index ? resolveInstalledManifestRegistryIndexFingerprint(params.index) : undefined);
-  return {
+  return hashJson({
     discovery: resolvePluginDiscoveryContext(params),
-    policyFingerprint: params.policyHash ?? resolveInstalledPluginIndexPolicyHash(params.config),
+    policyFingerprint:
+      params.policyHash ?? resolveInstalledPluginIndexPolicyHash(params.config, params.env),
     ...(inventoryFingerprint ? { inventoryFingerprint } : {}),
     ...(params.activationFingerprint
       ? { activationFingerprint: params.activationFingerprint }
       : {}),
-  };
-}
-
-export function resolvePluginControlPlaneFingerprint(
-  params: ResolvePluginControlPlaneContextParams = {},
-): string {
-  return fingerprintPluginControlPlaneContext(resolvePluginControlPlaneContext(params));
-}
-
-function fingerprintPluginControlPlaneContext(context: PluginControlPlaneContext): string {
-  return hashJson(context);
+  });
 }
