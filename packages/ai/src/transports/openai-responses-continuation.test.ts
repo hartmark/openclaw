@@ -556,8 +556,28 @@ describe("OpenAI Responses continuation", () => {
 
     vi.advanceTimersByTime(60_000 + 1);
 
-    const next = claimWithOverride(nextRequest());
+    // The cached baseline is now two rounds deep (round 1's response plus
+    // round 2's own committed response), so the third claim's own request
+    // must extend that same history -- reusing bare nextRequest() here (only
+    // 3 input items, one round short of the real baseline) would make
+    // currentInput.length < baselineLength return "history_shorter" on its
+    // own, passing this test's previous_response_id assertion for the wrong
+    // reason regardless of whether the override's TTL actually fired.
+    const thirdRoundRequest: ResponsesContinuationRequest = {
+      ...nextRequest(),
+      input: [
+        ...(nextRequest().input ?? []),
+        assistantOutput,
+        { type: "message", role: "user", content: [{ type: "input_text", text: "third" }] },
+      ] as never,
+    };
+    const next = claimWithOverride(thirdRoundRequest);
     expect(next?.request.previous_response_id).toBeUndefined();
+    // A genuine expiry (no cached baseline found at all) returns the request
+    // untouched -- still carrying the full history above, not a trimmed
+    // delta -- which is what actually distinguishes this from a
+    // coincidental "history_shorter" pass on a too-short request.
+    expect(next?.request.input).toEqual(thirdRoundRequest.input);
     next?.release();
   });
 

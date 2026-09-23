@@ -5,6 +5,15 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanupSessionResources } from "../session-resources.js";
 import { createOpenAIResponsesTransportStreamFn } from "./openai-responses-client.js";
 
+// Only the one real-wall-clock-elapsed test below needs this -- everything
+// else in this file completes instantly. Real elapsed time (not fake
+// timers, which would also freeze this test's own real HTTP/SSE I/O)
+// against a scheduler-dependent sleep is recurring CI cost and a source of
+// flaky failures the regular deterministic lane shouldn't carry on every
+// run; opt in the same way the *.live.test.ts files in this directory do
+// (`pnpm test:live`), even though this specific test never leaves loopback.
+const LIVE = process.env.OPENCLAW_LIVE_TEST === "1";
+
 // Matches the identically-named symbol in src/agents/provider-request-config.ts
 // (and the sibling local copy in openai-completions.test-support.ts) via the
 // global symbol registry, without a packages/ai -> src/agents import.
@@ -250,55 +259,59 @@ describe("real HTTP/SSE OpenAI-Responses continuation (loopback server, no SDK m
   // timers) around it, over the same real HTTP/SSE loopback server as the
   // tests above, to prove the *configured* number -- not the 90-minute
   // shipped default -- is what governs expiry end to end.
-  it("honors a configured responsesContinuationIdleMinutes over a real custom-route connection", async () => {
-    const IDLE_MINUTES = 0.05; // 3000ms: short enough to expire within a fast test
-    const server = new ScriptedResponsesServer([
-      () => completedFrame("resp_1", "first answer"),
-      () => completedFrame("resp_2", "second answer"),
-      () => completedFrame("resp_3", "third answer"),
-    ]);
-    const baseUrl = await server.listen();
-    try {
-      const model: Model<"openai-responses"> = {
-        ...customEndpointModel(baseUrl),
-        compat: {
-          supportsResponsesContinuation: true,
-          responsesContinuationIdleMinutes: IDLE_MINUTES,
-        },
-      };
-      const sessionId = "real-sse-configured-idle-ttl";
-      const firstUser = userMessage("first question", 1);
-      const first = await run(model, { messages: [firstUser], tools: [] }, sessionId);
-      const secondContext = {
-        messages: [firstUser, first, userMessage("second question", 2)],
-        tools: [],
-      };
-      // Immediately within the configured 3s window: the baseline must still
-      // be live, proving the short value isn't just being treated as "always
-      // expired" by some unrelated defect.
-      const second = await run(model, secondContext, sessionId);
-      expect(server.requests[1]).toMatchObject({ previous_response_id: "resp_1" });
-      expect((server.requests[1]?.input as unknown[] | undefined)?.length).toBe(1);
-
-      // Real wall-clock wait past the configured window (committed by the
-      // second turn above), comfortably short of the 90-minute shipped
-      // default -- a miss here only happens if the configured minutes value
-      // genuinely reached the real idle timer, not the default.
-      await new Promise((resolve) => setTimeout(resolve, IDLE_MINUTES * 60_000 + 500));
-      await run(
-        model,
-        {
-          messages: [...secondContext.messages, second, userMessage("third question", 3)],
+  it.skipIf(!LIVE)(
+    "honors a configured responsesContinuationIdleMinutes over a real custom-route connection",
+    async () => {
+      const IDLE_MINUTES = 0.05; // 3000ms: short enough to expire within a fast test
+      const server = new ScriptedResponsesServer([
+        () => completedFrame("resp_1", "first answer"),
+        () => completedFrame("resp_2", "second answer"),
+        () => completedFrame("resp_3", "third answer"),
+      ]);
+      const baseUrl = await server.listen();
+      try {
+        const model: Model<"openai-responses"> = {
+          ...customEndpointModel(baseUrl),
+          compat: {
+            supportsResponsesContinuation: true,
+            responsesContinuationIdleMinutes: IDLE_MINUTES,
+          },
+        };
+        const sessionId = "real-sse-configured-idle-ttl";
+        const firstUser = userMessage("first question", 1);
+        const first = await run(model, { messages: [firstUser], tools: [] }, sessionId);
+        const secondContext = {
+          messages: [firstUser, first, userMessage("second question", 2)],
           tools: [],
-        },
-        sessionId,
-      );
+        };
+        // Immediately within the configured 3s window: the baseline must still
+        // be live, proving the short value isn't just being treated as "always
+        // expired" by some unrelated defect.
+        const second = await run(model, secondContext, sessionId);
+        expect(server.requests[1]).toMatchObject({ previous_response_id: "resp_1" });
+        expect((server.requests[1]?.input as unknown[] | undefined)?.length).toBe(1);
 
-      expect(server.requests).toHaveLength(3);
-      expect(server.requests[2]).not.toHaveProperty("previous_response_id");
-      expect((server.requests[2]?.input as unknown[] | undefined)?.length).toBe(5);
-    } finally {
-      await server.close();
-    }
-  }, 15_000);
+        // Real wall-clock wait past the configured window (committed by the
+        // second turn above), comfortably short of the 90-minute shipped
+        // default -- a miss here only happens if the configured minutes value
+        // genuinely reached the real idle timer, not the default.
+        await new Promise((resolve) => setTimeout(resolve, IDLE_MINUTES * 60_000 + 500));
+        await run(
+          model,
+          {
+            messages: [...secondContext.messages, second, userMessage("third question", 3)],
+            tools: [],
+          },
+          sessionId,
+        );
+
+        expect(server.requests).toHaveLength(3);
+        expect(server.requests[2]).not.toHaveProperty("previous_response_id");
+        expect((server.requests[2]?.input as unknown[] | undefined)?.length).toBe(5);
+      } finally {
+        await server.close();
+      }
+    },
+    15_000,
+  );
 });
