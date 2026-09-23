@@ -68,26 +68,26 @@ function requestWithoutInput(request: ResponsesContinuationRequest): ResponsesCo
 // Canonicalizes a call_id/fc_id through the exact same shaping replay applies
 // (normalizeOpenAIResponsesToolCallIds in embedded-agent-helpers, mirrored
 // here as normalizeOpenAIResponsesFunctionCallId since packages/ai cannot
-// import from src/agents). Idempotent on an already-reshaped id -- it only
-// touches ids that don't already match the provider's own call_*/fc_* shape
-// -- so a raw provider id and the client's replayed reshaping of that same
-// id both canonicalize to the same value. This replaces a blanket call_id
-// drop: dropping it entirely would treat *any* changed function-call id as
-// the same known reshape, masking a genuinely different tool call.
-function canonicalizeReplayedCallId(value: unknown): unknown {
-  return typeof value === "string" ? normalizeOpenAIResponsesFunctionCallId(value) : value;
-}
-
-// A cached raw provider `function_call` still carries its separate,
-// un-reshaped `call_id` and item `id` fields exactly as the provider
-// returned them. Replay pairs those two into one `call_id|fc_id` string
-// before reshaping (normalizeOpenAIResponsesToolCallIds, mirrored by
-// normalizeOpenAIResponsesFunctionCallId), then the request builder splits
-// the reshaped pair back into separate wire fields -- so the replayed
-// call_id already reflects a hash of the *pair*, not of call_id alone.
-// Canonicalizing only the bare cached call_id (dropping id) hashes a
-// different input and never matches, permanently forcing history_changed.
-function canonicalizeCachedCallId(callId: unknown, itemId: unknown): unknown {
+// import from src/agents), for BOTH sides of the comparison -- the cached
+// raw provider function_call still carries its separate, un-reshaped
+// `call_id` and item `id` fields exactly as the provider returned them, and
+// a replayed item can equally arrive either already agent-reshaped (pass
+// through an AgentMessage[] transform) or, for a direct transport caller
+// that preserves same-model tool-call ids verbatim
+// (transcript-transform.ts's transformMessages), completely unreshaped --
+// still carrying the provider's own separate call_id/id pair, identically
+// to the cached side. Pairing call_id with id (when present) before
+// reshaping, on both sides, is required for that unchanged-raw-id replay to
+// canonicalize to the very same value the cached side computed: reshaping
+// only the bare call_id (dropping id) hashes a different input than the
+// cached side's pair and permanently, incorrectly forces history_changed.
+// Idempotent on an already-reshaped id -- it only touches ids that don't
+// already match the provider's own call_*/fc_* shape -- so a raw provider
+// id and the client's replayed reshaping of that same id both canonicalize
+// to the same value. This replaces a blanket call_id drop: dropping it
+// entirely would treat *any* changed function-call id as the same known
+// reshape, masking a genuinely different tool call.
+function canonicalizeToolCallId(callId: unknown, itemId: unknown): unknown {
   if (typeof callId !== "string") {
     return callId;
   }
@@ -123,9 +123,12 @@ function normalizeAssistantReplayInput(input: readonly unknown[], fromResponse =
     }
     const { id: rawId, status: _status, ...stableItem } = item;
     if ("call_id" in stableItem) {
-      stableItem.call_id = fromResponse
-        ? canonicalizeCachedCallId(stableItem.call_id, rawId)
-        : canonicalizeReplayedCallId(stableItem.call_id);
+      // Pair with the item's own raw id on both sides (see
+      // canonicalizeToolCallId): a replayed item can arrive either already
+      // agent-reshaped or, for a direct transport caller that preserves
+      // same-model tool-call ids verbatim, completely unreshaped and paired
+      // exactly like the cached side.
+      stableItem.call_id = canonicalizeToolCallId(stableItem.call_id, rawId);
     }
     if (fromResponse && item.type === "function_call") {
       // Only provider output crosses terminal admission; sent arguments must retain real type edits.
@@ -186,7 +189,7 @@ function restoreRawCallIdsInDelta(
     const rawCallId = item.call_id;
     // Mirror the eligibility comparison's pairing: the delta's call_id was
     // reshaped from the paired call_id|id, not the bare call_id alone.
-    const reshaped = canonicalizeCachedCallId(rawCallId, item.id);
+    const reshaped = canonicalizeToolCallId(rawCallId, item.id);
     if (typeof reshaped === "string" && reshaped !== rawCallId) {
       rawCallIdByReshaped.set(reshaped, rawCallId);
     }

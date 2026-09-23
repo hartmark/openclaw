@@ -419,6 +419,58 @@ describe("OpenAI Responses continuation", () => {
     });
   });
 
+  it("continues a tool-calling round when replay preserves the raw non-canonical call_id/id pair unchanged", () => {
+    // Real shape for a direct Responses transport caller that never runs
+    // history through the agent-level normalizer: transcript-transform.ts's
+    // transformMessages preserves same-model tool-call ids verbatim on its
+    // same-model branch, so this replayed function_call/function_call_output
+    // pair carries the exact same raw, non-canonical call_id and item id the
+    // provider originally returned -- not the agent-reshaped composite the
+    // sibling test above covers. Before this fixed, the cached side
+    // canonicalized the call_id/id *pair*, while the replayed side
+    // canonicalized only the bare call_id, so this exact case -- nothing
+    // about the call actually changed -- permanently forced history_changed
+    // and resent the whole conversation every round.
+    const rawCallId = "functions.gateway:0";
+    const rawItemId = "fc_tmp_kegospxl46";
+    const toolCall = {
+      type: "function_call",
+      id: rawItemId,
+      status: "completed",
+      call_id: rawCallId,
+      name: "exec",
+      arguments: '{"command":"echo hi"}',
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [{ type: "reasoning" }, toolCall] as never,
+    };
+    // Replayed completely unchanged -- same raw call_id, same raw id, no
+    // agent-level reshape applied at all.
+    const replayedToolCall = { ...toolCall };
+    const toolResult = {
+      type: "function_call_output",
+      call_id: rawCallId,
+      output: "hi\n",
+    };
+    const nextRoundRequest: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [firstUser, { type: "reasoning" }, replayedToolCall, toolResult] as never,
+    };
+
+    const result = resolveResponsesContinuationRequest(state, nextRoundRequest);
+
+    expect(result).toMatchObject({
+      continuationStatus: "continued",
+      request: {
+        previous_response_id: "resp_1",
+        input: [{ type: "function_call_output", call_id: rawCallId, output: "hi\n" }],
+      },
+    });
+  });
+
   it("does not tolerate an unrelated function-call id change as the known replay reshape", () => {
     // A changed call_id that ISN'T the client's own reshape of the cached raw
     // id (e.g. the model made a genuinely different tool call, or a
