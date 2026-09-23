@@ -106,7 +106,23 @@ function canonicalizeToolCallId(callId: unknown, itemId: unknown): unknown {
 // raw provider output), never for the replayed request's own input -- both
 // the call_id pairing above and the unsafe-integer handling below need to
 // know which side they're on, so this one flag drives both.
-function normalizeAssistantReplayInput(input: readonly unknown[], fromResponse = false): unknown[] {
+//
+// ignoreCachedItemIds (fromResponse side only) computes the cached call_id
+// as if it had no item id to pair with, even though the cached raw response
+// always has one. This exists for a real replay shape the pairing above
+// can't otherwise match: a direct transport caller can configure
+// replayResponsesItemIds:false, which omits function_call.id from the wire
+// while preserving its raw, non-canonical call_id verbatim -- that replayed
+// item structurally has no id to pair with, so it always canonicalizes via
+// the bare-call_id branch. The cached side must be compared against both
+// candidates (see resolveResponsesContinuationRequest) since either shape
+// is a legitimate "unchanged" replay depending on that per-connection
+// setting, not something this function can know on its own.
+function normalizeAssistantReplayInput(
+  input: readonly unknown[],
+  fromResponse = false,
+  ignoreCachedItemIds = false,
+): unknown[] {
   return input.map((item) => {
     if (!isRecord(item)) {
       return item;
@@ -128,7 +144,8 @@ function normalizeAssistantReplayInput(input: readonly unknown[], fromResponse =
       // agent-reshaped or, for a direct transport caller that preserves
       // same-model tool-call ids verbatim, completely unreshaped and paired
       // exactly like the cached side.
-      stableItem.call_id = canonicalizeToolCallId(stableItem.call_id, rawId);
+      const itemId = fromResponse && ignoreCachedItemIds ? undefined : rawId;
+      stableItem.call_id = canonicalizeToolCallId(stableItem.call_id, itemId);
     }
     if (fromResponse && item.type === "function_call") {
       // Only provider output crosses terminal admission; sent arguments must retain real type edits.
@@ -248,15 +265,33 @@ export function resolveResponsesContinuationRequest(
   if (currentInput.length < baselineLength) {
     return { request, continuationStatus: "history_shorter" };
   }
+  const replayedToolRound = normalizeAssistantReplayInput(
+    currentInput.slice(previousInput.length, baselineLength),
+  );
+  // Compared against two candidate cached-history shapes: normally paired
+  // with the cached response item's own id (matches both an agent-reshaped
+  // replay and a direct-transport replay that preserves the full raw
+  // call_id/id pair unchanged), or, failing that, ignoring the cached id
+  // entirely (matches a direct-transport replay whose connection disables
+  // item-id replay -- see normalizeAssistantReplayInput's own note). Both
+  // are legitimate "nothing about this call actually changed" shapes; which
+  // one a given connection produces depends on its own replayResponsesItemIds
+  // setting, not something knowable here.
+  const historyToolRoundUnchanged =
+    jsonValuesEqual(
+      replayedToolRound,
+      normalizeAssistantReplayInput(continuation.lastResponseItems, true),
+    ) ||
+    jsonValuesEqual(
+      replayedToolRound,
+      normalizeAssistantReplayInput(continuation.lastResponseItems, true, true),
+    );
   if (
     !jsonValuesEqual(
       normalizeAssistantReplayInput(currentInput.slice(0, previousInput.length)),
       normalizeAssistantReplayInput(previousInput),
     ) ||
-    !jsonValuesEqual(
-      normalizeAssistantReplayInput(currentInput.slice(previousInput.length, baselineLength)),
-      normalizeAssistantReplayInput(continuation.lastResponseItems, true),
-    )
+    !historyToolRoundUnchanged
   ) {
     return { request, continuationStatus: "history_changed" };
   }

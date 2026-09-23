@@ -471,6 +471,59 @@ describe("OpenAI Responses continuation", () => {
     });
   });
 
+  it("continues a tool-calling round when replay omits the item id entirely (replayResponsesItemIds:false)", () => {
+    // A connection configured with replayResponsesItemIds:false (e.g. the
+    // ChatGPT-Responses provider) omits function_call.id from the wire
+    // while preserving its raw call_id verbatim -- openai-responses-replay-
+    // messages-internal.ts's toolCall handling literally never puts `id` on
+    // the item in that case. The cached side still has the full raw
+    // call_id/id pair (from the provider's own response), so pairing it
+    // unconditionally (as the sibling "unchanged pair" test above requires)
+    // would hash a different input than this replay's un-pairable bare
+    // call_id ever could, permanently forcing history_changed for a call
+    // that didn't actually change -- a real regression the pairing fix
+    // above introduced for this equally real replay shape.
+    const rawCallId = "functions.gateway:0";
+    const rawItemId = "fc_tmp_kegospxl46";
+    const toolCall = {
+      type: "function_call",
+      id: rawItemId,
+      status: "completed",
+      call_id: rawCallId,
+      name: "exec",
+      arguments: '{"command":"echo hi"}',
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [{ type: "reasoning" }, toolCall] as never,
+    };
+    // Replayed with the same raw call_id but no `id` field at all -- exactly
+    // what a replayResponsesItemIds:false connection sends. Everything else
+    // about the item is otherwise unchanged from the cached one.
+    const { id: _unusedItemId, ...replayedToolCall } = toolCall;
+    const toolResult = {
+      type: "function_call_output",
+      call_id: rawCallId,
+      output: "hi\n",
+    };
+    const nextRoundRequest: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [firstUser, { type: "reasoning" }, replayedToolCall, toolResult] as never,
+    };
+
+    const result = resolveResponsesContinuationRequest(state, nextRoundRequest);
+
+    expect(result).toMatchObject({
+      continuationStatus: "continued",
+      request: {
+        previous_response_id: "resp_1",
+        input: [{ type: "function_call_output", call_id: rawCallId, output: "hi\n" }],
+      },
+    });
+  });
+
   it("does not tolerate an unrelated function-call id change as the known replay reshape", () => {
     // A changed call_id that ISN'T the client's own reshape of the cached raw
     // id (e.g. the model made a genuinely different tool call, or a
