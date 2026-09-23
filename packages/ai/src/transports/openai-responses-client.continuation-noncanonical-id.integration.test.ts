@@ -28,16 +28,10 @@ import { normalizeOpenAIResponsesFunctionCallId } from "./openai-responses-tool-
 // does the same mutation by hand to stay real without crossing the
 // packages/ai -> src/agents import boundary.
 //
-// Skipped on this branch: httpContinuationEligible here only recognizes a
-// genuine native api.openai.com connection (supportsNativeOpenAIResponsesEndpoint),
-// so the customEndpointModel below never actually gets a continuation claim
-// on origin/main today. The eligibility widening for compat/proxy endpoints
-// is PR #128633 (compat.supportsResponsesContinuation), not part of this PR.
-// Confirmed this test genuinely passes (not just theoretically) once stacked
-// on #128633's branch: copied this file plus this PR's own production
-// changes onto that branch's checkout, un-skipped, and ran it there --
-// green. Un-skip for real once this branch lands on top of #128633 (or after
-// it merges to main).
+// #128633 (compat.supportsResponsesContinuation, merged onto main) widened
+// eligibility to compat/proxy endpoints like customEndpointModel below --
+// this test was describe.skip'd until this branch stacked on top of that
+// prerequisite; now rebased past it, so it runs for real.
 class ScriptedResponsesServer {
   readonly requests: Array<Record<string, unknown>> = [];
   private readonly script: Array<(request: Record<string, unknown>) => string>;
@@ -163,12 +157,7 @@ function customEndpointModel(baseUrl: string): Model<"openai-responses"> {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 200_000,
     maxTokens: 8192,
-    // compat.supportsResponsesContinuation doesn't exist in
-    // OpenAIResponsesCompat on this branch yet -- it's #128633's own type,
-    // not landed here. This whole test is describe.skip'd until this
-    // branch stacks on #128633; the cast keeps that dependency's shape
-    // without pulling its type in early.
-    compat: { supportsResponsesContinuation: true } as Model<"openai-responses">["compat"],
+    compat: { supportsResponsesContinuation: true },
   } satisfies Model<"openai-responses">;
   return attachModelProviderRequestTransport(model, { allowPrivateNetwork: true });
 }
@@ -188,7 +177,7 @@ async function run(
   return stream.result();
 }
 
-describe.skip("HTTP continuation across a non-canonical replayed tool-call id (loopback server, no SDK mocking)", () => {
+describe("HTTP continuation across a non-canonical replayed tool-call id (loopback server, no SDK mocking)", () => {
   afterEach(() => {
     cleanupSessionResources();
   });
