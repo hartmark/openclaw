@@ -338,19 +338,18 @@ describe("createOpenClawCodingTools availability guidance", () => {
     expect(tool?.description).toContain("persistent/thread-bound");
     expect(tool?.description).toContain("(self: current session only)");
     expect(tool?.description).not.toContain('runtime="acp"');
-    // sessions_history alone can't report a child's terminal status (transcript
-    // only, no run outcome) -- the follow-up check must not claim otherwise.
-    expect(tool?.description).not.toContain("check it via `subagents`");
+    // Transcript access alone does not expose execution/delivery diagnostics.
+    expect(tool?.description).not.toContain("When diagnosing a missing result");
   });
 
-  it("gates the terminal-status follow-up check on subagents, not sessions_history alone", () => {
+  it("gates missing-result diagnostics on subagents, not sessions_history alone", () => {
     const [tool] = applyToolAvailabilityDescriptions([
       { name: "sessions_spawn", description: describeSessionsSpawnTool() },
       { name: "subagents", description: "status" },
     ] as AnyAgentTool[]);
 
     expect(tool?.description).toContain(
-      "After spawn, do non-overlap work; follow the receipt's completion mode. If an announced child hasn't reported back when expected, check it via `subagents` for failed/timed_out/cancelled status and follow up instead of leaving it stalled.",
+      "After spawn, do non-overlap work; follow the receipt's completion mode. When diagnosing a missing result from an announcing child, use `subagents` to inspect execution and delivery status. Recover existing results or follow up within the still-authorized task; respect intentional cancellation and never loop-poll.",
     );
   });
 
@@ -364,6 +363,10 @@ describe("createOpenClawCodingTools availability guidance", () => {
       })),
     ] as AnyAgentTool[]);
 
+    expect(tool?.description).toContain(
+      "Default to a hidden subagent for internal QA, research, coding, review, tests, and parallel work supporting the current task. This includes substantial, bounded API/service investigations that can be handed off with the needed context and capabilities. Omit `visible` or set it false, and report results through the parent.",
+    );
+    expect(tool?.description).not.toContain("trial-and-error");
     expect(tool?.description).toContain("configured agent (see agents_list);");
     expect(tool?.description).toContain("`groupId` groups a batch; await with agents_wait.");
     expect(tool?.description).toContain("(all: all sessions, cross-agent per tools.agentToAgent)");
@@ -371,7 +374,7 @@ describe("createOpenClawCodingTools availability guidance", () => {
       "No spawn for quick lookup/single read. Check spawns via `subagents`/`sessions_history`. After spawn,",
     );
     expect(tool?.description).toContain(
-      "If an announced child hasn't reported back when expected, check it via `subagents` for failed/timed_out/cancelled status and follow up instead of leaving it stalled.",
+      "When diagnosing a missing result from an announcing child, use `subagents` to inspect execution and delivery status. Recover existing results or follow up within the still-authorized task; respect intentional cancellation and never loop-poll.",
     );
   });
 });
