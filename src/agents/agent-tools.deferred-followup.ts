@@ -77,11 +77,16 @@ function describeAvailableTool(tool: AnyAgentTool, availableTools: ReadonlySet<s
     // sessions_history returns sanitized transcript/pagination only, never a
     // run's terminal status (a cancelled/timed-out child can leave no terminal
     // message at all) -- only `subagents` actually reports failed/timed_out/
-    // cancelled, so the follow-up check names that tool specifically.
+    // cancelled, so the follow-up check names that tool specifically. Tied to
+    // a missing/overdue report, not a routine post-spawn check: completion is
+    // push-based (delegation-guidance.ts, system-prompt.ts) and status lookup
+    // is otherwise reserved for a request or debugging -- an unconditional
+    // "before moving on, check" here would contradict that and prompt a
+    // needless status call on every ordinary, still-running child.
     if (availableTools.has("subagents")) {
       description = description.replace(
         "After spawn, do non-overlap work; follow the receipt's completion mode.",
-        "After spawn, do non-overlap work; follow the receipt's completion mode. Before moving on, check own spawned children via `subagents` for failed/timed_out/cancelled status and follow up instead of leaving them stalled.",
+        "After spawn, do non-overlap work; follow the receipt's completion mode. If an announced child hasn't reported back when expected, check it via `subagents` for failed/timed_out/cancelled status and follow up instead of leaving it stalled.",
       );
     }
   }
