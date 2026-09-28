@@ -650,6 +650,36 @@ describe("OpenAI Responses continuation", () => {
     );
   });
 
+  it("rejects distinct raw call ids that collapse to the same replay shape", () => {
+    const cachedCall = {
+      type: "function_call",
+      id: "fc_1",
+      status: "completed",
+      call_id: " x",
+      name: "exec",
+      arguments: "{}",
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [cachedCall] as never,
+    };
+    const request: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [
+        firstUser,
+        { ...cachedCall, call_id: "x" },
+        { type: "function_call_output", call_id: "x", output: "recorded" },
+      ] as never,
+    };
+
+    expect(resolveResponsesContinuationRequest(state, request)).toEqual({
+      continuationStatus: "history_changed",
+      request,
+    });
+  });
+
   it("ignores turn correlation headers but isolates explicit authorization", () => {
     const first = claim({ turn: "1" });
     first?.commit(continuationState().lastRequest, {
