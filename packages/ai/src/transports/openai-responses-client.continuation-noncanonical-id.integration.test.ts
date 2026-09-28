@@ -100,6 +100,35 @@ function attachModelProviderRequestTransport<TModel extends object>(
 const RAW_CALL_ID = "functions.gateway:0";
 const RAW_ITEM_ID = "fc_tmp_kegospxl46";
 
+function collidingToolCallsCompletedFrame(responseId: string): string {
+  return JSON.stringify({
+    type: "response.completed",
+    response: {
+      id: responseId,
+      status: "completed",
+      output: [
+        {
+          id: "fc_1",
+          call_id: " x",
+          type: "function_call",
+          status: "completed",
+          name: "first",
+          arguments: "{}",
+        },
+        {
+          id: "fc_1",
+          call_id: "x",
+          type: "function_call",
+          status: "completed",
+          name: "second",
+          arguments: "{}",
+        },
+      ],
+      usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+    },
+  });
+}
+
 function toolCallCompletedFrame(responseId: string): string {
   return JSON.stringify({
     type: "response.completed",
@@ -242,6 +271,57 @@ describe("HTTP continuation across a non-canonical replayed tool-call id (loopba
           output: "recorded",
         },
       ]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("resends full history when distinct cached calls share a replay ID shape", async () => {
+    const server = new ScriptedResponsesServer([
+      () => collidingToolCallsCompletedFrame("resp_1"),
+      () => textCompletedFrame("resp_2", "recorded"),
+    ]);
+    const baseUrl = await server.listen();
+    try {
+      const model = customEndpointModel(baseUrl);
+      const sessionId = "real-sse-ambiguous-noncanonical-ids";
+      const firstUser = userMessage("call both tools", 1);
+      const callTurn = await run(model, { messages: [firstUser], tools: [] }, sessionId);
+      const toolCalls = callTurn.content.filter((block) => block.type === "toolCall") as Array<{
+        type: "toolCall";
+        id: string;
+        name: string;
+        arguments: Record<string, unknown>;
+      }>;
+
+      expect(toolCalls).toHaveLength(2);
+      const replayedToolCalls = toolCalls.map((toolCall) => ({
+        ...toolCall,
+        id: normalizeOpenAIResponsesFunctionCallId(toolCall.id),
+      }));
+      expect(replayedToolCalls[0]?.id).toBe(replayedToolCalls[1]?.id);
+      const toolResults = replayedToolCalls.map((toolCall, index) => ({
+        role: "toolResult" as const,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        isError: false,
+        content: [{ type: "text" as const, text: `result ${index + 1}` }],
+        timestamp: index + 2,
+      }));
+      const messages: Context["messages"] = [
+        firstUser,
+        { ...callTurn, content: replayedToolCalls },
+        ...toolResults,
+      ];
+      const afterToolResults = await run(model, { messages, tools: [] }, sessionId);
+
+      expect(afterToolResults.stopReason).toBe("stop");
+      expect(server.requests).toHaveLength(2);
+      const secondRequest = server.requests[1];
+      expect(secondRequest).not.toHaveProperty("previous_response_id");
+      const input = secondRequest?.input as Array<Record<string, unknown>>;
+      expect(input.some((item) => item.type === "function_call")).toBe(true);
+      expect(input.some((item) => item.type === "function_call_output")).toBe(true);
     } finally {
       await server.close();
     }
