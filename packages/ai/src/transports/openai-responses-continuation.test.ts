@@ -889,6 +889,51 @@ describe("OpenAI Responses continuation", () => {
     expect(fallback.pendingToolCalls).toEqual([{ callId: replayedCallId }]);
   });
 
+  it("keeps raw async call IDs when HTTP commits the full baseline of a continuation", () => {
+    const rawCall = {
+      type: "function_call",
+      call_id: " x",
+      name: "async",
+      arguments: "{}",
+    };
+    const replayedCall = {
+      ...rawCall,
+      call_id: normalizeOpenAIResponsesFunctionCallId(rawCall.call_id),
+    };
+    const firstRequest: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [firstUser] as never,
+    };
+    claim({ request: firstRequest })?.commit(firstRequest, {
+      id: "resp_1",
+      output: [rawCall] as never,
+    });
+
+    const secondRequest: ResponsesContinuationRequest = {
+      ...firstRequest,
+      input: [firstUser, replayedCall] as never,
+    };
+    const second = claim({ request: secondRequest });
+    expect(second?.request.previous_response_id).toBe("resp_1");
+    second?.commit(secondRequest, { id: "resp_2", output: [assistantOutput] }, "resp_1");
+
+    const toolResult = {
+      type: "function_call_output",
+      call_id: replayedCall.call_id,
+      output: "lookup result",
+    };
+    const third = claim({
+      request: {
+        ...firstRequest,
+        input: [firstUser, replayedCall, assistantOutput, toolResult] as never,
+      },
+    });
+    expect(third?.request.previous_response_id).toBe("resp_2");
+    expect(third?.request.input).toEqual([{ ...toolResult, call_id: rawCall.call_id }]);
+    third?.release();
+  });
+
   it("rejects a continuation delta whose tool result id is not a replay shape of the cached call", () => {
     const cachedCall = {
       type: "function_call",

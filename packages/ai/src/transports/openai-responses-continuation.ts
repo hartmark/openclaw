@@ -120,69 +120,27 @@ function pendingResponsesToolCalls(
   calls: readonly ResponsesContinuationToolCall[],
   input: readonly unknown[],
 ): ResponsesContinuationToolCall[] {
-  const inputCalls = input.flatMap((item, inputIndex) => {
-    if (!isRecord(item) || item.type !== "function_call" || typeof item.call_id !== "string") {
-      return [];
-    }
-    return [
-      {
-        inputIndex,
-        call: {
-          callId: item.call_id,
-          ...(typeof item.id === "string" ? { itemId: item.id } : {}),
-        },
-      },
-    ];
-  });
-  const ownerByInputCall = new Map<number, number>();
-  const claimedInputCalls = new Set<number>();
-  for (let owner = calls.length - 1; owner >= 0; owner -= 1) {
-    const candidate = calls[owner];
-    const candidateShapes = toolCallReplayShapes(candidate);
-    const matches = inputCalls
-      .map(({ inputIndex, call }, index) => ({ inputIndex, call, index }))
-      .filter(
-        ({ call, index }) =>
-          !claimedInputCalls.has(index) &&
-          [...toolCallReplayShapes(call)].some((shape) => candidateShapes.has(shape)),
-      );
-    const exactItemMatches = matches.filter(
-      ({ call }) =>
-        call.callId === candidate.callId &&
-        typeof candidate.itemId === "string" &&
-        call.itemId === candidate.itemId,
-    );
-    const exactCallMatches = matches.filter(({ call }) => call.callId === candidate.callId);
-    const selected =
-      (exactItemMatches.length > 0 ? exactItemMatches : exactCallMatches).at(-1) ?? matches.at(-1);
-    if (!selected) continue;
-    ownerByInputCall.set(selected.inputIndex, owner);
-    claimedInputCalls.add(selected.index);
-  }
-
-  const activeOwners = new Set<number>();
-  const resolvedOwners = new Set<number>();
+  const ownerByReplayShape = toolCallOwnerByReplayShape(calls);
+  const replayedCallIds = new Set<string>();
+  const lastCallPosition = new Map<number, number>();
+  const lastOutputPosition = new Map<number, number>();
   for (const [inputIndex, item] of input.entries()) {
     if (!isRecord(item) || typeof item.call_id !== "string") continue;
+    const owner = ownerByReplayShape.get(item.call_id);
     if (item.type === "function_call") {
-      const owner = ownerByInputCall.get(inputIndex);
-      if (owner !== undefined) activeOwners.add(owner);
+      replayedCallIds.add(item.call_id);
+      if (owner !== undefined && owner !== null) lastCallPosition.set(owner, inputIndex);
       continue;
     }
     if (item.type !== "function_call_output") continue;
-    const candidates = [...activeOwners].filter((owner) => !resolvedOwners.has(owner));
-    const exactOwners = candidates.filter((owner) => calls[owner]?.callId === item.call_id);
-    const matches =
-      exactOwners.length > 0
-        ? exactOwners
-        : candidates.filter((owner) => toolCallReplayShapes(calls[owner]).has(item.call_id));
-    if (matches.length === 1) resolvedOwners.add(matches[0]);
+    if (owner !== undefined && owner !== null) lastOutputPosition.set(owner, inputIndex);
   }
   return calls.filter((_call, index) => {
-    const inputCallIndex = inputCalls.findIndex(
-      (entry) => ownerByInputCall.get(entry.inputIndex) === index,
+    const callPosition = lastCallPosition.get(index);
+    return (
+      [...toolCallReplayShapes(_call)].some((shape) => replayedCallIds.has(shape)) &&
+      (callPosition === undefined || (lastOutputPosition.get(index) ?? -1) < callPosition)
     );
-    return inputCallIndex >= 0 && !resolvedOwners.has(index);
   });
 }
 
