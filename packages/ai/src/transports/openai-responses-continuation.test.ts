@@ -6,6 +6,7 @@ import {
   type ResponsesContinuationRequest,
   type ResponsesContinuationState,
 } from "./openai-responses-continuation.js";
+import { normalizeOpenAIResponsesFunctionCallId } from "./openai-responses-tool-call-id-shape.js";
 
 const firstUser = {
   type: "message",
@@ -522,6 +523,72 @@ describe("OpenAI Responses continuation", () => {
         input: [{ type: "function_call_output", call_id: rawCallId, output: "hi\n" }],
       },
     });
+  });
+
+  it("restores the raw call id when replay omits the item id and reshapes the bare call id", () => {
+    const rawCallId = "functions.gateway:0";
+    const rawItemId = "fc_tmp_kegospxl46";
+    const bareReshapedCallId = normalizeOpenAIResponsesFunctionCallId(rawCallId);
+    const toolCall = {
+      type: "function_call",
+      id: rawItemId,
+      status: "completed",
+      call_id: rawCallId,
+      name: "exec",
+      arguments: '{"command":"echo hi"}',
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [{ type: "reasoning" }, toolCall] as never,
+    };
+    const { id: _itemId, ...replayedToolCall } = toolCall;
+    replayedToolCall.call_id = bareReshapedCallId;
+    const request: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [
+        firstUser,
+        { type: "reasoning" },
+        replayedToolCall,
+        { type: "function_call_output", call_id: bareReshapedCallId, output: "hi\n" },
+      ] as never,
+    };
+
+    const result = resolveResponsesContinuationRequest(state, request);
+
+    expect(result).toMatchObject({
+      continuationStatus: "continued",
+      request: {
+        previous_response_id: "resp_1",
+        input: [{ type: "function_call_output", call_id: rawCallId, output: "hi\n" }],
+      },
+    });
+  });
+
+  it.each([
+    ["id", "fc_output_changed"],
+    ["status", "in_progress"],
+  ] as const)("rejects continuation when prior function_call_output %s changes", (field, value) => {
+    const originalOutput = {
+      type: "function_call_output",
+      id: "fc_output_1",
+      call_id: "call_tool_1",
+      output: "recorded",
+      status: "completed",
+    };
+    const state = continuationState();
+    state.lastRequest.input = [firstUser, originalOutput] as never;
+    const next = nextRequest();
+    next.input = [
+      firstUser,
+      { ...originalOutput, [field]: value },
+      ...(next.input ?? []).slice(1),
+    ] as never;
+
+    expect(resolveResponsesContinuationRequest(state, next).continuationStatus).toBe(
+      "history_changed",
+    );
   });
 
   it("does not tolerate an unrelated function-call id change as the known replay reshape", () => {
