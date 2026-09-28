@@ -15,17 +15,17 @@ import {
   resolveStoredSessionKeyForAgentStore,
 } from "../gateway/session-store-key.js";
 import {
+  projectExistingAgentDatabaseTargets,
+  resolveTargetSqlitePath,
+  type ExistingAgentDatabaseTarget,
+} from "../infra/session-sqlite-migration-readers.js";
+import {
   DEFAULT_AGENT_ID,
   normalizeAgentId,
   normalizeMainKey,
   parseAgentSessionKey,
 } from "../routing/session-key.js";
 import { applyCanonicalOwnerEvidence } from "./doctor-session-canonical-owner-evidence.js";
-import {
-  projectExistingAgentDatabaseTargets,
-  resolveTargetSqlitePath,
-  type ExistingAgentDatabaseTarget,
-} from "./doctor-session-sqlite-readers.js";
 
 export type CanonicalSessionCandidate = {
   agentId: string;
@@ -120,18 +120,12 @@ function collectCanonicalSessionCandidateFacts(
         }
         const storedKey = resolveStoredKey(canonicalAgentId, value);
         const ownerAgentId = parseAgentSessionKey(storedKey)?.agentId ?? canonicalAgentId;
-        for (const key of [value, storedKey]) {
-          const sameStore = canonicalKeysByStoredKey.get(
-            `${target.sqlitePath}\0${ownerAgentId}\0${key}`,
-          );
-          if (sameStore?.size === 1) {
-            return [...sameStore][0];
-          }
-        }
-        for (const key of [value, storedKey]) {
-          const crossStore = canonicalKeysByStoredKey.get(`*\0${ownerAgentId}\0${key}`);
-          if (crossStore?.size === 1) {
-            return [...crossStore][0];
+        for (const sqlitePath of [target.sqlitePath, "*"]) {
+          for (const key of [value, storedKey]) {
+            const mapped = canonicalKeysByStoredKey.get(`${sqlitePath}\0${ownerAgentId}\0${key}`);
+            if (mapped?.size === 1) {
+              return [...mapped][0];
+            }
           }
         }
         return storedKey;

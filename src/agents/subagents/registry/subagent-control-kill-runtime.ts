@@ -18,11 +18,13 @@ import {
   waitForSessionWorkAdmissionRelease,
 } from "../../../sessions/session-lifecycle-admission.js";
 import { createLazyImportLoader } from "../../../shared/lazy-promise.js";
-import { SUBAGENT_KILL_TASK_ERROR } from "../../../tasks/detached-task-runtime-contract.js";
-import type { TaskCancellationControl } from "../../../tasks/task-cancellation-context.js";
-import type { SubagentKillTargetState } from "../../../tasks/task-registry-control.types.js";
 import { createAgentRunDirectAbortError } from "../../run-termination.js";
 import { isCurrentSubagentRun } from "./subagent-control-scope.js";
+import type {
+  SubagentCancellationControl,
+  SubagentKillTargetState,
+} from "./subagent-control.types.js";
+import { SUBAGENT_KILL_TASK_ERROR } from "./subagent-control.types.js";
 import { SUBAGENT_ENDED_REASON_KILLED } from "./subagent-lifecycle-events.js";
 import {
   resolveFinalizedSubagentTaskState,
@@ -30,6 +32,7 @@ import {
 } from "./subagent-registry-completion.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
 import {
+  cancelSubagentRequesterSettleWake,
   claimSubagentRunKill,
   markSubagentRunTerminated,
   releaseSubagentRunKillClaim,
@@ -54,10 +57,7 @@ export function resolveSubagentKillTargetState(
           task: {
             status: "cancelled",
             endedAt: taskEndedAt,
-            lastEventAt: taskEndedAt,
             error: SUBAGENT_KILL_TASK_ERROR,
-            progressSummary: entry.completion?.resultText ?? undefined,
-            terminalSummary: null,
           },
         }
       : undefined;
@@ -147,7 +147,7 @@ export async function killSubagentRun(params: {
   cfg: OpenClawConfig;
   entry: SubagentRunRecord;
   session: ReturnType<typeof resolveSubagentKillSession>;
-  cancellationControl?: TaskCancellationControl;
+  cancellationControl?: SubagentCancellationControl;
   suppressTaskDelivery?: boolean;
   beforeSessionKill?: () => boolean;
   isCurrent?: (entry: SubagentRunRecord) => boolean;
@@ -171,6 +171,14 @@ export async function killSubagentRun(params: {
     });
   const initialTargetState = resolveSubagentKillTargetState(params.entry);
   if (initialTargetState) {
+    if (params.suppressTaskDelivery && params.entry.requesterSettleWake) {
+      await cancelSubagentRequesterSettleWake(params.entry, () => {
+        params.cancellationControl?.assertCurrent();
+        if (!isCurrent()) {
+          throw new Error("Subagent ownership changed during cancellation; retry.");
+        }
+      });
+    }
     if (
       params.entry.endedReason === SUBAGENT_ENDED_REASON_KILLED &&
       params.entry.suppressAnnounceReason !== "steer-restart"
