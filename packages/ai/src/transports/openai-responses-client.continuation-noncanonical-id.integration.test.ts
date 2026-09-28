@@ -295,10 +295,11 @@ describe("HTTP continuation across a non-canonical replayed tool-call id (loopba
       }>;
 
       expect(toolCalls).toHaveLength(2);
-      const replayedToolCalls = toolCalls.map((toolCall) => ({
-        ...toolCall,
-        id: normalizeOpenAIResponsesFunctionCallId(toolCall.id),
-      }));
+      const replayedToolCalls = toolCalls.map((toolCall) =>
+        Object.assign({}, toolCall, {
+          id: normalizeOpenAIResponsesFunctionCallId(toolCall.id),
+        }),
+      );
       expect(replayedToolCalls[0]?.id).toBe(replayedToolCalls[1]?.id);
       const toolResults = replayedToolCalls.map((toolCall, index) => ({
         role: "toolResult" as const,
