@@ -78,42 +78,6 @@ function canonicalizeToolCallId(callId: unknown, itemId: unknown): unknown {
   return splitOpenAIFunctionCallPairing(normalizeOpenAIResponsesFunctionCallId(paired)).callId;
 }
 
-function replayableCachedCallIds(item: Record<string, unknown>): Set<string> {
-  if (item.type !== "function_call" || typeof item.call_id !== "string") {
-    return new Set();
-  }
-  const callId = item.call_id;
-  return new Set(
-    [
-      callId,
-      canonicalizeToolCallId(callId, item.id),
-      canonicalizeToolCallId(callId, undefined),
-    ].filter((value): value is string => typeof value === "string"),
-  );
-}
-
-function replayedFunctionCallIdsMatch(
-  replayedInput: readonly unknown[],
-  cachedResponseItems: readonly unknown[],
-): boolean {
-  const replayedCalls = replayedInput.filter(
-    (item): item is Record<string, unknown> => isRecord(item) && item.type === "function_call",
-  );
-  const cachedCalls = cachedResponseItems.filter(
-    (item): item is Record<string, unknown> => isRecord(item) && item.type === "function_call",
-  );
-  // Shaping trims and sanitizes IDs, so equal shaped IDs do not prove equal raw IDs.
-  return (
-    replayedCalls.length === cachedCalls.length &&
-    cachedCalls.every((cachedCall, index) => {
-      const replayedCallId = replayedCalls[index]?.call_id;
-      return typeof cachedCall.call_id !== "string"
-        ? true
-        : typeof replayedCallId === "string" && replayableCachedCallIds(cachedCall).has(replayedCallId);
-    })
-  );
-}
-
 // Cached output keeps raw IDs; compare with and without the item ID because replay may omit it.
 // `fromResponse` also gates provider-output argument normalization below.
 function normalizeAssistantReplayInput(
@@ -191,14 +155,32 @@ export function responsesContinuationPrefixFingerprint(
 function restoreRawCallIdsInDelta(
   delta: readonly unknown[],
   cachedResponseItems: readonly unknown[],
+  replayedToolRound: readonly unknown[],
 ): unknown[] | undefined {
+  const cachedCalls = cachedResponseItems.filter(
+    (item): item is Record<string, unknown> => isRecord(item) && item.type === "function_call",
+  );
+  const replayedCalls = replayedToolRound.filter(
+    (item): item is Record<string, unknown> => isRecord(item) && item.type === "function_call",
+  );
+  if (cachedCalls.length !== replayedCalls.length) {
+    return undefined;
+  }
+
   const rawCallIdsByReplayShape = new Map<string, Set<string>>();
-  for (const item of cachedResponseItems) {
-    if (!isRecord(item) || item.type !== "function_call" || typeof item.call_id !== "string") {
+  for (const item of cachedCalls) {
+    if (typeof item.call_id !== "string") {
       continue;
     }
     const rawCallId = item.call_id;
-    for (const replayShape of replayableCachedCallIds(item)) {
+    for (const replayShape of new Set([
+      rawCallId,
+      canonicalizeToolCallId(rawCallId, item.id),
+      canonicalizeToolCallId(rawCallId, undefined),
+    ])) {
+      if (typeof replayShape !== "string") {
+        continue;
+      }
       let rawCallIds = rawCallIdsByReplayShape.get(replayShape);
       if (!rawCallIds) {
         rawCallIds = new Set();
@@ -207,9 +189,27 @@ function restoreRawCallIdsInDelta(
       rawCallIds.add(rawCallId);
     }
   }
+
+  // Lossy ID shaping is safe only when each replayed call has one cached raw owner.
+  for (const [index, item] of cachedCalls.entries()) {
+    if (typeof item.call_id !== "string") {
+      continue;
+    }
+    const replayedCallId = replayedCalls[index]?.call_id;
+    const rawCallIds =
+      typeof replayedCallId === "string" ? rawCallIdsByReplayShape.get(replayedCallId) : undefined;
+    if (!rawCallIds || rawCallIds.size !== 1 || !rawCallIds.has(item.call_id)) {
+      return undefined;
+    }
+  }
+
   const restoredDelta: unknown[] = [];
   for (const item of delta) {
-    if (!isRecord(item) || item.type !== "function_call_output" || typeof item.call_id !== "string") {
+    if (
+      !isRecord(item) ||
+      item.type !== "function_call_output" ||
+      typeof item.call_id !== "string"
+    ) {
       restoredDelta.push(item);
       continue;
     }
@@ -278,8 +278,7 @@ export function resolveResponsesContinuationRequest(
     jsonValuesEqual(
       replayedToolRound,
       normalizeAssistantReplayInput(continuation.lastResponseItems, true, true),
-    ) &&
-    replayedFunctionCallIdsMatch(replayedToolRoundInput, continuation.lastResponseItems);
+    );
   if (
     !jsonValuesEqual(
       normalizeAssistantReplayInput(currentInput.slice(0, previousInput.length)),
@@ -292,6 +291,7 @@ export function resolveResponsesContinuationRequest(
   const restoredInput = restoreRawCallIdsInDelta(
     currentInput.slice(baselineLength),
     continuation.lastResponseItems,
+    replayedToolRoundInput,
   );
   if (!restoredInput) {
     return { request, continuationStatus: "history_changed" };
