@@ -78,6 +78,42 @@ function canonicalizeToolCallId(callId: unknown, itemId: unknown): unknown {
   return splitOpenAIFunctionCallPairing(normalizeOpenAIResponsesFunctionCallId(paired)).callId;
 }
 
+function replayableCachedCallIds(item: Record<string, unknown>): Set<string> {
+  if (item.type !== "function_call" || typeof item.call_id !== "string") {
+    return new Set();
+  }
+  const callId = item.call_id;
+  return new Set(
+    [
+      callId,
+      canonicalizeToolCallId(callId, item.id),
+      canonicalizeToolCallId(callId, undefined),
+    ].filter((value): value is string => typeof value === "string"),
+  );
+}
+
+function replayedFunctionCallIdsMatch(
+  replayedInput: readonly unknown[],
+  cachedResponseItems: readonly unknown[],
+): boolean {
+  const replayedCalls = replayedInput.filter(
+    (item): item is Record<string, unknown> => isRecord(item) && item.type === "function_call",
+  );
+  const cachedCalls = cachedResponseItems.filter(
+    (item): item is Record<string, unknown> => isRecord(item) && item.type === "function_call",
+  );
+  // Shaping trims and sanitizes IDs, so equal shaped IDs do not prove equal raw IDs.
+  return (
+    replayedCalls.length === cachedCalls.length &&
+    cachedCalls.every((cachedCall, index) => {
+      const replayedCallId = replayedCalls[index]?.call_id;
+      return typeof cachedCall.call_id !== "string"
+        ? true
+        : typeof replayedCallId === "string" && replayableCachedCallIds(cachedCall).has(replayedCallId);
+    })
+  );
+}
+
 // Cached output keeps raw IDs; compare with and without the item ID because replay may omit it.
 // `fromResponse` also gates provider-output argument normalization below.
 function normalizeAssistantReplayInput(
@@ -155,34 +191,40 @@ export function responsesContinuationPrefixFingerprint(
 function restoreRawCallIdsInDelta(
   delta: readonly unknown[],
   cachedResponseItems: readonly unknown[],
-): unknown[] {
-  const rawCallIdByReshaped = new Map<string, string>();
+): unknown[] | undefined {
+  const rawCallIdsByReplayShape = new Map<string, Set<string>>();
   for (const item of cachedResponseItems) {
     if (!isRecord(item) || item.type !== "function_call" || typeof item.call_id !== "string") {
       continue;
     }
     const rawCallId = item.call_id;
-    // Replay can omit the function item id, so accept both eligible shapes.
-    for (const reshaped of new Set([
-      canonicalizeToolCallId(rawCallId, item.id),
-      canonicalizeToolCallId(rawCallId, undefined),
-    ])) {
-      if (typeof reshaped === "string" && reshaped !== rawCallId) {
-        rawCallIdByReshaped.set(reshaped, rawCallId);
+    for (const replayShape of replayableCachedCallIds(item)) {
+      let rawCallIds = rawCallIdsByReplayShape.get(replayShape);
+      if (!rawCallIds) {
+        rawCallIds = new Set();
+        rawCallIdsByReplayShape.set(replayShape, rawCallIds);
       }
+      rawCallIds.add(rawCallId);
     }
   }
-  if (rawCallIdByReshaped.size === 0) {
-    // SAFETY: Caller passes a fresh slice, so widening preserves its mutable input shape.
-    return delta as unknown[];
-  }
-  return delta.map((item) => {
-    if (!isRecord(item) || typeof item.call_id !== "string") {
-      return item;
+  const restoredDelta: unknown[] = [];
+  for (const item of delta) {
+    if (!isRecord(item) || item.type !== "function_call_output" || typeof item.call_id !== "string") {
+      restoredDelta.push(item);
+      continue;
     }
-    const rawCallId = rawCallIdByReshaped.get(item.call_id);
-    return rawCallId ? { ...item, call_id: rawCallId } : item;
-  });
+    const rawCallIds = rawCallIdsByReplayShape.get(item.call_id);
+    // Unknown or shared shapes cannot identify a cached call; resend full history to preserve pairing.
+    if (!rawCallIds || rawCallIds.size !== 1) {
+      return undefined;
+    }
+    const rawCallId = rawCallIds.values().next().value;
+    if (typeof rawCallId !== "string") {
+      return undefined;
+    }
+    restoredDelta.push(rawCallId === item.call_id ? item : { ...item, call_id: rawCallId });
+  }
+  return restoredDelta;
 }
 
 export function resolveResponsesContinuationRequest(
@@ -225,9 +267,8 @@ export function resolveResponsesContinuationRequest(
   if (currentInput.length < baselineLength) {
     return { request, continuationStatus: "history_shorter" };
   }
-  const replayedToolRound = normalizeAssistantReplayInput(
-    currentInput.slice(previousInput.length, baselineLength),
-  );
+  const replayedToolRoundInput = currentInput.slice(previousInput.length, baselineLength);
+  const replayedToolRound = normalizeAssistantReplayInput(replayedToolRoundInput);
   // Replay may keep or omit function_call.id, so compare both cached forms.
   const historyToolRoundUnchanged =
     jsonValuesEqual(
@@ -237,7 +278,8 @@ export function resolveResponsesContinuationRequest(
     jsonValuesEqual(
       replayedToolRound,
       normalizeAssistantReplayInput(continuation.lastResponseItems, true, true),
-    );
+    ) &&
+    replayedFunctionCallIdsMatch(replayedToolRoundInput, continuation.lastResponseItems);
   if (
     !jsonValuesEqual(
       normalizeAssistantReplayInput(currentInput.slice(0, previousInput.length)),
@@ -251,9 +293,11 @@ export function resolveResponsesContinuationRequest(
     currentInput.slice(baselineLength),
     continuation.lastResponseItems,
   );
-  // restoreRawCallIdsInDelta only rewrites `call_id` string fields on items
-  // already sliced from `currentInput` (itself a ResponseInput); it never
-  // adds, removes, or reshapes an item, so the result is still valid input.
+  if (!restoredInput) {
+    return { request, continuationStatus: "history_changed" };
+  }
+  // Restoration only changes output call IDs on items sliced from current input;
+  // unknown or ambiguous IDs reject continuation before this cast.
   // SAFETY: shape preserved by restoreRawCallIdsInDelta as documented above.
   const restoredResponseInput = restoredInput as ResponseInput;
   return {
