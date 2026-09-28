@@ -617,9 +617,8 @@ describe("OpenAI Responses continuation", () => {
   it("does not tolerate an unrelated function-call id change as the known replay reshape", () => {
     // A changed call_id that ISN'T the client's own reshape of the cached raw
     // id (e.g. the model made a genuinely different tool call, or a
-    // corrupted replay) must still be treated as real history drift --
-    // canonicalizeReplayedCallId only forgives ids that reshape TO the same
-    // value as the cached raw one, never an arbitrary difference.
+    // corrupted replay) must still be treated as real history drift. The
+    // resolver accepts only an ID owned by the same cached call occurrence.
     const toolCall = {
       type: "function_call",
       id: "fc_1",
