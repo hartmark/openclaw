@@ -167,38 +167,25 @@ function restoreRawCallIdsInDelta(
     return undefined;
   }
 
-  const rawCallIdsByReplayShape = new Map<string, Set<string>>();
-  for (const item of cachedCalls) {
-    if (typeof item.call_id !== "string") {
-      continue;
-    }
-    const rawCallId = item.call_id;
+  const ownerByReplayShape = new Map<string, number | null>();
+  for (const [index, item] of cachedCalls.entries()) {
+    if (typeof item.call_id !== "string") continue;
     for (const replayShape of new Set([
-      rawCallId,
-      canonicalizeToolCallId(rawCallId, item.id),
-      canonicalizeToolCallId(rawCallId, undefined),
+      item.call_id,
+      canonicalizeToolCallId(item.call_id, item.id),
+      canonicalizeToolCallId(item.call_id, undefined),
     ])) {
-      if (typeof replayShape !== "string") {
-        continue;
-      }
-      let rawCallIds = rawCallIdsByReplayShape.get(replayShape);
-      if (!rawCallIds) {
-        rawCallIds = new Set();
-        rawCallIdsByReplayShape.set(replayShape, rawCallIds);
-      }
-      rawCallIds.add(rawCallId);
+      if (typeof replayShape !== "string") continue;
+      const owner = ownerByReplayShape.get(replayShape);
+      ownerByReplayShape.set(replayShape, owner === undefined || owner === index ? index : null);
     }
   }
 
-  // Lossy ID shaping is safe only when each replayed call has one cached raw owner.
+  // Lossy shaping is safe only when a replayed call or output has one cached owner.
   for (const [index, item] of cachedCalls.entries()) {
-    if (typeof item.call_id !== "string") {
-      continue;
-    }
+    if (typeof item.call_id !== "string") continue;
     const replayedCallId = replayedCalls[index]?.call_id;
-    const rawCallIds =
-      typeof replayedCallId === "string" ? rawCallIdsByReplayShape.get(replayedCallId) : undefined;
-    if (!rawCallIds || rawCallIds.size !== 1 || !rawCallIds.has(item.call_id)) {
+    if (typeof replayedCallId !== "string" || ownerByReplayShape.get(replayedCallId) !== index) {
       return undefined;
     }
   }
@@ -213,12 +200,10 @@ function restoreRawCallIdsInDelta(
       restoredDelta.push(item);
       continue;
     }
-    const rawCallIds = rawCallIdsByReplayShape.get(item.call_id);
+    const owner = ownerByReplayShape.get(item.call_id);
     // Unknown or shared shapes cannot identify a cached call; resend full history to preserve pairing.
-    if (!rawCallIds || rawCallIds.size !== 1) {
-      return undefined;
-    }
-    const rawCallId = rawCallIds.values().next().value;
+    if (owner === undefined || owner === null) return undefined;
+    const rawCallId = cachedCalls[owner]?.call_id;
     if (typeof rawCallId !== "string") {
       return undefined;
     }
