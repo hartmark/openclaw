@@ -90,6 +90,10 @@ describe.skipIf(process.platform === "win32")("survivor manager fixture", () => 
       resolve("scripts/e2e/lib/upgrade-survivor/update-first-hop-compat.sh"),
       "utf8",
     );
+    const timingStart = firstHop.indexOf("first_hop_timing() {");
+    const updateStart = firstHop.indexOf("run_update() {");
+    const firstHopTiming =
+      timingStart >= 0 && updateStart > timingStart ? firstHop.slice(timingStart, updateStart) : "";
     const resetLane = firstHop.slice(
       firstHop.indexOf("reset_lane() {"),
       firstHop.indexOf("run_negative_control() {"),
@@ -101,6 +105,7 @@ describe.skipIf(process.platform === "win32")("survivor manager fixture", () => 
     const reset = shell(`
 ARTIFACT_DIR="$HOME"
 openclaw() { return 1; }
+${firstHopTiming}
 ${resetLane}
 reset_lane negative
 `);
