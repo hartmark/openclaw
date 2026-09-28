@@ -169,7 +169,7 @@ function restoreRawCallIdsInDelta(
     }
   }
   if (rawCallIdByReshaped.size === 0) {
-    // Callers only read the returned delta, so this readonly widening is inert.
+    // SAFETY: Caller passes a fresh slice, so widening preserves its mutable input shape.
     return delta as unknown[];
   }
   return delta.map((item) => {
