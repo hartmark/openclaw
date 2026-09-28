@@ -102,8 +102,12 @@ function normalizeAssistantReplayInput(
     const { id: rawId, status: _status, ...stableItem } = item;
     if (item.type === "function_call_output") {
       // Output ID and status affect replayed input; keep them in the prefix comparison.
-      if ("id" in item) stableItem.id = item.id;
-      if ("status" in item) stableItem.status = item.status;
+      if ("id" in item) {
+        stableItem.id = item.id;
+      }
+      if ("status" in item) {
+        stableItem.status = item.status;
+      }
     }
     if ("call_id" in stableItem) {
       // Only function_call pairs IDs; function_call_output references the bare call ID.
