@@ -65,59 +65,21 @@ function requestWithoutInput(request: ResponsesContinuationRequest): ResponsesCo
   return { ...rest, metadata };
 }
 
-// Canonicalizes a call_id/fc_id through the exact same shaping replay applies
-// (normalizeOpenAIResponsesToolCallIds in embedded-agent-helpers, mirrored
-// here as normalizeOpenAIResponsesFunctionCallId since packages/ai cannot
-// import from src/agents), for BOTH sides of the comparison -- the cached
-// raw provider function_call still carries its separate, un-reshaped
-// `call_id` and item `id` fields exactly as the provider returned them, and
-// a replayed item can equally arrive either already agent-reshaped (pass
-// through an AgentMessage[] transform) or, for a direct transport caller
-// that preserves same-model tool-call ids verbatim
-// (transcript-transform.ts's transformMessages), completely unreshaped --
-// still carrying the provider's own separate call_id/id pair, identically
-// to the cached side. Pairing call_id with id (when present) before
-// reshaping, on both sides, is required for that unchanged-raw-id replay to
-// canonicalize to the very same value the cached side computed: reshaping
-// only the bare call_id (dropping id) hashes a different input than the
-// cached side's pair and permanently, incorrectly forces history_changed.
-// Idempotent on an already-reshaped id -- it only touches ids that don't
-// already match the provider's own call_*/fc_* shape -- so a raw provider
-// id and the client's replayed reshaping of that same id both canonicalize
-// to the same value. This replaces a blanket call_id drop: dropping it
-// entirely would treat *any* changed function-call id as the same known
-// reshape, masking a genuinely different tool call.
+// Match replay's ID shaping while keeping unrelated ID edits visible to history checks.
 function canonicalizeToolCallId(callId: unknown, itemId: unknown): unknown {
   if (typeof callId !== "string") {
     return callId;
   }
   const paired = typeof itemId === "string" && itemId ? `${callId}|${itemId}` : callId;
-  // Already-valid call_*/fc_* ids (the common case once a provider itself
-  // returns provider-shaped ids) never get reshaped by replay either --
-  // mirror that exact idempotent short-circuit, or a validly-shaped pair
-  // would be needlessly re-hashed here into a value replay never produces.
+  // Replay leaves provider-shaped IDs untouched; match that short-circuit.
   if (!shouldNormalizeOpenAIResponsesToolCallId(paired)) {
     return callId;
   }
   return splitOpenAIFunctionCallPairing(normalizeOpenAIResponsesFunctionCallId(paired)).callId;
 }
 
-// fromResponse is true only for continuation.lastResponseItems (the cached
-// raw provider output), never for the replayed request's own input -- both
-// the call_id pairing above and the unsafe-integer handling below need to
-// know which side they're on, so this one flag drives both.
-//
-// ignoreCachedItemIds (fromResponse side only) computes the cached call_id
-// as if it had no item id to pair with, even though the cached raw response
-// always has one. This exists for a real replay shape the pairing above
-// can't otherwise match: a direct transport caller can configure
-// replayResponsesItemIds:false, which omits function_call.id from the wire
-// while preserving its raw, non-canonical call_id verbatim -- that replayed
-// item structurally has no id to pair with, so it always canonicalizes via
-// the bare-call_id branch. The cached side must be compared against both
-// candidates (see resolveResponsesContinuationRequest) since either shape
-// is a legitimate "unchanged" replay depending on that per-connection
-// setting, not something this function can know on its own.
+// Cached output keeps raw IDs; compare with and without the item ID because replay may omit it.
+// `fromResponse` also gates provider-output argument normalization below.
 function normalizeAssistantReplayInput(
   input: readonly unknown[],
   fromResponse = false,
@@ -138,13 +100,15 @@ function normalizeAssistantReplayInput(
       return item;
     }
     const { id: rawId, status: _status, ...stableItem } = item;
+    if (item.type === "function_call_output") {
+      // Output ID and status affect replayed input; keep them in the prefix comparison.
+      if ("id" in item) stableItem.id = item.id;
+      if ("status" in item) stableItem.status = item.status;
+    }
     if ("call_id" in stableItem) {
-      // Pair with the item's own raw id on both sides (see
-      // canonicalizeToolCallId): a replayed item can arrive either already
-      // agent-reshaped or, for a direct transport caller that preserves
-      // same-model tool-call ids verbatim, completely unreshaped and paired
-      // exactly like the cached side.
-      const itemId = fromResponse && ignoreCachedItemIds ? undefined : rawId;
+      // Only function_call pairs IDs; function_call_output references the bare call ID.
+      const itemId =
+        item.type === "function_call" && !(fromResponse && ignoreCachedItemIds) ? rawId : undefined;
       stableItem.call_id = canonicalizeToolCallId(stableItem.call_id, itemId);
     }
     if (fromResponse && item.type === "function_call") {
@@ -183,17 +147,7 @@ export function responsesContinuationPrefixFingerprint(
   return sha256Hex(stableStringify(JSON.parse(serialized)));
 }
 
-// The wire-bound delta (sent under previous_response_id) still carries
-// whatever call_id the client's own replay reshaping produced for a
-// function_call_output referencing a call from continuation.lastResponseItems
-// -- that's the exact id mismatch normalizeAssistantReplayInput tolerates
-// for the eligibility comparison above, but the comparison result is never
-// sent. Rewrite it back to the raw id the provider actually returned (and
-// this module cached) before the delta goes out, so a server that
-// reconstructs full history from its own cached copy of that raw response
-// (e.g. a proxy virtualizing previous_response_id server-side) sees a
-// function_call_output whose call_id matches the function_call it's pairing
-// against, instead of an orphaned id it silently drops.
+// Restore accepted replay IDs in the delta to match the provider's cached call.
 function restoreRawCallIdsInDelta(
   delta: readonly unknown[],
   cachedResponseItems: readonly unknown[],
@@ -204,16 +158,18 @@ function restoreRawCallIdsInDelta(
       continue;
     }
     const rawCallId = item.call_id;
-    // Mirror the eligibility comparison's pairing: the delta's call_id was
-    // reshaped from the paired call_id|id, not the bare call_id alone.
-    const reshaped = canonicalizeToolCallId(rawCallId, item.id);
-    if (typeof reshaped === "string" && reshaped !== rawCallId) {
-      rawCallIdByReshaped.set(reshaped, rawCallId);
+    // Replay can omit the function item id, so accept both eligible shapes.
+    for (const reshaped of new Set([
+      canonicalizeToolCallId(rawCallId, item.id),
+      canonicalizeToolCallId(rawCallId, undefined),
+    ])) {
+      if (typeof reshaped === "string" && reshaped !== rawCallId) {
+        rawCallIdByReshaped.set(reshaped, rawCallId);
+      }
     }
   }
   if (rawCallIdByReshaped.size === 0) {
-    // No rewrite needed: `delta` is returned as-is.
-    // SAFETY: callers only read the result (assign to `input`) and never mutate it in place, so the `readonly` -> mutable widening is inert.
+    // Callers only read the returned delta, so this readonly widening is inert.
     return delta as unknown[];
   }
   return delta.map((item) => {
@@ -268,15 +224,7 @@ export function resolveResponsesContinuationRequest(
   const replayedToolRound = normalizeAssistantReplayInput(
     currentInput.slice(previousInput.length, baselineLength),
   );
-  // Compared against two candidate cached-history shapes: normally paired
-  // with the cached response item's own id (matches both an agent-reshaped
-  // replay and a direct-transport replay that preserves the full raw
-  // call_id/id pair unchanged), or, failing that, ignoring the cached id
-  // entirely (matches a direct-transport replay whose connection disables
-  // item-id replay -- see normalizeAssistantReplayInput's own note). Both
-  // are legitimate "nothing about this call actually changed" shapes; which
-  // one a given connection produces depends on its own replayResponsesItemIds
-  // setting, not something knowable here.
+  // Replay may keep or omit function_call.id, so compare both cached forms.
   const historyToolRoundUnchanged =
     jsonValuesEqual(
       replayedToolRound,

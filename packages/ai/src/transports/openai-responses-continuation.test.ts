@@ -591,6 +591,29 @@ describe("OpenAI Responses continuation", () => {
     );
   });
 
+  it("matches a replayed output call id without pairing it to the output item id", () => {
+    const rawCallId = "functions.gateway:0";
+    const output = {
+      type: "function_call_output",
+      id: "fc_output_1",
+      call_id: rawCallId,
+      output: "recorded",
+      status: "completed",
+    };
+    const state = continuationState();
+    state.lastRequest.input = [firstUser, output] as never;
+    const request = nextRequest();
+    request.input = [
+      firstUser,
+      { ...output, call_id: normalizeOpenAIResponsesFunctionCallId(rawCallId) },
+      ...(request.input ?? []).slice(1),
+    ] as never;
+
+    expect(resolveResponsesContinuationRequest(state, request).continuationStatus).toBe(
+      "continued",
+    );
+  });
+
   it("does not tolerate an unrelated function-call id change as the known replay reshape", () => {
     // A changed call_id that ISN'T the client's own reshape of the cached raw
     // id (e.g. the model made a genuinely different tool call, or a
