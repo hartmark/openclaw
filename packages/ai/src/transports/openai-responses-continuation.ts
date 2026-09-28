@@ -28,7 +28,9 @@ export type ResponsesContinuationState = {
   lastRequest: ResponsesContinuationRequest;
   lastResponseId: string;
   lastResponseItems: ResponseOutputItem[];
+  pendingToolCalls?: Array<{ callId: string; itemId?: string }>;
 };
+type ContinuationResponse = { id: string; output: ResponseOutputItem[] };
 export type ResponsesContinuationStatus =
   | "continued"
   | "explicit_previous_response_id"
@@ -76,6 +78,138 @@ function canonicalizeToolCallId(callId: unknown, itemId: unknown): unknown {
     return callId;
   }
   return splitOpenAIFunctionCallPairing(normalizeOpenAIResponsesFunctionCallId(paired)).callId;
+}
+
+type ResponsesContinuationToolCall = { callId: string; itemId?: string };
+
+function responseToolCalls(items: readonly unknown[]): ResponsesContinuationToolCall[] {
+  return items.flatMap((item) => {
+    if (!isRecord(item) || item.type !== "function_call" || typeof item.call_id !== "string") {
+      return [];
+    }
+    return [{ callId: item.call_id, ...(typeof item.id === "string" ? { itemId: item.id } : {}) }];
+  });
+}
+
+function toolCallReplayShapes(call: ResponsesContinuationToolCall): Set<string> {
+  return new Set(
+    [
+      call.callId,
+      canonicalizeToolCallId(call.callId, call.itemId),
+      canonicalizeToolCallId(call.callId, undefined),
+    ].filter((shape): shape is string => typeof shape === "string"),
+  );
+}
+
+function toolCallOwnerByReplayShape(
+  calls: readonly ResponsesContinuationToolCall[],
+): Map<string, number | null> {
+  const ownerByReplayShape = new Map<string, number | null>();
+  for (const [index, call] of calls.entries()) {
+    for (const replayShape of toolCallReplayShapes(call)) {
+      const owner = ownerByReplayShape.get(replayShape);
+      ownerByReplayShape.set(replayShape, owner === undefined || owner === index ? index : null);
+    }
+  }
+  return ownerByReplayShape;
+}
+
+// A later response can supersede the one that introduced an unresolved async call.
+// Keep its raw ID while the full transcript still has the call but no output.
+function pendingResponsesToolCalls(
+  calls: readonly ResponsesContinuationToolCall[],
+  input: readonly unknown[],
+): ResponsesContinuationToolCall[] {
+  const inputCalls = input.flatMap((item, inputIndex) => {
+    if (!isRecord(item) || item.type !== "function_call" || typeof item.call_id !== "string") {
+      return [];
+    }
+    return [
+      {
+        inputIndex,
+        call: {
+          callId: item.call_id,
+          ...(typeof item.id === "string" ? { itemId: item.id } : {}),
+        },
+      },
+    ];
+  });
+  const ownerByInputCall = new Map<number, number>();
+  const claimedInputCalls = new Set<number>();
+  for (let owner = calls.length - 1; owner >= 0; owner -= 1) {
+    const candidate = calls[owner];
+    const candidateShapes = toolCallReplayShapes(candidate);
+    const matches = inputCalls
+      .map(({ inputIndex, call }, index) => ({ inputIndex, call, index }))
+      .filter(
+        ({ call, index }) =>
+          !claimedInputCalls.has(index) &&
+          [...toolCallReplayShapes(call)].some((shape) => candidateShapes.has(shape)),
+      );
+    const exactItemMatches = matches.filter(
+      ({ call }) =>
+        call.callId === candidate.callId &&
+        typeof candidate.itemId === "string" &&
+        call.itemId === candidate.itemId,
+    );
+    const exactCallMatches = matches.filter(({ call }) => call.callId === candidate.callId);
+    const selected =
+      (exactItemMatches.length > 0 ? exactItemMatches : exactCallMatches).at(-1) ?? matches.at(-1);
+    if (!selected) continue;
+    ownerByInputCall.set(selected.inputIndex, owner);
+    claimedInputCalls.add(selected.index);
+  }
+
+  const activeOwners = new Set<number>();
+  const resolvedOwners = new Set<number>();
+  for (const [inputIndex, item] of input.entries()) {
+    if (!isRecord(item) || typeof item.call_id !== "string") continue;
+    if (item.type === "function_call") {
+      const owner = ownerByInputCall.get(inputIndex);
+      if (owner !== undefined) activeOwners.add(owner);
+      continue;
+    }
+    if (item.type !== "function_call_output") continue;
+    const candidates = [...activeOwners].filter((owner) => !resolvedOwners.has(owner));
+    const exactOwners = candidates.filter((owner) => calls[owner]?.callId === item.call_id);
+    const matches =
+      exactOwners.length > 0
+        ? exactOwners
+        : candidates.filter((owner) => toolCallReplayShapes(calls[owner]).has(item.call_id));
+    if (matches.length === 1) resolvedOwners.add(matches[0]);
+  }
+  return calls.filter((_call, index) => {
+    const inputCallIndex = inputCalls.findIndex(
+      (entry) => ownerByInputCall.get(entry.inputIndex) === index,
+    );
+    return inputCallIndex >= 0 && !resolvedOwners.has(index);
+  });
+}
+
+export function recordResponsesContinuationState(
+  previous: ResponsesContinuationState | undefined,
+  lastRequest: ResponsesContinuationRequest,
+  response: ContinuationResponse,
+  continued = false,
+): ResponsesContinuationState {
+  const calls =
+    previous && continued
+      ? [...(previous.pendingToolCalls ?? []), ...responseToolCalls(previous.lastResponseItems)]
+      : responseToolCalls(lastRequest.input ?? []);
+  const seenCalls = new Set<string>();
+  const uniqueCalls = calls.filter((call) => {
+    const key = JSON.stringify([call.callId, call.itemId]);
+    if (seenCalls.has(key)) return false;
+    seenCalls.add(key);
+    return true;
+  });
+  const pendingToolCalls = pendingResponsesToolCalls(uniqueCalls, lastRequest.input ?? []);
+  return {
+    lastRequest,
+    lastResponseId: response.id,
+    lastResponseItems: response.output,
+    pendingToolCalls,
+  };
 }
 
 // Cached output keeps raw IDs; compare with and without the item ID because replay may omit it.
@@ -133,6 +267,81 @@ function normalizeAssistantReplayInput(
   });
 }
 
+// Compare tool results by their uniquely identified call occurrence, not a lossy ID alias.
+function normalizeContinuationHistory(input: readonly unknown[]): unknown[] | undefined {
+  const normalized = normalizeAssistantReplayInput(input);
+  const calls = responseToolCalls(input);
+  const ownerByReplayShape = toolCallOwnerByReplayShape(calls);
+  let callIndex = 0;
+  for (const [index, item] of input.entries()) {
+    if (!isRecord(item) || !isRecord(normalized[index])) continue;
+    const normalizedItem = normalized[index] as Record<string, unknown>;
+    if (item.type === "function_call") {
+      const callOwner = ownerByReplayShape.get(normalizedItem.call_id as string);
+      if (callOwner !== callIndex) return undefined;
+      normalizedItem.call_id = { callOwner };
+      callIndex += 1;
+      continue;
+    }
+    if (item.type !== "function_call_output" || typeof item.call_id !== "string") continue;
+    const owner = ownerByReplayShape.get(item.call_id);
+    if (owner === null) return undefined;
+    normalizedItem.call_id =
+      owner === undefined ? { unknownCallId: item.call_id } : { callOwner: owner };
+  }
+  return normalized;
+}
+
+function continuationHistoryMatches(
+  previousInput: readonly unknown[],
+  currentInput: readonly unknown[],
+): boolean {
+  for (const [index, previousItem] of previousInput.entries()) {
+    const currentItem = currentInput[index];
+    if (!isRecord(previousItem) || !isRecord(currentItem)) continue;
+    if (previousItem.type === "function_call" && currentItem.type === "function_call") {
+      if (
+        typeof previousItem.call_id === "string" &&
+        typeof currentItem.call_id === "string" &&
+        !toolCallReplayShapes({
+          callId: previousItem.call_id,
+          ...(typeof previousItem.id === "string" ? { itemId: previousItem.id } : {}),
+        }).has(currentItem.call_id)
+      ) {
+        return false;
+      }
+    }
+    if (
+      previousItem.type === "function_call_output" &&
+      currentItem.type === "function_call_output" &&
+      typeof previousItem.call_id === "string" &&
+      typeof currentItem.call_id === "string" &&
+      currentItem.call_id !== previousItem.call_id &&
+      currentItem.call_id !== canonicalizeToolCallId(previousItem.call_id, undefined)
+    ) {
+      return false;
+    }
+  }
+  const previousCalls = responseToolCalls(previousInput);
+  const currentCalls = responseToolCalls(currentInput);
+  if (previousCalls.length !== currentCalls.length) return false;
+  for (const [index, previousCall] of previousCalls.entries()) {
+    const previousShapes = toolCallReplayShapes(previousCall);
+    if (
+      ![...toolCallReplayShapes(currentCalls[index])].some((shape) => previousShapes.has(shape))
+    ) {
+      return false;
+    }
+  }
+  const normalizedPrevious = normalizeContinuationHistory(previousInput);
+  const normalizedCurrent = normalizeContinuationHistory(currentInput);
+  return (
+    normalizedPrevious !== undefined &&
+    normalizedCurrent !== undefined &&
+    jsonValuesEqual(normalizedCurrent, normalizedPrevious)
+  );
+}
+
 export function responsesContinuationRequestFingerprint(
   request: ResponsesContinuationRequest,
 ): string {
@@ -156,36 +365,27 @@ function restoreRawCallIdsInDelta(
   delta: readonly unknown[],
   cachedResponseItems: readonly unknown[],
   replayedToolRound: readonly unknown[],
+  pendingToolCalls: readonly ResponsesContinuationToolCall[],
 ): unknown[] | undefined {
-  const cachedCalls = cachedResponseItems.filter(
-    (item): item is Record<string, unknown> => isRecord(item) && item.type === "function_call",
-  );
+  const currentResponseCalls = responseToolCalls(cachedResponseItems);
   const replayedCalls = replayedToolRound.filter(
     (item): item is Record<string, unknown> => isRecord(item) && item.type === "function_call",
   );
-  if (cachedCalls.length !== replayedCalls.length) {
+  if (currentResponseCalls.length !== replayedCalls.length) {
     return undefined;
   }
 
-  const ownerByReplayShape = new Map<string, number | null>();
-  for (const [index, item] of cachedCalls.entries()) {
-    if (typeof item.call_id !== "string") continue;
-    for (const replayShape of new Set([
-      item.call_id,
-      canonicalizeToolCallId(item.call_id, item.id),
-      canonicalizeToolCallId(item.call_id, undefined),
-    ])) {
-      if (typeof replayShape !== "string") continue;
-      const owner = ownerByReplayShape.get(replayShape);
-      ownerByReplayShape.set(replayShape, owner === undefined || owner === index ? index : null);
-    }
-  }
+  const cachedCalls = [...pendingToolCalls, ...currentResponseCalls];
+  const currentCallOffset = pendingToolCalls.length;
+  const ownerByReplayShape = toolCallOwnerByReplayShape(cachedCalls);
 
   // Lossy shaping is safe only when a replayed call or output has one cached owner.
-  for (const [index, item] of cachedCalls.entries()) {
-    if (typeof item.call_id !== "string") continue;
+  for (const [index, item] of currentResponseCalls.entries()) {
     const replayedCallId = replayedCalls[index]?.call_id;
-    if (typeof replayedCallId !== "string" || ownerByReplayShape.get(replayedCallId) !== index) {
+    if (
+      typeof replayedCallId !== "string" ||
+      ownerByReplayShape.get(replayedCallId) !== currentCallOffset + index
+    ) {
       return undefined;
     }
   }
@@ -203,10 +403,8 @@ function restoreRawCallIdsInDelta(
     const owner = ownerByReplayShape.get(item.call_id);
     // Unknown or shared shapes cannot identify a cached call; resend full history to preserve pairing.
     if (owner === undefined || owner === null) return undefined;
-    const rawCallId = cachedCalls[owner]?.call_id;
-    if (typeof rawCallId !== "string") {
-      return undefined;
-    }
+    const rawCallId = cachedCalls[owner]?.callId;
+    if (!rawCallId) return undefined;
     restoredDelta.push(rawCallId === item.call_id ? item : { ...item, call_id: rawCallId });
   }
   return restoredDelta;
@@ -265,10 +463,7 @@ export function resolveResponsesContinuationRequest(
       normalizeAssistantReplayInput(continuation.lastResponseItems, true, true),
     );
   if (
-    !jsonValuesEqual(
-      normalizeAssistantReplayInput(currentInput.slice(0, previousInput.length)),
-      normalizeAssistantReplayInput(previousInput),
-    ) ||
+    !continuationHistoryMatches(previousInput, currentInput.slice(0, previousInput.length)) ||
     !historyToolRoundUnchanged
   ) {
     return { request, continuationStatus: "history_changed" };
@@ -277,6 +472,7 @@ export function resolveResponsesContinuationRequest(
     currentInput.slice(baselineLength),
     continuation.lastResponseItems,
     replayedToolRoundInput,
+    continuation.pendingToolCalls ?? [],
   );
   if (!restoredInput) {
     return { request, continuationStatus: "history_changed" };
@@ -318,7 +514,6 @@ type HttpContinuationIdentity = {
   baseUrl: string;
   headers: Record<string, string>;
 };
-type ContinuationResponse = { id: string; output: ResponseOutputItem[] };
 
 function connectionIdentity(params: HttpContinuationIdentity): string {
   const headers = Object.entries(resolveAiTransportHeaderSentinels(params.headers) ?? {})
@@ -363,18 +558,24 @@ export function claimOpenAIResponsesHttpContinuation(
       // Unstored HTTP responses cannot be referenced, but their prompt prefix can still be cached.
       request: params.request.store === false ? fullRequest : resolved.request,
       fullRequest,
-      commit: (effectiveRequest: ResponsesContinuationRequest, response: ContinuationResponse) => {
+      commit: (
+        effectiveRequest: ResponsesContinuationRequest,
+        response: ContinuationResponse,
+        dispatchedPreviousResponseId?: string,
+      ) => {
         if (httpContinuationEntries.get(key) !== claimed) {
           return;
         }
         const ready = {
           ...claimed,
           kind: "ready",
-          state: {
-            lastRequest: effectiveRequest,
-            lastResponseId: response.id,
-            lastResponseItems: response.output,
-          },
+          state: recordResponsesContinuationState(
+            previous?.kind === "ready" ? previous.state : undefined,
+            effectiveRequest,
+            response,
+            previous?.kind === "ready" &&
+              dispatchedPreviousResponseId === previous.state.lastResponseId,
+          ),
           idleTimer: setTimeout(
             () => deleteHttpContinuationIfOwned(key, ready),
             HTTP_CONTINUATION_IDLE_TTL_MS,
