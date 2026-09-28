@@ -680,6 +680,64 @@ describe("OpenAI Responses continuation", () => {
     });
   });
 
+  it("rejects a continuation delta whose tool result id is not a replay shape of the cached call", () => {
+    const cachedCall = {
+      type: "function_call",
+      id: "fc_1",
+      status: "completed",
+      call_id: " x",
+      name: "exec",
+      arguments: "{}",
+    };
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: [cachedCall] as never,
+    };
+    const request: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [
+        firstUser,
+        cachedCall,
+        { type: "function_call_output", call_id: "x", output: "recorded" },
+      ] as never,
+    };
+
+    expect(resolveResponsesContinuationRequest(state, request)).toEqual({
+      continuationStatus: "history_changed",
+      request,
+    });
+  });
+
+  it("rejects ambiguous restoration when distinct cached calls share a bare replay shape", () => {
+    const cachedCalls = [
+      { type: "function_call", id: "fc_1", call_id: " x", name: "first", arguments: "{}" },
+      { type: "function_call", id: "fc_2", call_id: "x", name: "second", arguments: "{}" },
+    ];
+    const bareReplayCallId = normalizeOpenAIResponsesFunctionCallId(" x");
+    const state: ResponsesContinuationState = {
+      lastRequest: { model: "gpt-5.6-luna", store: true, input: [firstUser] as never },
+      lastResponseId: "resp_1",
+      lastResponseItems: cachedCalls as never,
+    };
+    const request: ResponsesContinuationRequest = {
+      model: "gpt-5.6-luna",
+      store: true,
+      input: [
+        firstUser,
+        { type: "function_call", call_id: bareReplayCallId, name: "first", arguments: "{}" },
+        { type: "function_call", call_id: bareReplayCallId, name: "second", arguments: "{}" },
+        { type: "function_call_output", call_id: bareReplayCallId, output: "recorded" },
+      ] as never,
+    };
+
+    expect(resolveResponsesContinuationRequest(state, request)).toEqual({
+      continuationStatus: "history_changed",
+      request,
+    });
+  });
+
   it("ignores turn correlation headers but isolates explicit authorization", () => {
     const first = claim({ turn: "1" });
     first?.commit(continuationState().lastRequest, {
