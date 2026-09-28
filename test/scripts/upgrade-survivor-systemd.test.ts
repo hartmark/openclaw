@@ -90,10 +90,10 @@ describe.skipIf(process.platform === "win32")("survivor manager fixture", () => 
       resolve("scripts/e2e/lib/upgrade-survivor/update-first-hop-compat.sh"),
       "utf8",
     );
-    const timingStart = firstHop.indexOf("first_hop_timing() {");
-    const updateStart = firstHop.indexOf("run_update() {");
-    const firstHopTiming =
-      timingStart >= 0 && updateStart > timingStart ? firstHop.slice(timingStart, updateStart) : "";
+    const firstHopTiming = firstHop.slice(
+      firstHop.indexOf("first_hop_timing() {"),
+      firstHop.indexOf("run_update() {"),
+    );
     const resetLane = firstHop.slice(
       firstHop.indexOf("reset_lane() {"),
       firstHop.indexOf("run_negative_control() {"),
@@ -110,6 +110,7 @@ ${resetLane}
 reset_lane negative
 `);
     expect(reset.status, reset.stderr).toBe(0);
+    expect(reset.stdout).toMatch(/^first-hop timing: negative reset \d+s$/m);
     expect(existsSync(`${unit}.loaded-unit`)).toBe(false);
     expect(await readLoadedSystemdServiceRuntime(env)).toMatchObject({ status: "unknown" });
     expect(await readSystemdServiceRuntime(env)).toMatchObject({
