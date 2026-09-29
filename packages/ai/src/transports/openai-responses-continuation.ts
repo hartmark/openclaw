@@ -232,8 +232,8 @@ function normalizeContinuationHistory(input: readonly unknown[]): unknown[] | un
   const ownerByReplayShape = toolCallOwnerByReplayShape(calls);
   let callIndex = 0;
   for (const [index, item] of input.entries()) {
-    if (!isRecord(item) || !isRecord(normalized[index])) continue;
-    const normalizedItem = normalized[index] as Record<string, unknown>;
+    const normalizedItem = normalized[index];
+    if (!isRecord(item) || !isRecord(normalizedItem)) continue;
     if (item.type === "function_call") {
       const callOwner = ownerByReplayShape.get(normalizedItem.call_id as string);
       if (callOwner !== callIndex) return undefined;
@@ -245,7 +245,9 @@ function normalizeContinuationHistory(input: readonly unknown[]): unknown[] | un
     const owner = ownerByReplayShape.get(item.call_id);
     if (owner === null) return undefined;
     normalizedItem.call_id =
-      owner === undefined ? { unknownCallId: item.call_id } : { callOwner: owner };
+      owner === undefined
+        ? { unknownCallId: canonicalizeToolCallId(item.call_id, undefined) }
+        : { callOwner: owner };
   }
   return normalized;
 }
@@ -284,10 +286,10 @@ function continuationHistoryMatches(
   const currentCalls = responseToolCalls(currentInput);
   if (previousCalls.length !== currentCalls.length) return false;
   for (const [index, previousCall] of previousCalls.entries()) {
+    const currentCall = currentCalls[index];
+    if (!currentCall) return false;
     const previousShapes = toolCallReplayShapes(previousCall);
-    if (
-      ![...toolCallReplayShapes(currentCalls[index])].some((shape) => previousShapes.has(shape))
-    ) {
+    if (![...toolCallReplayShapes(currentCall)].some((shape) => previousShapes.has(shape))) {
       return false;
     }
   }

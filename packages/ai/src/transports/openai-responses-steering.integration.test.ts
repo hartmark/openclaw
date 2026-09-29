@@ -111,6 +111,7 @@ import { OpenAIResponsesWebSocketPostDispatchError } from "./openai-responses-co
 import { responsesLoopbackModel } from "./openai-responses-loopback.test-support.js";
 import {
   normalizeOpenAIResponsesFunctionCallId,
+  shouldNormalizeOpenAIResponsesToolCallId,
   splitOpenAIFunctionCallPairing,
 } from "./openai-responses-tool-call-id-shape.js";
 import { createOpenAIResponsesWebSocketStream } from "./openai-responses-websocket.js";
@@ -648,9 +649,11 @@ describe("Responses WebSocket steering handoff", () => {
       ).toHaveLength(1);
 
       // Replay must match delivery: the automatic response never saw the tool result.
-      const replayedIds = splitOpenAIFunctionCallPairing(
-        normalizeOpenAIResponsesFunctionCallId(`${callId}|${itemId}`),
-      );
+      const pairedId = `${callId}|${itemId}`;
+      const replayedId = shouldNormalizeOpenAIResponsesToolCallId(pairedId)
+        ? normalizeOpenAIResponsesFunctionCallId(pairedId)
+        : pairedId;
+      const replayedIds = splitOpenAIFunctionCallPairing(replayedId);
       const replayedToolCall = {
         ...toolCall,
         id: replayedIds.itemId ?? itemId,
