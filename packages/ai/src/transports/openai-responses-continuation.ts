@@ -235,7 +235,8 @@ function normalizeContinuationHistory(input: readonly unknown[]): unknown[] | un
     const normalizedItem = normalized[index];
     if (!isRecord(item) || !isRecord(normalizedItem)) continue;
     if (item.type === "function_call") {
-      const callOwner = ownerByReplayShape.get(normalizedItem.call_id as string);
+      if (typeof normalizedItem.call_id !== "string") return undefined;
+      const callOwner = ownerByReplayShape.get(normalizedItem.call_id);
       if (callOwner !== callIndex) return undefined;
       normalizedItem.call_id = { callOwner };
       callIndex += 1;
