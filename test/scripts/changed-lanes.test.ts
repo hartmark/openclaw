@@ -1493,6 +1493,7 @@ describe("scripts/changed-lanes", () => {
   it("targets mixed core, extension, script, and root test lint without full-owner fan-out", () => {
     const result = detectChangedLanes([
       "config/assertion-safety-baseline.txt",
+      "config/max-lines-baseline.txt",
       ".github/workflows/ci.yml",
       "src/gateway/node-registry.ts",
       "extensions/lmstudio/src/models.fetch.ts",
@@ -1874,6 +1875,7 @@ describe("scripts/changed-lanes", () => {
       createTargetedCoreLintCommands(
         [
           "config/assertion-safety-baseline.txt",
+          "config/max-lines-baseline.txt",
           "config/tsconfig/oxlint.core.json",
           "packages/normalization-core/src/string-normalization.ts",
         ],
