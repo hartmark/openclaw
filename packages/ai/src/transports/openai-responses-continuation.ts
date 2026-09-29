@@ -341,7 +341,7 @@ function restoreRawCallIdsInDelta(
   const ownerByReplayShape = toolCallOwnerByReplayShape(cachedCalls);
 
   // Lossy shaping is safe only when a replayed call or output has one cached owner.
-  for (const [index, item] of currentResponseCalls.entries()) {
+  for (const index of currentResponseCalls.keys()) {
     const replayedCallId = replayedCalls[index]?.call_id;
     if (
       typeof replayedCallId !== "string" ||
