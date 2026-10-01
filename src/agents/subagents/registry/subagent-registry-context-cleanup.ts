@@ -2,7 +2,6 @@ import { getRuntimeConfig } from "../../../config/config.js";
 import { hasSqliteWorkerOutcomeUnknown } from "../../../infra/sqlite-worker-contract.js";
 import { withPluginRuntimeRegistryScope } from "../../../plugins/runtime/gateway-request-scope.js";
 import { captureOpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.js";
-import type { OpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.types.js";
 import { removeInternalSessionEffectsSession } from "../../internal-session-effects.js";
 import {
   SUBAGENT_ENDED_OUTCOME_KILLED,
@@ -22,7 +21,8 @@ import { safeRemoveAttachmentsDir } from "./subagent-registry-helpers.js";
 import {
   assertSubagentRegistryWriteOutcomeKnown,
   assertSubagentRegistryWriteSourceCurrent,
-  type SubagentRegistryWriteOptions,
+  waitForPendingSubagentRegistryWrites,
+  type publishSubagentRunPostimages,
 } from "./subagent-registry-persistence.js";
 import type {
   ContextEngineSubagentEndedParams,
@@ -31,11 +31,7 @@ import type {
 
 export function createSubagentRegistryContextCleanup(config: {
   persist: (...runIds: string[]) => void;
-  persistAsyncOrThrow: (
-    context: OpenClawStateWorkerContext,
-    callbacks: Omit<SubagentRegistryWriteOptions, "context"> & { assertCurrent: () => void },
-    ...runIds: string[]
-  ) => Promise<void>;
+  persistAsyncOrThrow: Parameters<typeof publishSubagentRunPostimages>[0]["persist"];
   isEndedHookOwnerCurrent: (runId: string, entry: SubagentRunRecord) => boolean;
   warn: (message: string, meta?: Record<string, unknown>) => void;
 }) {
@@ -120,7 +116,7 @@ export function createSubagentRegistryContextCleanup(config: {
       }
     }
     const contextAlreadyEnded = typeof entry.contextEngineCleanupCompletedAt === "number";
-    const attachmentsRemoved = await safeRemoveAttachmentsDir(entry);
+    const attachmentsRemoved = await safeRemoveAttachmentsDir(entry, isCurrent);
     if (!isCurrent()) {
       return false;
     }
@@ -212,8 +208,25 @@ export function createSubagentRegistryContextCleanup(config: {
           outcome,
           error,
           inFlightRunIds: endedHookInFlightRunIds,
-          persist: (...runIds) =>
-            config.persistAsyncOrThrow(stateContext, { assertCurrent }, ...runIds),
+          recordEmitted: async () => {
+            // Do not invalidate an admitted wake's preimage while its worker settles.
+            // Plugin execution remains independent of requester delivery.
+            for (;;) {
+              assertCurrent();
+              const pending = waitForPendingSubagentRegistryWrites(
+                [params.entry.runId],
+                stateContext.admission,
+              );
+              if (!pending) {
+                break;
+              }
+              await pending;
+            }
+            // Capture the stamp write without yielding after the last owner check.
+            // Keep the emitted fact even if its own persistence fails.
+            params.entry.endedHookEmittedAt = Date.now();
+            await config.persistAsyncOrThrow(stateContext, { assertCurrent }, params.entry.runId);
+          },
         });
       });
     } catch (err) {

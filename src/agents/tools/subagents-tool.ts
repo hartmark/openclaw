@@ -1,4 +1,3 @@
-/** Lists, waits for, and cancels native subagent executions. */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Type } from "typebox";
 import { getRuntimeConfig } from "../../config/config.js";
@@ -28,10 +27,10 @@ import {
 } from "../subagents/registry/subagent-list.js";
 import { subagentRuns } from "../subagents/registry/subagent-registry-memory.js";
 import { assertSubagentRegistryWriteSourceCurrent } from "../subagents/registry/subagent-registry-persistence.js";
+import { subscribeSubagentRunChanges } from "../subagents/registry/subagent-registry-publication.js";
 import type { SubagentRunReadRecord } from "../subagents/registry/subagent-registry-read.types.js";
 import {
   getSubagentSessionListReadSnapshotIdentity,
-  onSubagentRegistryPersisted,
   prepareSubagentRunsSnapshotForRunIds,
   prepareSubagentSessionListReadCache,
 } from "../subagents/registry/subagent-registry-state.js";
@@ -129,7 +128,6 @@ function waitForSelectedRuns(params: {
     let prepared: Awaited<ReturnType<typeof prepareSubagentRunsSnapshotForRunIds>> | undefined;
     let timedOut = params.timeoutMs === 0;
     let abortError: Error | undefined;
-    let unsubscribe = () => {};
     const cleanup = () => {
       unsubscribe();
       clearTimeout(timer);
@@ -206,10 +204,7 @@ function waitForSelectedRuns(params: {
         finish();
       });
     };
-    const unsubscribeSubagents = onSubagentRegistryPersisted(wake);
-    unsubscribe = () => {
-      unsubscribeSubagents();
-    };
+    const unsubscribe = subscribeSubagentRunChanges("persistence", wake);
     params.signal?.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(() => {
       timedOut = true;
@@ -279,7 +274,7 @@ export function createSubagentsTool(opts: SubagentsToolOptions = {}): AnyAgentTo
         });
       }
     }
-    return { cfg, controller, runs, readable: [...readable.values()], controlled };
+    return { cfg, controller, readable: [...readable.values()], controlled };
   };
   return {
     label: "Subagents",

@@ -7,6 +7,7 @@ import type {
   SessionEntryReadScope,
 } from "../../../config/sessions/session-accessor.js";
 import type { applySessionEntryExactReplacements } from "../../../config/sessions/session-accessor.sqlite-replacement-projection.js";
+import type { prepareSessionGenerationFacts } from "../../../config/sessions/session-delivery-generation.js";
 import type { captureSessionEntryCurrentRead } from "../../../config/sessions/session-entry-current-runtime.js";
 import type { SessionEntryCurrentFacts } from "../../../config/sessions/session-entry-current.types.js";
 import type { SessionEntryReadWorkerOwner } from "../../../config/sessions/session-entry-read-runtime.js";
@@ -24,6 +25,7 @@ import type {
   persistSubagentRunsToDiskOrThrow,
   restoreSubagentRunsFromDisk,
 } from "./subagent-registry-state.js";
+import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 const noop = () => {};
 
@@ -122,7 +124,7 @@ export function createSubagentRegistryMockState() {
     clearSubagentRunsReadCacheForTest: vi.fn(),
     persistSubagentRunsToDisk: vi.fn<typeof persistSubagentRunsToDisk>(),
     persistSubagentRunsToDiskOrThrow: vi.fn<typeof persistSubagentRunsToDiskOrThrow>(),
-    restoreSubagentRunsFromDisk: vi.fn<typeof restoreSubagentRunsFromDisk>(() => 0),
+    restoreSubagentRunsFromDisk: vi.fn<typeof restoreSubagentRunsFromDisk>(async () => 0),
     getSubagentRunsSnapshotForRead: vi.fn(
       (runs: Map<string, import("./subagent-registry.types.js").SubagentRunRecord>) =>
         new Map(runs),
@@ -157,6 +159,14 @@ export function createSubagentRegistryMockState() {
     lifecycleGeneration: "test-generation",
   };
   return Object.assign(mocks, {
+    mockRestoredRuns: (createEntries: () => SubagentRunRecord[]) =>
+      mocks.restoreSubagentRunsFromDisk.mockImplementation(async ({ runs }) => {
+        const entries = createEntries();
+        for (const entry of entries) {
+          runs.set(entry.runId, entry);
+        }
+        return entries.length;
+      }),
     sessionAccessors: {
       findTranscriptEvent: vi.fn(async () => undefined),
       listSessionEntriesCore: mocks.listSessionEntriesCore,
@@ -164,6 +174,28 @@ export function createSubagentRegistryMockState() {
       loadSessionEntry: mocks.loadSessionEntry,
       loadSessionEntryReadOnly: mocks.loadSessionEntry,
       patchSessionEntryCore: mocks.patchSessionEntryCore,
+    },
+    prepareSessionGenerationFacts: (
+      input: Parameters<typeof prepareSessionGenerationFacts>[0],
+    ): ReturnType<typeof prepareSessionGenerationFacts> => {
+      let active = true;
+      const assertCurrent = () => {
+        const entry = mocks.readSessionCurrent(input);
+        if (
+          !active ||
+          (entry?.sessionId ?? null) !== input.sessionId ||
+          (entry?.lifecycleRevision ?? null) !== input.lifecycleRevision
+        ) {
+          throw new Error("Registry fixture lost its original session generation.");
+        }
+      };
+      assertCurrent();
+      return Promise.resolve({
+        assertCurrent,
+        release: () => {
+          active = false;
+        },
+      });
     },
     captureSessionEntryCurrentRead: (
       scope: Parameters<typeof captureSessionEntryCurrentRead>[0],

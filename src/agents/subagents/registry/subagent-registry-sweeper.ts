@@ -27,7 +27,7 @@ import { isRestoredQueuedFailureSettlementClaimed } from "./subagent-registry-re
 import {
   discardSuspendedPendingFinalDelivery,
   isSuspendedPendingFinalDelivery,
-  resolveSuspendedDeliveryExpiryMs,
+  SUBAGENT_SUSPENDED_DELIVERY_RETENTION_MS,
   warnSuspendedDeliveryPressure,
 } from "./subagent-registry-suspended-delivery.js";
 import {
@@ -68,6 +68,9 @@ export function createSubagentRegistrySweeper(params: {
   resumeRequesterSettleWake: SubagentLifecycleController["resumeRequesterSettleWake"];
   startSubagentAnnounceCleanupFlow: SubagentLifecycleController["startSubagentAnnounceCleanupFlow"];
   completeCleanupBookkeeping: SubagentLifecycleController["completeCleanupBookkeeping"];
+  isEndedHookOwnerCurrent: SubagentLifecycleController["isEndedHookOwnerCurrent"];
+  sessionEffectsHostCurrent: SubagentLifecycleController["sessionEffectsHostCurrent"];
+  shouldSuppressSessionEffects: SubagentLifecycleController["shouldSuppressSessionEffects"];
   discardTerminalDelivery: typeof SubagentLifecycleController.discardTerminalDelivery;
   shouldEmitEndedHookForRun: SubagentLifecycleOptions["shouldEmitEndedHookForRun"];
   emitSubagentEndedHookForRun: SubagentLifecycleOptions["emitSubagentEndedHookForRun"];
@@ -326,7 +329,7 @@ export function createSubagentRegistrySweeper(params: {
         }
         if (isSuspendedPendingFinalDelivery(entry)) {
           const expired =
-            now - (entry.delivery?.suspendedAt ?? now) >= resolveSuspendedDeliveryExpiryMs();
+            now - (entry.delivery?.suspendedAt ?? now) >= SUBAGENT_SUSPENDED_DELIVERY_RETENTION_MS;
           if (expired) {
             await discardSuspendedPendingFinalDelivery({
               runId,
@@ -338,11 +341,13 @@ export function createSubagentRegistrySweeper(params: {
               clearPendingLifecycleTimeout: params.clearPendingLifecycleTimeout,
               discardTerminalDelivery: params.discardTerminalDelivery,
               completeCleanupBookkeeping: params.completeCleanupBookkeeping,
+              isCurrent: () => params.isEndedHookOwnerCurrent(runId, entry),
+              sessionEffectsHostCurrent: params.sessionEffectsHostCurrent,
+              shouldSuppressSessionEffects: params.shouldSuppressSessionEffects,
               shouldEmitEndedHookForRun: params.shouldEmitEndedHookForRun,
               emitSubagentEndedHookForRun: params.emitSubagentEndedHookForRun,
               warn: params.warn,
             });
-            mutatedRunIds.add(runId);
           }
           continue;
         }
@@ -364,7 +369,7 @@ export function createSubagentRegistrySweeper(params: {
           continue;
         }
         if (entry.killReconciliation) {
-          const reconciled = await reconcileProvisionalSubagentKill({
+          const needsPersistence = await reconcileProvisionalSubagentKill({
             runId,
             entry,
             now,
@@ -375,7 +380,7 @@ export function createSubagentRegistrySweeper(params: {
             getRunsForChildSession: params.getRunsForChildSession,
             warn: params.warn,
           });
-          if (reconciled) {
+          if (needsPersistence) {
             mutatedRunIds.add(runId);
           }
           continue;

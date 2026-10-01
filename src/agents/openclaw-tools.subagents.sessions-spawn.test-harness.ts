@@ -242,9 +242,8 @@ export async function getSessionsSpawnTool(opts: CreateOpenClawToolsOpts) {
   vi.mocked(persistence.persistSubagentRunsToDiskOrThrow).mockImplementation(
     hoisted.notifyEventWaiters,
   );
-  vi.mocked(persistence.restoreSubagentRunsFromDisk).mockReturnValue(0);
-  const persistenceMock = createSubagentPersistenceMock(persistence);
-  persistenceMock.onSubagentRegistryPersisted(hoisted.notifyEventWaiters);
+  vi.mocked(persistence.restoreSubagentRunsFromDisk).mockResolvedValue(0);
+  const persistenceMock = createSubagentPersistenceMock(persistence, hoisted.notifyEventWaiters);
   vi.mocked(persistence.persistSubagentRunsToDiskAsyncOrThrow).mockImplementation(
     persistenceMock.persistSubagentRunsToDiskAsyncOrThrow,
   );

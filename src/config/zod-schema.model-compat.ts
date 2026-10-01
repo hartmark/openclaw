@@ -4,62 +4,53 @@ import { z } from "zod";
 import type { OpenRouterRouting, VercelGatewayRouting } from "../llm/types.js";
 import { MODEL_THINKING_FORMATS } from "./model-config-vocabulary.js";
 
-const RoutingPercentileCutoffsSchema = z
-  .object({
-    p50: z.number().optional(),
-    p75: z.number().optional(),
-    p90: z.number().optional(),
-    p99: z.number().optional(),
-  })
-  .strict();
+const RoutingPercentileCutoffsSchema = z.strictObject({
+  p50: z.number().optional(),
+  p75: z.number().optional(),
+  p90: z.number().optional(),
+  p99: z.number().optional(),
+});
 
-const OpenRouterRoutingSchema = z
-  .object({
-    allow_fallbacks: z.boolean().optional(),
-    require_parameters: z.boolean().optional(),
-    data_collection: z.enum(["deny", "allow"]).optional(),
-    zdr: z.boolean().optional(),
-    enforce_distillable_text: z.boolean().optional(),
-    order: z.array(z.string()).optional(),
-    only: z.array(z.string()).optional(),
-    ignore: z.array(z.string()).optional(),
-    quantizations: z.array(z.string()).optional(),
-    sort: z
-      .union([
-        z.string(),
-        z
-          .object({
-            by: z.string().optional(),
-            partition: z.string().nullable().optional(),
-          })
-          .strict(),
-      ])
-      .optional(),
-    max_price: z
-      .object({
-        prompt: z.union([z.number(), z.string()]).optional(),
-        completion: z.union([z.number(), z.string()]).optional(),
-        image: z.union([z.number(), z.string()]).optional(),
-        audio: z.union([z.number(), z.string()]).optional(),
-        request: z.union([z.number(), z.string()]).optional(),
-      })
-      .strict()
-      .optional(),
-    preferred_min_throughput: z.union([z.number(), RoutingPercentileCutoffsSchema]).optional(),
-    preferred_max_latency: z.union([z.number(), RoutingPercentileCutoffsSchema]).optional(),
-  } satisfies Record<keyof OpenRouterRouting, z.ZodType>)
-  .strict();
+const OpenRouterRoutingSchema = z.strictObject({
+  allow_fallbacks: z.boolean().optional(),
+  require_parameters: z.boolean().optional(),
+  data_collection: z.enum(["deny", "allow"]).optional(),
+  zdr: z.boolean().optional(),
+  enforce_distillable_text: z.boolean().optional(),
+  order: z.array(z.string()).optional(),
+  only: z.array(z.string()).optional(),
+  ignore: z.array(z.string()).optional(),
+  quantizations: z.array(z.string()).optional(),
+  sort: z
+    .union([
+      z.string(),
+      z.strictObject({
+        by: z.string().optional(),
+        partition: z.string().nullable().optional(),
+      }),
+    ])
+    .optional(),
+  max_price: z
+    .strictObject({
+      prompt: z.union([z.number(), z.string()]).optional(),
+      completion: z.union([z.number(), z.string()]).optional(),
+      image: z.union([z.number(), z.string()]).optional(),
+      audio: z.union([z.number(), z.string()]).optional(),
+      request: z.union([z.number(), z.string()]).optional(),
+    })
+    .optional(),
+  preferred_min_throughput: z.union([z.number(), RoutingPercentileCutoffsSchema]).optional(),
+  preferred_max_latency: z.union([z.number(), RoutingPercentileCutoffsSchema]).optional(),
+} satisfies Record<keyof OpenRouterRouting, z.ZodType>);
 
-const VercelGatewayRoutingSchema = z
-  .object({
-    only: z.array(z.string()).optional(),
-    order: z.array(z.string()).optional(),
-  } satisfies Record<keyof VercelGatewayRouting, z.ZodType>)
-  .strict();
+const VercelGatewayRoutingSchema = z.strictObject({
+  only: z.array(z.string()).optional(),
+  order: z.array(z.string()).optional(),
+} satisfies Record<keyof VercelGatewayRouting, z.ZodType>);
 
 /** Provider/model compatibility switches consumed by request builders and tool schema adapters. */
 export const ModelCompatSchema = z
-  .object({
+  .strictObject({
     /** Whether the provider supports the `store` field. Default: auto-detected from URL. */
     supportsStore: z.boolean().optional(),
     /** Whether provider accepts prompt-cache/session affinity keys. */
@@ -166,11 +157,8 @@ export const ModelCompatSchema = z
     supportsEagerToolInputStreaming: z.boolean().optional(),
     /**
      * Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"`
-     * or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. Whether
-     * the provider supports `prompt_cache_retention: "24h"`. Default: true. Whether the provider
-     * supports Anthropic long cache retention (`cache_control.ttl: "1h"`). Default: true.
+     * or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true.
      */
     supportsLongCacheRetention: z.boolean().optional(),
   })
-  .strict()
   .optional();

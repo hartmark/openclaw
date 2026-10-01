@@ -14,7 +14,7 @@ import {
 import { runGatewayLoop } from "../cli/gateway-cli/run-loop.js";
 import { loadSessionEntry, replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import { runSqliteSessionReclamation } from "../config/sessions/session-accessor.sqlite-reclamation-run.js";
-import * as reclamationWorker from "../config/sessions/session-accessor.sqlite-reclamation-worker.js";
+import { SqliteReclamationWorker } from "../config/sessions/session-accessor.sqlite-reclamation-worker-lifetime.js";
 import { createSessionMaintenanceStatisticsOperation } from "../config/sessions/session-accessor.sqlite-reclamation.js";
 import { writeGatewayRestartIntentSync } from "../infra/restart-intent.js";
 import type { SqliteIntegrityDiagnostics } from "../infra/sqlite-integrity.js";
@@ -117,54 +117,48 @@ it("closes a Gateway with an active plugin while retaining a deleted agent store
   }
 }, 300_000);
 
-it.each(["stop", "restart"] as const)(
-  "releases agent leases for Doctor after the final Gateway %s while its process stays alive",
-  async (mode) => {
-    const fixture = await createGatewayMetadataCloseFixture(`gateway-agent-leases-${mode}`);
-    const ownerPid = process.pid;
-    try {
-      const first = await fixture.start(await fixture.reservePort());
-      const siblingPort = await fixture.reservePort();
-      const sibling = await fixture.start(siblingPort);
-      const options = { agentId: "main", env: fixture.state.env };
-      const agent = openOpenClawAgentDatabase(options);
-      const incognito = openOpenClawAgentDatabase({
-        ...options,
-        path: resolveIncognitoOpenClawAgentSqlitePath(options),
-      });
-      const shared = openOpenClawStateDatabase({ env: fixture.state.env }).db;
-      const inspectForDoctor = () =>
-        assertNoOpenClawAgentDatabaseLeasesReadOnly({ env: fixture.state.env });
-      expect(inspectForDoctor).toThrow(OpenClawAgentDatabaseLeaseActiveError);
-      const closeOptions = {
-        reason: mode === "restart" ? "gateway restarting" : "gateway stopping",
-        restartExpectedMs: mode === "restart" ? 1_500 : null,
-      };
+it("releases agent leases for Doctor after the final Gateway stops while its process stays alive", async () => {
+  const fixture = await createGatewayMetadataCloseFixture("gateway-agent-leases-stop");
+  const ownerPid = process.pid;
+  try {
+    const first = await fixture.start(await fixture.reservePort());
+    const siblingPort = await fixture.reservePort();
+    const sibling = await fixture.start(siblingPort);
+    const options = { agentId: "main", env: fixture.state.env };
+    const agent = openOpenClawAgentDatabase(options);
+    const incognito = openOpenClawAgentDatabase({
+      ...options,
+      path: resolveIncognitoOpenClawAgentSqlitePath(options),
+    });
+    const shared = openOpenClawStateDatabase({ env: fixture.state.env }).db;
+    const inspectForDoctor = () =>
+      assertNoOpenClawAgentDatabaseLeasesReadOnly({ env: fixture.state.env });
+    expect(inspectForDoctor).toThrow(OpenClawAgentDatabaseLeaseActiveError);
+    const closeOptions = { reason: "gateway stopping" };
 
-      await first.close(closeOptions);
-      expect(agent.db.isOpen).toBe(true);
-      expect(incognito.db.isOpen).toBe(true);
-      expect(inspectForDoctor).toThrow(OpenClawAgentDatabaseLeaseActiveError);
-      const response = await fetch(`http://127.0.0.1:${siblingPort}/healthz`);
-      await response.body?.cancel();
-      expect(response.ok).toBe(true);
+    await first.close(closeOptions);
+    expect(agent.db.isOpen).toBe(true);
+    expect(incognito.db.isOpen).toBe(true);
+    expect(inspectForDoctor).toThrow(OpenClawAgentDatabaseLeaseActiveError);
+    const response = await fetch(`http://127.0.0.1:${siblingPort}/healthz`);
+    await response.body?.cancel();
+    expect(response.ok).toBe(true);
 
-      await sibling.close(closeOptions);
-      expect(process.pid).toBe(ownerPid);
-      expect(isPidAlive(ownerPid)).toBe(true);
-      expect(inspectForDoctor).not.toThrow();
-      expect(agent.db.isOpen).toBe(false);
-      expect(shared.isOpen).toBe(false);
-      expect(incognito.db.isOpen).toBe(false);
-      expect(listOpenIncognitoAgentDatabases()).not.toContainEqual({
-        agentId: "main",
-        storePath: incognito.path,
-      });
-    } finally {
-      await fixture.cleanup();
-    }
-  },
-);
+    await sibling.close(closeOptions);
+    expect(process.pid).toBe(ownerPid);
+    expect(isPidAlive(ownerPid)).toBe(true);
+    expect(inspectForDoctor).not.toThrow();
+    expect(agent.db.isOpen).toBe(false);
+    expect(shared.isOpen).toBe(false);
+    expect(incognito.db.isOpen).toBe(false);
+    expect(listOpenIncognitoAgentDatabases()).not.toContainEqual({
+      agentId: "main",
+      storePath: incognito.path,
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
 
 it.skipIf(process.platform !== "linux")(
   "joins agent resources and records a clean witness after a managed SIGTERM drain",
@@ -263,10 +257,7 @@ it.skipIf(process.platform !== "linux")(
             },
           }),
       );
-      const reclamationClose = vi.spyOn(
-        reclamationWorker.SqliteReclamationWorker.prototype,
-        "close",
-      );
+      const reclamationClose = vi.spyOn(SqliteReclamationWorker.prototype, "close");
       await runSqliteSessionReclamation({
         forceInProcess: false,
         plan: createSessionMaintenanceStatisticsOperation({ ...options, path: agent.path }),

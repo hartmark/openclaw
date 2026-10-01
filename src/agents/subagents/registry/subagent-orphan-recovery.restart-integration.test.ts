@@ -49,11 +49,9 @@ import { prepareInternalSessionEffectsSession } from "../../internal-session-eff
 import { runSubagentAnnounceFlow } from "../announce/subagent-announce.js";
 import { SubagentLifecycleController } from "./subagent-registry-lifecycle.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
+import { subscribeSubagentRunChanges } from "./subagent-registry-publication.js";
 import { recoverInterruptedSubagentRow } from "./subagent-registry-restart-recovery.js";
-import {
-  onSubagentRegistryPersisted,
-  persistSubagentRunsToDiskOrThrow,
-} from "./subagent-registry-state.js";
+import { persistSubagentRunsToDiskOrThrow } from "./subagent-registry-state.js";
 import {
   readSubagentSessionStore,
   removeSubagentSessionEntry,
@@ -180,7 +178,7 @@ describe("subagent orphan recovery — faithful restart path", () => {
       );
       addSubagentRunForTests(entry);
     }
-    persistSubagentRunsToDiskOrThrow(subagentRuns);
+    persistSubagentRunsToDiskOrThrow(subagentRuns, [...subagentRuns.keys()]);
     await fixture.settle();
     resetSubagentRegistryForTests({ persist: false });
     rotateAgentEventLifecycleGeneration();
@@ -196,8 +194,8 @@ describe("subagent orphan recovery — faithful restart path", () => {
     try {
       await lock.run(async () => {
         await runStartupSessionMigration({ cfg: { agents: { entries: { main: {} } } }, log });
-        initSubagentRegistry();
-        activateGatewayRuntime();
+        await initSubagentRegistry();
+        await activateGatewayRuntime();
         await testing.sweepOnceForTests();
         await fixture.settle();
         for (const entry of records) {
@@ -273,7 +271,7 @@ describe("subagent orphan recovery — faithful restart path", () => {
         return (params.runId === runId ? await oldWait.promise : { status: "pending" }) as T;
       };
       const terminalPersisted = createDeferred();
-      const stopObservingTerminal = onSubagentRegistryPersisted(() => {
+      const stopObservingTerminal = subscribeSubagentRunChanges("persistence", () => {
         if (loadSubagentRegistryFromSqlite().get(runId)?.execution.status === "terminal") {
           terminalPersisted.resolve();
         }
@@ -374,8 +372,8 @@ describe("subagent orphan recovery — faithful restart path", () => {
         resetSubagentRegistryForTests({ persist: false });
         resetGatewayWorkAdmission();
         rotateAgentEventLifecycleGeneration();
-        initSubagentRegistry();
-        activateGatewayRuntime();
+        await initSubagentRegistry();
+        await activateGatewayRuntime();
         await testing.sweepOnceForTests();
         expect(dispatchAgent).not.toHaveBeenCalled();
         expect(getSubagentRunByChildSessionKey(childSessionKey)).toMatchObject({
@@ -522,8 +520,8 @@ describe("subagent orphan recovery — faithful restart path", () => {
         resetSubagentRegistryForTests({ persist: false });
         await cleanupSessionStateForTest({ stateDir: fixture.stateDir });
         rotateAgentEventLifecycleGeneration();
-        initSubagentRegistry();
-        activateGatewayRuntime();
+        await initSubagentRegistry();
+        await activateGatewayRuntime();
       }
       const announce = vi.mocked(runSubagentAnnounceFlow);
       const cleanupBrowser = vi.mocked(cleanupBrowserSessionsForLifecycleEnd);
@@ -692,7 +690,6 @@ describe("subagent orphan recovery — faithful restart path", () => {
         runId: nextRunId,
         source: retired,
         storePath,
-        requireSource: true,
       });
       addSubagentRunForTests(
         makeRunRecord({
@@ -800,8 +797,8 @@ describe("subagent orphan recovery — faithful restart path", () => {
     await fixture.settle();
     resetSubagentRegistryForTests({ persist: false });
     rotateAgentEventLifecycleGeneration();
-    initSubagentRegistry();
-    activateGatewayRuntime();
+    await initSubagentRegistry();
+    await activateGatewayRuntime();
     await Promise.resolve();
     await testing.sweepOnceForTests();
 
@@ -830,8 +827,8 @@ describe("subagent orphan recovery — faithful restart path", () => {
 
     resetSubagentRegistryForTests({ persist: false });
     rotateAgentEventLifecycleGeneration();
-    initSubagentRegistry();
-    activateGatewayRuntime();
+    await initSubagentRegistry();
+    await activateGatewayRuntime();
     await Promise.resolve();
     await testing.sweepOnceForTests();
 
