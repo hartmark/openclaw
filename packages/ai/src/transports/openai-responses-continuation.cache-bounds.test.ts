@@ -204,15 +204,8 @@ describe("OpenAI Responses continuation cache bounds", () => {
     survivor?.release();
   });
 
-  it("evicts by true commit order, not Map iteration position, when a reclaim lands in the same millisecond", () => {
-    // Date.now() is not a unique completion order: a Map re-set on an
-    // existing key keeps that key's original iteration position, so a
-    // session reclaimed (claimed again, then re-committed) in the same
-    // millisecond as the rest of a full cache still iterates first --
-    // exactly where a strict `<` timestamp comparison would keep it as
-    // "oldest" even though it just became the freshest entry. Freeze time
-    // so every commit below shares one timestamp, isolating the ordering
-    // fix from real wall-clock progression.
+  it("evicts the oldest committed baseline after a same-millisecond reclaim", () => {
+    // Freeze time so ordering must follow commits, including reclaimed keys.
     vi.useFakeTimers();
     try {
       for (let i = 0; i < READY_ENTRY_CAPACITY; i++) {
@@ -223,9 +216,7 @@ describe("OpenAI Responses continuation cache bounds", () => {
         });
       }
 
-      // Reclaim session-0: consumes its ready entry (claim), then commits a
-      // fresh one -- Map.set on the existing key keeps it at iteration
-      // position 0, but it is now the most-recently-committed entry.
+      // Reclaiming the oldest session must make its next baseline newest.
       const reclaimed = claim({ sessionId: "reclaim-session-0", request: nextRequest() });
       expect(reclaimed?.request.previous_response_id).toBe("reclaim-resp-0");
       reclaimed?.commit(continuationState().lastRequest, {
@@ -256,7 +247,11 @@ describe("OpenAI Responses continuation cache bounds", () => {
     }
   });
 
-  it("skips caching a single entry that alone exceeds the retained-byte budget", () => {
+  it("skips an oversized entry without evicting another ready session", () => {
+    claim({ sessionId: "retained-neighbor" })?.commit(continuationState().lastRequest, {
+      id: "resp_neighbor",
+      output: continuationState().lastResponseItems,
+    });
     const first = claim({});
     // Evicting every other entry still wouldn't make this one fit, so the
     // commit must be a no-op for caching purposes rather than trying to make
@@ -267,8 +262,13 @@ describe("OpenAI Responses continuation cache bounds", () => {
     });
 
     // Not cached: the next claim for the same session sees no baseline.
-    const afterOversized = claim({ request: nextRequest() });
+    const afterOversized = claim({
+      request: nextRequestAfterOversized(RETAINED_BYTES_BUDGET + 1),
+    });
     expect(afterOversized?.request.previous_response_id).toBeUndefined();
+    const neighbor = claim({ sessionId: "retained-neighbor", request: nextRequest() });
+    expect(neighbor?.request.previous_response_id).toBe("resp_neighbor");
+    neighbor?.release();
 
     // The oversized commit must not leave the entry stuck "claimed" forever
     // -- a normal-sized commit right after succeeds and is retained.

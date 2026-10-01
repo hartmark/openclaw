@@ -20,35 +20,11 @@ import {
 } from "./openai-responses-tool-call-id-shape.js";
 import { sha256Hex } from "./transport-utils.js";
 
-// Fixed, not operator-configurable. A real chat conversation's turns are
-// commonly minutes to hours apart, well past the original 5-minute TTL --
-// continuation only ever engaged within one multi-round tool-calling turn
-// (seconds between rounds), never across separate incoming messages, even
-// though sessionId and connection identity are both stable across turns
-// (confirmed by tracing the full call chain). Unchanged since #122194
-// introduced it; review only ever flagged the in-memory/process-local
-// design generally, never the specific value.
+// Keep completed baselines across ordinary conversation gaps; ready entries are
+// bounded by count and serialized content size so the longer idle window cannot
+// retain an unbounded backlog. Session cleanup discards them earlier.
 const HTTP_CONTINUATION_IDLE_TTL_MS = 90 * 60 * 1000;
-// A ready entry retains the full request/response baseline for
-// HTTP_CONTINUATION_IDLE_TTL_MS, now 18x longer (5m -> 90m). Without a
-// capacity cap, a burst of concurrent sessions/connections could
-// grow this process-wide map unbounded for the entire idle window. Claimed
-// entries (in-flight, no retained baseline) don't count against the cap --
-// they're already bounded by the request they represent.
 const MAX_HTTP_CONTINUATION_READY_ENTRIES = 1000;
-// A count cap alone bounds cardinality, not memory: a full-context turn near
-// a large model's context window can retain a multi-megabyte baseline on its
-// own, so 1000 oversized entries could still exhaust process memory well
-// before the count cap engages. This aggregate budget is enforced alongside
-// the count cap (whichever evicts first), and also bypasses caching a single
-// candidate entry that exceeds the whole budget by itself -- evicting every
-// other entry still wouldn't make room for it, and the request itself
-// already succeeded, so skipping continuation for that one oversized turn
-// (falling back to a full-history resend next round) is strictly better than
-// either rejecting the response or growing past the budget. 64MB matches the
-// existing ANTHROPIC_INLINE_IMAGES_DECODE_SAFETY_BYTES precedent for a
-// single-request memory ceiling in this package -- comfortably above even a
-// 200K-token context's realistic JSON footprint (well under 4MB).
 const MAX_HTTP_CONTINUATION_RETAINED_BYTES = 64 * 1024 * 1024;
 const TURN_HEADERS = new Set(["traceparent", "x-openclaw-turn-id", "x-openclaw-turn-attempt"]);
 
@@ -523,45 +499,21 @@ type HttpContinuationEntry =
       owner: SessionResourceOwner;
       state: ResponsesContinuationState;
       idleTimer: ReturnType<typeof setTimeout>;
-      readySequence: number;
       retainedBytes: number;
     }
   | { kind: "claimed"; sessionId: string; owner: SessionResourceOwner };
 
 const httpContinuationEntries = new Map<string, HttpContinuationEntry>();
-// Ready-only index, insertion-ordered (a Map iterates in insertion order),
-// kept in exact lockstep with every ready entry's add/remove in
-// httpContinuationEntries. evictReadyEntriesForCapacity reads only this map
-// so its cost stays proportional to the ready-entry cap, never to however
-// many claimed (in-flight) entries also happen to exist -- a live gateway
-// can have many concurrent long-running requests claimed at once, and
-// scanning those on every commit would defeat the cap's own purpose of
-// bounding synchronous work.
+// Commit order owns eviction order. Index only ready entries so eviction work
+// stays bounded even when many requests are still in flight.
 const readyHttpContinuationEntries = new Map<
   string,
   Extract<HttpContinuationEntry, { kind: "ready" }>
 >();
-// Monotonic counter for ready-entry commit order: Date.now() is not a
-// unique completion order (two commits can land in the same millisecond,
-// e.g. a reclaimed session key completing alongside another), so an
-// eviction based on wall-clock time can pick a newer entry over an older
-// one that happens to share a timestamp. A strictly incrementing sequence
-// makes "oldest" unambiguous regardless of timing; readyHttpContinuationEntries'
-// own insertion order already matches it (both advance exactly at commit
-// time), so eviction only needs the map's natural iteration order.
-let nextHttpContinuationReadySequence = 1;
-// Running total of every ready entry's retainedBytes, kept in lockstep with
-// httpContinuationEntries by removeReadyEntry -- the only path that deletes a
-// ready entry -- so MAX_HTTP_CONTINUATION_RETAINED_BYTES can be enforced
-// without re-summing the map on every commit.
+// Updated with ready-entry insertion/removal; no full-cache scan on commit.
 let httpContinuationRetainedBytes = 0;
 
-// Reference-checked removal for a context that only *might* still own this
-// entry (a timer firing later, or `release()`): a foreign caller passes the
-// exact entry it was handed, and this is a no-op if that entry has since
-// been replaced or evicted. removeReadyEntry below is for a caller that
-// already knows -- from a synchronous map read of its own -- that the entry
-// it holds is still current.
+// Timers and released handles must not remove a replacement claim.
 function deleteHttpContinuationIfOwned(key: string, entry: HttpContinuationEntry): void {
   if (httpContinuationEntries.get(key) !== entry) {
     return;
@@ -573,18 +525,12 @@ function deleteHttpContinuationIfOwned(key: string, entry: HttpContinuationEntry
   httpContinuationEntries.delete(key);
 }
 
-/** Estimates a ready entry's retained memory: the same JSON that gets
- * stringified for the eviction budget it counts against, no separate copy
- * kept around just to size it. */
+// A serialized-content budget, not a measurement of JavaScript heap overhead.
 function estimateRetainedBytes(state: ResponsesContinuationState): number {
   return Buffer.byteLength(JSON.stringify(state), "utf8");
 }
 
-// Single removal path for a ready entry the caller already knows is still
-// current (reclaim-before-overwrite, capacity/budget eviction, session
-// cleanup) -- keeps idleTimer cleanup and the retainedBytes running total
-// symmetric with httpContinuationEntries without duplicating either at each
-// call site.
+// The caller synchronously verified this ready entry still owns its key.
 function removeReadyEntry(
   key: string,
   entry: Extract<HttpContinuationEntry, { kind: "ready" }>,
@@ -595,15 +541,7 @@ function removeReadyEntry(
   httpContinuationEntries.delete(key);
 }
 
-// Deterministic capacity/budget policy: evict the least-recently-committed
-// ready entry first (the one least likely to be reused before its own idle
-// TTL would have expired it anyway) until both MAX_HTTP_CONTINUATION_READY_ENTRIES
-// and MAX_HTTP_CONTINUATION_RETAINED_BYTES (including the incoming
-// `pendingBytes` about to be inserted) are satisfied. Reads only
-// readyHttpContinuationEntries (never the full httpContinuationEntries map,
-// which can also hold arbitrarily many in-flight claimed entries), and its
-// insertion order already is oldest-first, so finding the eviction
-// candidate is a single first-entry read, not a scan.
+// Evict oldest committed baselines until the incoming entry fits both bounds.
 function evictReadyEntriesForCapacity(pendingBytes: number): void {
   for (;;) {
     const overCapacity = readyHttpContinuationEntries.size >= MAX_HTTP_CONTINUATION_READY_ENTRIES;
@@ -687,22 +625,14 @@ export function claimOpenAIResponsesHttpContinuation(
             dispatchedPreviousResponseId === previous.state.lastResponseId,
         );
         const retainedBytes = estimateRetainedBytes(state);
-        // recordResponsesContinuationState/estimateRetainedBytes just ran
-        // JSON.stringify over caller-supplied request/response content, which
-        // can synchronously invoke a caller-defined toJSON/getter. That
-        // callback could run session cleanup and/or start a replacement claim
-        // at this same key mid-serialization -- re-check ownership now, after
-        // the one step that can re-enter this module, and before eviction or
-        // any write touches shared state, so a stale commit can't overwrite
-        // the replacement claim or resurrect state a concurrent cleanup cleared.
+        // Serialization can invoke caller-owned toJSON/getters that clean up or
+        // reclaim this session. Fence stale commits before eviction or mutation.
         if (httpContinuationEntries.get(key) !== claimed) {
           return;
         }
         if (retainedBytes > MAX_HTTP_CONTINUATION_RETAINED_BYTES) {
-          // Evicting every other entry still wouldn't make this one fit --
-          // skip caching it. The turn's actual response already completed
-          // successfully; only the *next* turn loses continuation and falls
-          // back to a full-history resend, same as before this cache existed.
+          // Keep other sessions when this baseline cannot fit alone. Its next
+          // request sends full history; the completed response remains valid.
           deleteHttpContinuationIfOwned(key, claimed);
           return;
         }
@@ -715,7 +645,6 @@ export function claimOpenAIResponsesHttpContinuation(
             () => deleteHttpContinuationIfOwned(key, ready),
             HTTP_CONTINUATION_IDLE_TTL_MS,
           ),
-          readySequence: nextHttpContinuationReadySequence++,
           retainedBytes,
         } satisfies Extract<HttpContinuationEntry, { kind: "ready" }>;
         ready.idleTimer.unref?.();
